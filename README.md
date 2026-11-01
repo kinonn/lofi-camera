@@ -1,8 +1,11 @@
-# lofi-cam
+# lofi-camera
 
 ESP32-CAM lo-fi viewfinder: live grayscale camera preview on a
 128×64 SSD1306 OLED, with button-triggered full-resolution JPEG capture to
 microSD.
+
+The host-side [film look lab](tools/film_lab/README.md) prototypes the colour
+looks for those JPEGs before any of them are ported to C++.
 
 ## Hardware
 
@@ -91,10 +94,14 @@ full-resolution JPEGs to the SD card is a separate path and never changes.
 | `PREVIEW_MODE_DITHER` (default) | 4×4 Bayer ordered dither | Cheapest, shows tone and greys |
 | `PREVIEW_MODE_CANNY` | Canny edge detection | Wireframe look, ~48 KB extra RAM |
 
-Switch it in `platformio.ini`:
+Switch it in the existing `build_flags` block in `platformio.ini` — keep the
+other lines, only the `PREVIEW_MODE` value changes:
 
 ```ini
-build_flags = -DPREVIEW_MODE=PREVIEW_MODE_CANNY
+build_flags =
+ -DJPEG_FILTER_SWAP565=1
+ -DPREVIEW_MODE=PREVIEW_MODE_CANNY
+ -DJPEG_FILTER=JPEG_FILTER_WHITE_BORDER
 ```
 
 or for a one-off build:
@@ -138,10 +145,13 @@ or re-encode, so it costs nothing.
 | `JPEG_FILTER_NONE` (default) | Pass-through | SXGA 1280×1024 |
 | `JPEG_FILTER_WHITE_BORDER` | 20 px white border, photo inset to 1240×984 | SXGA 1280×1024 (canvas unchanged) |
 
-Enable it in `platformio.ini`:
+Enable it in the existing `build_flags` block in `platformio.ini`:
 
 ```ini
-build_flags = -DJPEG_FILTER=JPEG_FILTER_WHITE_BORDER
+build_flags =
+ -DJPEG_FILTER_SWAP565=1
+ -DPREVIEW_MODE=PREVIEW_MODE_DITHER
+ -DJPEG_FILTER=JPEG_FILTER_WHITE_BORDER
 ```
 
 Tunables (all `-D` overridable):
@@ -234,6 +244,14 @@ Declared in `platformio.ini` (auto-installed on first build):
 Framework libraries (no install needed): `Wire`, `FS`, `SD_MMC`,
 ESP32 Arduino camera driver (`esp_camera`).
 
+## Host tools
+
+`tools/film_lab/` is a Python test bench that renders every candidate film look
+over the sample captures in `test-images/` and builds a contact-sheet gallery,
+so a grade can be chosen by eye without flashing anything. It needs `uv` and the
+packages in `tools/film_lab/requirements.txt`; see its
+[README](tools/film_lab/README.md) for setup and options.
+
 ## Project layout
 
 - `src/main.cpp` — firmware: setup, viewfinder loop, SD capture
@@ -244,4 +262,5 @@ ESP32 Arduino camera driver (`esp_camera`).
 - `src/jpeg_filter.h` — compile-time JPEG filter pipeline for SD capture
 - `platformio.ini` — `esp32cam` board, Arduino framework, 115200 monitor,
   460800 upload
-- `clementi-temp/` — original unrelated sketch, kept for reference
+- `tools/film_lab/` — host-side film look lab (Python + `uv`)
+- `test-images/` — sample captures used by the lab (git-ignored, local only)

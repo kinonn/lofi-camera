@@ -1,7 +1,7 @@
 # Film look lab
 
 Host-side test bench for choosing a **film-camera colour look** for the JPEGs
-that `lofi-cam` saves to the SD card.
+that `lofi-camera` saves to the SD card.
 
 It runs every look defined in `film_emulation.py` — 20 Kodak / Fujifilm /
 creative film stocks, a Diana F+ toy camera, and a neutral `cf01` enhancement
