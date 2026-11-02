@@ -672,6 +672,10 @@ void loop() {
     lastBtnT = now;
     DBG("Button pressed -> capture\n");
     savePhoto();
+    // savePhoto() blocks while the capture is written and the result is shown.
+    // Sample the level again so a held button cannot become a fresh press edge
+    // on the next loop iteration when btnPrev is updated below.
+    btn = digitalRead(BUTTON_PIN);
   }
   btnPrev = btn;
   streamFrame();
