@@ -287,16 +287,22 @@ static bool decodePreviewGray(const camera_fb_t* fb) {
 
   if (!jpg2rgb565(fb->buf, fb->len, previewRgb, JPG_SCALE_8X)) return false;
 
-  // The helper emits RGB565 in an LCD-oriented byte order, so derive luma from
-  // the two bytes directly: that is byte-order independent and more than good
-  // enough for a 1-bit preview.
+  // The decoder's RGB565 word uses R in the high 5 bits, G in the middle 6,
+  // and B in the low 5. Expand to 8-bit channels before computing Rec.709 luma;
+  // averaging the packed bytes mixes channel bits and badly skews brightness.
   const uint16_t* src = (const uint16_t*)previewRgb;
   for (int y = 0; y < h; y++) {
     uint8_t* drow = previewGray + (size_t)y * w;
     const uint16_t* srow = src + (size_t)y * w;
     for (int x = 0; x < w; x++) {
       const uint16_t v = srow[x];
-      drow[x] = (uint8_t)((((v >> 8) & 0xFF) + (v & 0xFF)) >> 1);
+      const uint8_t r5 = (v >> 11) & 0x1F;
+      const uint8_t g6 = (v >> 5) & 0x3F;
+      const uint8_t b5 = v & 0x1F;
+      const uint8_t r = (uint8_t)((r5 << 3) | (r5 >> 2));
+      const uint8_t g = (uint8_t)((g6 << 2) | (g6 >> 4));
+      const uint8_t b = (uint8_t)((b5 << 3) | (b5 >> 2));
+      drow[x] = (uint8_t)((54u * r + 183u * g + 19u * b) >> 8);
     }
   }
 
