@@ -258,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
 
         stem = image_path.stem
         items: list[tuple[str, str, str]] = []
+        rendered: list[tuple[str, str, Image.Image]] = []
 
         for preset in presets:
             result = apply_filter(original, preset)
@@ -267,6 +268,9 @@ def main(argv: list[str] | None = None) -> int:
             filename = f"{stem}__{preset.name}.jpg"
             result.save(folder / filename, quality=args.quality, subsampling=0)
 
+            if not args.no_sheet:
+                rendered.append((f"{preset.order:02d}", preset.label, result))
+
             items.append((f"{preset.order:02d}", preset.label,
                           f"{preset.name}/{filename}"))
             print(f"  {stem}  <- {preset.order:02d} {preset.label}")
@@ -274,12 +278,6 @@ def main(argv: list[str] | None = None) -> int:
         groups.append((image_path, items))
 
         if not args.no_sheet:
-            rendered = []
-            for preset in presets:
-                path = out_dir / preset.name / f"{stem}__{preset.name}.jpg"
-                with Image.open(path) as handle:
-                    rendered.append((f"{preset.order:02d}", preset.label,
-                                     handle.convert("RGB")))
             sheet = build_contact_sheet(
                 original, rendered, cols=args.cols, thumb_w=args.thumb_width,
             )
