@@ -143,7 +143,7 @@ or re-encode, so it costs nothing.
 | `JPEG_FILTER` | Effect | Output |
 |---|---|---|
 | `JPEG_FILTER_NONE` (default) | Pass-through | SXGA 1280×1024 |
-| `JPEG_FILTER_WHITE_BORDER` | 20 px white border, photo inset to 1240×984 | SXGA 1280×1024 (canvas unchanged) |
+| `JPEG_FILTER_WHITE_BORDER` | Paints a 20 px white band over all four frame edges; edge pixels are lost and the visible image area is 1240×984 | SXGA 1280×1024 (canvas unchanged) |
 
 Enable it in the existing `build_flags` block in `platformio.ini`:
 
@@ -162,8 +162,9 @@ Tunables (all `-D` overridable):
 | `JPEG_FILTER_SWAP565` | `0` | Set to `1` if a filtered photo shows red/blue swapped |
 | `JPEG_QUALITY` | `10` | Camera JPEG quality *and* re-encode quality |
 
-**Memory.** The border does not grow the frame: the photo is scaled to
-1240×984 and inset, so the canvas stays 1280×1024. Because `esp_jpg_decode`
+**Memory.** The border does not grow the frame: it paints over the outer 20
+pixels on each edge (no scaling or resampling), so the canvas stays
+1280×1024. Because `esp_jpg_decode`
 delivers MCU blocks through a callback, the decode is written straight into
 that canvas — there is no second full-frame buffer — and the encoder streams
 to the SD file via `fmt2jpg_cb`, so the JPEG is never held in RAM either.
@@ -171,11 +172,11 @@ to the SD file via `fmt2jpg_cb`, so the JPEG is never held in RAM either.
 | Item | Bytes |
 |---|---|
 | RGB565 canvas, 1280×1024 | 2,621,440 |
-| Camera buffers (`fb_count = 2`) | 524,288 |
-| **Peak** | **~3.1 MB** (of 4 MB PSRAM) |
+| Camera buffer (`fb_count = 1`, w×h/5) | 262,144 |
+| **Peak** | **~2.9 MB** (of 4 MB PSRAM) |
 
 Border width is free: it does not change the memory requirement, only the
-inset size. `jpegFilterWorstCaseBytes()` reports an upper bound (0.25
+painted area. `jpegFilterWorstCaseBytes()` reports an upper bound (0.25
 bytes/pixel) so the free-space check can run before the file is opened.
 
 Adding a filter: extend the `#if` chain in `src/jpeg_filter.h` with a new
