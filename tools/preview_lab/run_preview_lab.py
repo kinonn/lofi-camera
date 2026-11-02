@@ -1,0 +1,447 @@
+"""OLED preview test bench for lofi-camera.
+
+Simulates ``src/preview.h`` + ``src/preview_dither.h`` +
+``src/preview_canny.h`` over the sample JPEGs in ``test-images/`` without
+touching the firmware.
+
+Pipeline per image (mirrors the device)::
+
+    RGB -> Rec.709 luma -> aspect-fit letterbox (nearest neighbour)
+    -> dither (4x4 Bayer + contrast) / Canny edge detection
+
+Examples:
+    python tools/preview_lab/run_preview_lab.py
+    python tools/preview_lab/run_preview_lab.py --list
+    python tools/preview_lab/run_preview_lab.py --modes dither
+    python tools/preview_lab/run_preview_lab.py --input test-images/img_0027.jpg
+    python tools/preview_lab/run_preview_lab.py --dither-contrast 130 --blur-passes 2 --low 80 --high 160
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from preview_sim import (  # noqa: E402
+    SCREEN_HEIGHT,
+    SCREEN_WIDTH,
+    area_resize,
+    atkinson_render,
+    blur_atkinson_render,
+    canny_render,
+    clahe_floyd_render,
+    dither_bayer2_render,
+    dither_bayer8_render,
+    dither_render,
+    floyd_steinberg_render,
+    photo_floyd_render,
+    preview_prepare,
+    rgb_to_luma,
+    threshold_render,
+)
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
+BG = (26, 27, 30)
+LABEL_BG = (38, 40, 45)
+TEXT = (232, 232, 236)
+ACCENT = (255, 196, 96)
+
+MODES = ("dither", "bayer2", "bayer8", "floyd", "atkinson", "threshold",
+         "clahe-floyd", "blur-atkinson", "photo", "canny")
+DITHER_MODES = ("dither", "bayer2", "bayer8", "floyd", "atkinson", "threshold",
+                "clahe-floyd", "blur-atkinson", "photo")
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+
+def find_images(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    return sorted(
+        p for p in path.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
+    )
+
+
+def load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for name in ("arial.ttf", "segoeui.ttf", "calibri.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def upscale_nearest(img: Image.Image, scale: int) -> Image.Image:
+    """Magnify a 128x64 1-bit preview so dots/edges are visible."""
+    scale = max(1, int(scale))
+    if scale == 1:
+        return img
+    return img.resize(
+        (img.width * scale, img.height * scale), Image.Resampling.NEAREST
+    )
+
+
+def build_contact_sheet(
+    original: Image.Image,
+    rendered: list[tuple[str, str, Image.Image]],
+    cols: int = 3,
+    thumb_w: int = 512,
+    label_h: int = 30,
+    gap: int = 10,
+) -> Image.Image:
+    """Grid of ``original`` first, then every (number, label, image) entry."""
+    cells: list[tuple[str, Image.Image, bool]] = [("00  ORIGINAL", original, True)]
+    for number, label, img in rendered:
+        cells.append((f"{number}  {label}", img, False))
+
+    def thumb(img: Image.Image) -> Image.Image:
+        height = max(1, round(thumb_w * img.height / img.width))
+        # NEAREST keeps the 1-bit preview pixels crisp in the sheet.
+        resample = (
+            Image.Resampling.NEAREST
+            if img.width <= SCREEN_WIDTH * 2
+            else Image.Resampling.LANCZOS
+        )
+        return img.resize((thumb_w, height), resample)
+
+    prepared = [(label, thumb(img), is_original) for label, img, is_original in cells]
+    cell_h = max(pic.height for _, pic, _ in prepared) + label_h
+    rows = (len(prepared) + cols - 1) // cols
+
+    sheet_w = gap + cols * (thumb_w + gap)
+    sheet_h = gap + rows * (cell_h + gap)
+    sheet = Image.new("RGB", (sheet_w, sheet_h), BG)
+
+    draw = ImageDraw.Draw(sheet)
+    small = load_font(max(12, label_h - 13))
+    title = load_font(max(13, label_h - 12))
+
+    for i, (label, pic, is_original) in enumerate(prepared):
+        r, c = divmod(i, cols)
+        x = gap + c * (thumb_w + gap)
+        y = gap + r * (cell_h + gap)
+
+        sheet.paste(pic, (x, y))
+
+        draw.rectangle(
+            [x, y + pic.height, x + thumb_w, y + cell_h],
+            fill=LABEL_BG,
+        )
+        colour = ACCENT if is_original else TEXT
+        draw.text(
+            (x + 6, y + pic.height + 7),
+            label,
+            fill=colour,
+            font=title if is_original else small,
+        )
+
+    return sheet
+
+
+def write_gallery(
+    out_dir: Path,
+    groups: list[tuple[Path, list[tuple[str, str, str]]]],
+    sheet_paths: dict[str, str],
+) -> Path:
+    """Plain static HTML so every preview mode can be flipped through."""
+    rows = []
+    for src, items in groups:
+        cards = [
+            f'<figure class="card"><a href="{href}">'
+            f'<img src="{href}" loading="lazy" alt="{label}" '
+            f'style="image-rendering: pixelated;"></a>'
+            f'<figcaption><b>{number}</b> {label}</figcaption></figure>'
+            for number, label, href in items
+        ]
+        sheet = sheet_paths.get(src.stem)
+        sheet_link = (
+            f'<a class="sheet" href="{sheet}">contact sheet &rsaquo;</a>' if sheet else ""
+        )
+        rows.append(
+            f'<section><h2>{src.name} {sheet_link}</h2>'
+            f'<div class="grid">{"".join(cards)}</div></section>'
+        )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>lofi-cam preview bench</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{ margin: 0; padding: 24px 28px 64px; background: #141518;
+         color: #e8e8ec; font: 14px/1.5 "Segoe UI", system-ui, sans-serif; }}
+  h1 {{ font-size: 20px; margin: 0 0 4px; letter-spacing: .01em; }}
+  .hint {{ color: #9a9aa4; margin: 0 0 28px; }}
+  h2 {{ font-size: 15px; font-weight: 600; margin: 36px 0 12px;
+       padding-bottom: 8px; border-bottom: 1px solid #2c2e34; }}
+  .sheet {{ font-weight: 400; font-size: 12px; color: #ffc460;
+           text-decoration: none; margin-left: 10px; }}
+  .grid {{ display: grid; gap: 14px;
+          grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }}
+  .card {{ margin: 0; background: #1c1e22; border-radius: 6px; overflow: hidden; }}
+  .card img {{ display: block; width: 100%; height: auto; image-rendering: pixelated; }}
+  .card figcaption {{ padding: 7px 9px; font-size: 12px; color: #c9c9d2; }}
+  .card figcaption b {{ color: #ffc460; font-variant-numeric: tabular-nums; }}
+</style>
+</head>
+<body>
+<h1>lofi-cam &mdash; preview bench</h1>
+<p class="hint">Dither + Canny OLED previews over the sample captures. Click any
+thumbnail for full size. Tunables mirror <code>src/preview_*.h</code>.</p>
+{"".join(rows)}
+</body>
+</html>
+"""
+    index = out_dir / "index.html"
+    index.write_text(html, encoding="utf-8")
+    return index
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    repo_root = Path(__file__).resolve().parents[2]
+    parser = argparse.ArgumentParser(
+        description="Simulate lofi-cam OLED preview modes over sample images.",
+    )
+    parser.add_argument("--input", default=str(repo_root / "test-images"),
+                        help="image file or folder (default: test-images/)")
+    parser.add_argument("--out", default=str(Path(__file__).resolve().parent / "out"),
+                        help="output folder (default: tools/preview_lab/out)")
+    parser.add_argument("--modes", nargs="+", default=list(MODES),
+                        choices=list(MODES),
+                        help="preview modes to render (default: all)")
+    parser.add_argument("--list", action="store_true",
+                        help="list the available preview modes and exit")
+    parser.add_argument("--dither-contrast", type=int, default=130,
+                        help="DITHER_CONTRAST (default: 130, 100 = unchanged)")
+    parser.add_argument("--photo-contrast", type=float, default=1.15,
+                        help="photo mode contrast gain around mid-grey (default: 1.15)")
+    parser.add_argument("--photo-brightness", type=float, default=0.0,
+                        help="photo mode brightness offset in gray levels (default: 0)")
+    parser.add_argument("--photo-gamma", type=float, default=1.0,
+                        help="photo mode gamma power curve (default: 1.0 = off)")
+    parser.add_argument("--photo-alpha", type=float, default=0.8,
+                        help="photo mode temporal weight on past frames (default: 0.80)")
+    parser.add_argument("--photo-strength", type=float, default=0.9,
+                        help="photo mode diffused error fraction (default: 0.90)")
+    parser.add_argument("--photo-threshold", type=float, default=128.0,
+                        help="photo mode black/white decision point (default: 128)")
+    parser.add_argument("--photo-sharpen", type=float, default=0.0,
+                        help="photo mode unsharp-mask amount (default: 0 = off)")
+    parser.add_argument("--photo-blur", type=float, default=0.0,
+                        help="photo mode Gaussian sigma before diffusion (default: 0 = off)")
+    parser.add_argument("--photo-resize", choices=["area", "nearest"], default="area",
+                        help="photo mode downsampler (default: area; nearest only if already 128x64)")
+    parser.add_argument("--clahe-clip", type=float, default=2.0,
+                        help="CLAHE clip limit for clahe-floyd (default: 2.0)")
+    parser.add_argument("--clahe-tiles", type=int, nargs=2, default=[8, 8],
+                        metavar=("ROWS", "COLS"),
+                        help="CLAHE tile grid for clahe-floyd (default: 8 8)")
+    parser.add_argument("--clahe-blur", type=float, default=0.8,
+                        help="Gaussian sigma before Floyd-Steinberg (default: 0.8, 0 = off)")
+    parser.add_argument("--clahe-contrast", type=int, default=100,
+                        help="contrast stretch before CLAHE (default: 100 = unchanged)")
+    parser.add_argument("--blur-passes", type=int, default=2,
+                        help="CANNY_BLUR_PASSES (default: 2, 0 = off)")
+    parser.add_argument("--low", type=int, default=80,
+                        help="CANNY_LOW weak-edge threshold (default: 80)")
+    parser.add_argument("--high", type=int, default=160,
+                        help="CANNY_HIGH strong-edge threshold (default: 160)")
+    parser.add_argument("--preview-scale", type=int, default=4,
+                        help="magnify 128x64 previews for viewing (default: 4)")
+    parser.add_argument("--cols", type=int, default=3,
+                        help="contact sheet columns (default: 3)")
+    parser.add_argument("--thumb-width", type=int, default=512,
+                        help="contact sheet thumbnail width (default: 512)")
+    parser.add_argument("--no-sheet", action="store_true",
+                        help="skip contact sheets and the HTML gallery")
+    args = parser.parse_args(argv)
+
+    if args.list:
+        print("preview modes:\n")
+        print("  dither     firmware 4x4 Bayer ordered dither (DITHER_CONTRAST, default 130)")
+        print("  bayer2     lab-only 2x2 Bayer (tight dots, only 4 gray steps)")
+        print("  bayer8     lab-only 8x8 Bayer (finer tones, coarser dots)")
+        print("  floyd      lab-only Floyd-Steinberg error diffusion (smooth tones)")
+        print("  atkinson   lab-only Atkinson error diffusion (punchy, posterised)")
+        print("  threshold  lab-only plain threshold (stark black/white)")
+        print("  clahe-floyd  lab-only CLAHE -> slight Gaussian blur -> Floyd-Steinberg")
+        print("  blur-atkinson  lab-only slight Gaussian blur -> Atkinson")
+        print("  photo      lab-only area resize + tone + temporal Floyd-Steinberg")
+        print("  canny      edge detection (CANNY_BLUR_PASSES=2, CANNY_LOW=80, CANNY_HIGH=160)")
+        return 0
+
+    src_dir = Path(args.input)
+    if not src_dir.exists():
+        print(f"error: input not found: {src_dir}", file=sys.stderr)
+        return 2
+
+    images = find_images(src_dir)
+    if not images:
+        print(f"error: no images in {src_dir}", file=sys.stderr)
+        return 2
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"input   : {src_dir}")
+    print(f"output  : {out_dir}")
+    print(f"images  : {len(images)}   modes: {', '.join(args.modes)}")
+    print(f"dither  : contrast={args.dither_contrast}")
+    print(f"photo   : contrast={args.photo_contrast} brightness={args.photo_brightness} "
+          f"gamma={args.photo_gamma} alpha={args.photo_alpha} strength={args.photo_strength} "
+          f"threshold={args.photo_threshold} sharpen={args.photo_sharpen} blur={args.photo_blur} "
+          f"resize={args.photo_resize}")
+    print(f"clahe   : contrast={args.clahe_contrast} clip={args.clahe_clip} "
+          f"tiles={args.clahe_tiles[0]}x{args.clahe_tiles[1]} blur={args.clahe_blur}")
+    print(f"canny   : blur_passes={args.blur_passes} low={args.low} high={args.high}\n")
+
+    groups: list[tuple[Path, list[tuple[str, str, str]]]] = []
+    sheet_paths: dict[str, str] = {}
+
+    for image_path in images:
+        with Image.open(image_path) as handle:
+            rgb = handle.convert("RGB")
+        import numpy as np
+
+        luma = rgb_to_luma(np.asarray(rgb))
+        frame = preview_prepare(luma)
+
+        stem = image_path.stem
+        items: list[tuple[str, str, str]] = []
+        rendered: list[tuple[str, str, Image.Image]] = []
+
+        from preview_sim import PreviewFrame  # noqa: E402
+
+        dither_specs = [
+            ("dither", "dither", lambda f: dither_render(f, contrast=args.dither_contrast)),
+            ("bayer2", "bayer2", lambda f: dither_bayer2_render(f, contrast=args.dither_contrast)),
+            ("bayer8", "bayer8", lambda f: dither_bayer8_render(f, contrast=args.dither_contrast)),
+            ("floyd", "floyd-steinberg", lambda f: floyd_steinberg_render(f, contrast=args.dither_contrast)),
+            ("atkinson", "atkinson", lambda f: atkinson_render(f, contrast=args.dither_contrast)),
+            ("threshold", "threshold", lambda f: threshold_render(f, contrast=args.dither_contrast)),
+            ("clahe-floyd", "clahe-floyd", lambda f: clahe_floyd_render(
+                f, contrast=args.clahe_contrast, clip_limit=args.clahe_clip,
+                tiles=(args.clahe_tiles[0], args.clahe_tiles[1]), sigma=args.clahe_blur)),
+            ("blur-atkinson", "blur-atkinson", lambda f: blur_atkinson_render(
+                f, contrast=args.dither_contrast, sigma=args.clahe_blur)),
+            ("photo", "photo", None),
+        ]
+        number = 0
+        photo_state: dict[str, object] = {}
+        for mode, slug, fn in dither_specs:
+            if mode not in args.modes:
+                continue
+            number += 1
+            num = f"{number:02d}"
+            if mode == "photo":
+                if args.photo_resize == "area":
+                    import numpy as _np
+                    small_gray = area_resize(luma, frame.w, frame.h)
+                    photo_frame = PreviewFrame(px=small_gray, w=frame.w, h=frame.h,
+                                               x=frame.x, y=frame.y)
+                else:
+                    photo_frame = frame
+                mono, stabilised = photo_floyd_render(
+                    photo_frame, contrast=args.photo_contrast,
+                    brightness=args.photo_brightness, gamma=args.photo_gamma,
+                    sharpen_amount=args.photo_sharpen, blur_sigma=args.photo_blur,
+                    threshold=args.photo_threshold, strength=args.photo_strength,
+                    previous=photo_state.get(stem), alpha=args.photo_alpha)
+                photo_state[stem] = stabilised
+            else:
+                assert fn is not None
+                mono = fn(frame)
+            small = Image.fromarray(mono, mode="L")
+            big = upscale_nearest(small, args.preview_scale)
+
+            folder = out_dir / slug
+            folder.mkdir(parents=True, exist_ok=True)
+            small_path = folder / f"{stem}__{slug}.png"
+            big_path = folder / f"{stem}__{slug}_x{args.preview_scale}.png"
+            small.save(small_path)
+            big.save(big_path)
+
+            if mode == "photo":
+                label = (f"{slug} (contrast {args.photo_contrast}, bright {args.photo_brightness}, "
+                         f"gamma {args.photo_gamma}, alpha {args.photo_alpha}, "
+                         f"strength {args.photo_strength}, thr {args.photo_threshold}, "
+                         f"sharpen {args.photo_sharpen}, blur {args.photo_blur}, {args.photo_resize})")
+            elif mode == "clahe-floyd":
+                label = (f"{slug} (contrast {args.clahe_contrast}, clip {args.clahe_clip}, "
+                         f"tiles {args.clahe_tiles[0]}x{args.clahe_tiles[1]}, blur {args.clahe_blur})")
+            elif mode == "blur-atkinson":
+                label = f"{slug} (contrast {args.dither_contrast}, blur {args.clahe_blur})"
+            else:
+                label = f"{slug} (contrast {args.dither_contrast})"
+            items.append((num, label, f"{slug}/{big_path.name}"))
+            print(f"  {stem}  <- {num} {label}")
+            if not args.no_sheet:
+                rendered.append((num, label, big.convert("RGB")))
+
+        if "canny" in args.modes:
+            mono = canny_render(
+                frame,
+                blur_passes=args.blur_passes,
+                low=args.low,
+                high=args.high,
+            )
+            small = Image.fromarray(mono, mode="L")
+            big = upscale_nearest(small, args.preview_scale)
+
+            folder = out_dir / "canny"
+            folder.mkdir(parents=True, exist_ok=True)
+            small_path = folder / f"{stem}__canny.png"
+            big_path = folder / f"{stem}__canny_x{args.preview_scale}.png"
+            small.save(small_path)
+            big.save(big_path)
+
+            label = (f"canny (blur {args.blur_passes}, "
+                     f"low {args.low}, high {args.high})")
+            num = f"{len(items) + 1:02d}"
+            items.append((num, label, f"canny/{big_path.name}"))
+            print(f"  {stem}  <- {num} {label}")
+            if not args.no_sheet:
+                rendered.append((num, label, big.convert("RGB")))
+
+        groups.append((image_path, items))
+
+        if not args.no_sheet:
+            sheet = build_contact_sheet(
+                rgb, rendered, cols=args.cols, thumb_w=args.thumb_width,
+            )
+            sheet_dir = out_dir / "contact_sheets"
+            sheet_dir.mkdir(parents=True, exist_ok=True)
+            sheet_path = sheet_dir / f"{stem}__contact_sheet.jpg"
+            sheet.save(sheet_path, quality=92, subsampling=0)
+            sheet_paths[stem] = f"contact_sheets/{sheet_path.name}"
+            print(f"  sheet   -> {sheet_path.relative_to(out_dir)}")
+
+        print()
+
+    if not args.no_sheet:
+        index = write_gallery(out_dir, groups, sheet_paths)
+        print(f"gallery -> {index}")
+
+    print("\nDone. Open the gallery to compare dither vs Canny, then tune via "
+          "--dither-contrast / --blur-passes / --low / --high.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
