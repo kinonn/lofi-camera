@@ -104,6 +104,7 @@ Every output filename carries the filter slug, so a result is never ambiguous.
 | 42 | `cf21` | CF | Vivid landscape: contrast +25%, saturation 1.35, vignette 0.02 |
 | 43 | `polaroid_sx70` | Instant | Integral instant film: olive lifted blacks, ochre mid-tones, cyan shadows, creamy highlights |
 | 44 | `polaroid_sx70_border` | Instant | The same SX-70 chemistry inside a white border of equal width on all four sides |
+| 45 | `vintage_warm` | Creative | Reference-matched grade: lifted blacks, rolled cream highlights, deeper mid-tones, colour boosted |
 
 ---
 
@@ -299,6 +300,32 @@ because that frame's sky is already clipped at white.
 This is deliberately *not* the `contrast` field the film looks use. That one is
 a smoothstep blend on `0..1` and is far too gentle for "I want more contrast" -
 the CF ladder needed a different, honest knob.
+
+## The vintage warm grade (45)
+
+`45 vintage_warm` is not tied to a film stock — it was matched to four
+before/after reference pairs, each showing the left half ungraded and the right
+half graded. Measuring the two halves gives a consistent signature:
+
+| Metric | Before → after |
+|---|---|
+| Black point (luma p1) | **+0.023** — lifted |
+| Highlights (luma p99) | **−0.083** — rolled off, never clipped |
+| HSV saturation | **+0.11** |
+| R−B warmth | **+0.04** |
+
+That combination is not a faded look, which is the easy mistake: blacks come up
+*and* colour goes up. The preset reproduces it in two moves — `fade` lifts the
+blacks, while `midtone_gamma=1.28` and `highlight_rolloff=0.34` pull the top
+back down — then `wb` and the three tints supply the warmth and `saturation`
+the colour push.
+
+Run on the four `test-images/` captures, the deltas land within 0.03 of those
+targets (`p1` exact, `p50` −0.061, `p99` −0.057, `sat` +0.084, warmth +0.038).
+
+One tuning note worth keeping: the highlight tint has to be **red-dominant**,
+with green barely moved. Lifting R and G together over a blue sky reads as
+mint-green, whereas every reference only ever goes cream.
 
 ## Porting to the firmware (later)
 

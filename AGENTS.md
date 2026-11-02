@@ -36,7 +36,7 @@ changing firmware.
 - Keep preview and capture independent: `PREVIEW_MODE` only affects the OLED,
   `JPEG_FILTER` only affects the SD file. Neither may change the other's output.
 - SD writes stream through `JpegWriteFn`; keep the encoded JPEG out of RAM
-  (peak PSRAM is ~3.1 MB of 4 MB and depends on it).
+  (peak PSRAM is ~2.9 MB of 4 MB and depends on it).
 - No per-frame or per-shot heap allocation. Use `static`/file-scope buffers
   (`PreviewFrame`, the Canny scratch arrays, the once-allocated `previewRgb`).
 

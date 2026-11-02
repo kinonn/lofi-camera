@@ -919,6 +919,39 @@ _PRESETS.append(
     )
 )
 
+# --------------------------------------------------------------------------
+# Reference-matched grade
+# --------------------------------------------------------------------------
+
+_PRESETS.append(
+    FilmPreset(
+        name="vintage_warm",
+        label="Vintage warm (matte + saturated)",
+        family="Creative",
+        description="Warm compressed-range grade: lifted blacks, creamy rolled "
+                    "highlights, deeper mid-tones and boosted colour.",
+        auto_balance=0.60, auto_contrast=0.45,
+        # Measured from four before/after reference pairs, which agree on the
+        # shape of the change: the black point rises ~+0.02, the highlights come
+        # down ~-0.08, saturation goes *up* ~+0.1 and the image warms ~+0.04.
+        # That combination is not a faded look - it is a compressed range with
+        # the colour pushed, so `fade` lifts the blacks while `midtone_gamma`
+        # and `highlight_rolloff` pull the top back down.
+        wb=(1.02, 1.00, 0.95),
+        saturation=1.50,
+        midtone_gamma=1.28,
+        contrast=0.04, contrast_gain=1.02,
+        highlight_rolloff=0.34, fade=0.060,
+        # Red-dominant, not yellow: lifting R and G together over a blue sky
+        # reads as mint-green, whereas the references only ever go cream.
+        shadow_tint=(0.008, 0.001, -0.010),
+        midtone_tint=(0.004, -0.001, -0.006),
+        highlight_tint=(0.014, 0.002, -0.008),
+        softness=0.04, vignette=0.08,
+        grain=0.010, grain_size=1.2,
+    )
+)
+
 # Registry in presentation order, 1-based numbering used by the contact sheets.
 FILTERS: dict[str, FilmPreset] = {}
 for _i, _p in enumerate(_PRESETS, start=1):

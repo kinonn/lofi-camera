@@ -207,9 +207,10 @@ Known limitations (by design, not bugs):
   build and the OLED SCL wire must be detached to upload.
 - Capture blocks the loop for ~0.2–0.4 s, so the preview pauses briefly
   while the file is written.
-- SXGA stills need PSRAM: two JPEG frame buffers reserve roughly 500 KB. It
-  fits on the 4 MB module, but drop `fb_count` to `1` in `captureStill()` if
-  PSRAM allocation ever fails.
+- SXGA stills need PSRAM: the single JPEG frame buffer reserves ~256 KB. If
+  that allocation fails, the boot ladder (`CAM_MODES` in `src/main.cpp`) steps
+  down to XGA, SVGA and finally VGA on its own, and the OLED reports which
+  mode stuck.
 - Filenames are index-only — there is no RTC, so no timestamps.
 
 ## Build & upload
