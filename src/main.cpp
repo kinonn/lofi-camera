@@ -540,7 +540,14 @@ bool recoverCamera() {
   }
 
   restarts++;
-  unsigned long backoff = CAM_BACKOFF_MIN_MS << (restarts > 4 ? 3 : restarts - 1);
+  // Use explicit steps rather than shifting by restarts - 1: the recovery
+  // delay stays defined even if the counter update order changes. delay()
+  // intentionally blocks the viewfinder and shutter during this backoff.
+  const unsigned int multiplier =
+      (restarts <= 1) ? 1 :
+      (restarts == 2) ? 2 :
+      (restarts == 3) ? 4 : 8;
+  unsigned long backoff = CAM_BACKOFF_MIN_MS * multiplier;
   if (backoff > CAM_BACKOFF_MAX_MS) backoff = CAM_BACKOFF_MAX_MS;
   snprintf(line, sizeof(line), "retry %lus", backoff / 1000);
   DBG("Camera restart failed -- backing off %lu ms\n", backoff);
