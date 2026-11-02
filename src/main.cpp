@@ -339,6 +339,7 @@ bool initSD() {
     return false;
   }
   DBG("SD card: %llu MB\n", SD_MMC.cardSize() / (1024ULL * 1024ULL));
+  lastPhotoIdx = 0;
   return true;
 }
 
@@ -346,9 +347,7 @@ bool initSD() {
 bool retrySD() {
   SD_MMC.end();
   delay(50);
-  const bool mounted = initSD();
-  if (mounted) lastPhotoIdx = 0;
-  return mounted;
+  return initSD();
 }
 
 // Liveness probe for the mounted card. SD_MMC.cardType() is cached at mount
@@ -375,7 +374,6 @@ void waitForSD() {
     sdReady = retrySD();
   }
   sdFailStreak = 0;
-  lastPhotoIdx = 0;
   showText("SD card OK", "Ready to capture");
   DBG("SD card mounted\n");
   delay(600);
