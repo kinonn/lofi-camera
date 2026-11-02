@@ -87,8 +87,7 @@ inline void cannyDraw(Adafruit_SSD1306& disp, const PreviewFrame& f) {
       int gy = -at(src, x - 1, y - 1) - 2 * at(src, x, y - 1) - at(src, x + 1, y - 1)
              + at(src, x - 1, y + 1) + 2 * at(src, x, y + 1) + at(src, x + 1, y + 1);
 
-      int mag = abs(gx) + abs(gy);          // max 2040 for 8-bit input
-      if (mag > 2047) mag = 2047;
+            int mag = abs(gx) + abs(gy);          // max 1530 for 8-bit input
 
       const int ax = abs(gx);
       const int ay = abs(gy);
@@ -136,7 +135,7 @@ inline void cannyDraw(Adafruit_SSD1306& disp, const PreviewFrame& f) {
           break;
       }
 
-      if (m < a || m < b) continue;  // not a ridge -> suppressed
+      if (m <= a || m < b) continue; // break plateaus consistently on one side
 
       if (m >= CANNY_HIGH) {
         edge[i] = 2;                  // strong
