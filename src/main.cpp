@@ -98,7 +98,6 @@ unsigned long lastFpsT = 0;
 bool sdReady = false;
 bool oledReady = false;
 bool btnPrev = true;  // pull-up idle HIGH
-static unsigned int lastPhotoIdx = 0;
 unsigned long lastBtnT = 0;
 int sdFailStreak = 0;
 unsigned long lastSdCheck = 0;
@@ -346,9 +345,7 @@ bool initSD() {
 bool retrySD() {
   SD_MMC.end();
   delay(50);
-  const bool mounted = initSD();
-  if (mounted) lastPhotoIdx = 0;
-  return mounted;
+  return initSD();
 }
 
 // Liveness probe for the mounted card. SD_MMC.cardType() is cached at mount
@@ -375,7 +372,6 @@ void waitForSD() {
     sdReady = retrySD();
   }
   sdFailStreak = 0;
-  lastPhotoIdx = 0;
   showText("SD card OK", "Ready to capture");
   DBG("SD card mounted\n");
   delay(600);
@@ -400,6 +396,8 @@ bool restartCamera() {
 // Find the next free /img_NNNN.jpg and write it into `out`. Returns false when
 // all slots are taken. The scan remembers where it stopped, so a full card is
 // not re-walked from index 0 on every shot.
+static unsigned int lastPhotoIdx = 0;
+
 bool nextPhotoPath(char* out, size_t outLen) {
   for (unsigned int i = 0; i < 10000; i++) {
     unsigned int n = (lastPhotoIdx + i) % 10000;
