@@ -481,7 +481,7 @@ def apply_filter(img: Image.Image, preset: FilmPreset, seed: int | None = None) 
 
 
 # --------------------------------------------------------------------------
-# the 20 looks
+# the film-stock and creative looks
 # --------------------------------------------------------------------------
 
 _PRESETS = [

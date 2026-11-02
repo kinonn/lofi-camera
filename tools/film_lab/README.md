@@ -3,7 +3,7 @@
 Host-side test bench for choosing a **film-camera colour look** for the JPEGs
 that `lofi-camera` saves to the SD card.
 
-It runs every look defined in `film_emulation.py` — 20 Kodak / Fujifilm /
+It runs every look defined in `film_emulation.py` — Kodak / Fujifilm /
 creative film stocks, a Diana F+ toy camera, and a neutral `cf01` enhancement
 pass — over the sample captures in `../../test-images/` so a look can be picked
 by eye **before** anything is written in C++ for the ESP32. No firmware file is
@@ -82,6 +82,26 @@ Every output filename carries the filter slug, so a result is never ambiguous.
 | 20 | `ilford_hp5_bw` | Mono | Panchromatic B&W, deep blacks, coarse grain |
 | 21 | `diana_f` | Toy | Plastic lens: heavy vignette, dreamy edges, low contrast, barrel bulge, light leak |
 | 22 | `cf01` | CF | Neutral: saturation +5%, unsharp mask +10%, very light vignette |
+| 23 | `cf02` | CF | Contrast +10% |
+| 24 | `cf03` | CF | Contrast +20% |
+| 25 | `cf04` | CF | Contrast +35% |
+| 26 | `cf05` | CF | Contrast +50% |
+| 27 | `cf06` | CF | Contrast +75% |
+| 28 | `cf07` | CF | Contrast +35%, mid-tones lifted |
+| 29 | `cf08` | CF | Contrast +50%, mid-tones lifted |
+| 30 | `cf09` | CF | Contrast +20%, mid-tones lowered |
+| 31 | `cf10` | CF | Saturation +10% |
+| 32 | `cf11` | CF | Saturation +20% |
+| 33 | `cf12` | CF | Saturation +30% |
+| 34 | `cf13` | CF | Saturation −10% |
+| 35 | `cf14` | CF | Sharpen 0.20 |
+| 36 | `cf15` | CF | Sharpen 0.35 |
+| 37 | `cf16` | CF | Vignette 0.12 |
+| 38 | `cf17` | CF | Vignette 0.22 |
+| 39 | `cf18` | CF | Exposure +0.3 EV |
+| 40 | `cf19` | CF | Exposure −0.3 EV |
+| 41 | `cf20` | CF | Punchy: contrast +30%, saturation 1.20, sharpen 0.18 |
+| 42 | `cf21` | CF | Vivid landscape: contrast +25%, saturation 1.35, vignette 0.02 |
 | 43 | `polaroid_sx70` | Instant | Integral instant film: olive lifted blacks, ochre mid-tones, cyan shadows, creamy highlights |
 | 44 | `polaroid_sx70_border` | Instant | The same SX-70 chemistry inside a white border of equal width on all four sides |
 
