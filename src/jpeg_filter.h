@@ -9,9 +9,8 @@
 // pure pass-through -- the camera's JPEG is written verbatim, no decode.
 //
 //   JPEG_FILTER_NONE          write the camera frame unchanged (zero cost)
-//   JPEG_FILTER_WHITE_BORDER  draw a white border *inside* the frame: the
-//                             photo is inset, scaled slightly to fit, and the
-//                             output keeps the capture's pixel dimensions
+//   JPEG_FILTER_WHITE_BORDER  paint a white border over the frame edges; the
+//                             outer 20 px are lost, with no resampling
 //
 // Switch in platformio.ini:
 //   build_flags = -DJPEG_FILTER=JPEG_FILTER_WHITE_BORDER
@@ -31,9 +30,9 @@
 // The canvas keeps the capture's dimensions (SXGA stays 1280x1024); the
 // border is carved out of the image area instead of growing the frame. That
 // needs only ONE large buffer -- the RGB565 canvas -- because the JPEG is
-// decoded straight into it through a block callback. At SXGA that canvas is
-// 2.5 MiB, roughly 3.4 MiB peak with the camera buffer and encoder output,
-// so it fits a 4 MB PSRAM module.
+// decoded directly into it. At SXGA that canvas is 2,621,440 bytes (2.5 MiB).
+// With one SXGA camera buffer, the calculated peak is about 2.9 MB including
+// decoder/encoder work space, within 4 MB PSRAM.
 
 // The decoder emits RGB565 in a byte order intended for LCD panels. If the
 // re-encoded photo comes out with red and blue swapped, set this to 1.
