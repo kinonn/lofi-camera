@@ -31,8 +31,12 @@
   #stage-wrap { position:relative; overflow:hidden; cursor:grab; background:
     radial-gradient(circle at 1px 1px, #23252b 1px, transparent 1px) 0 0/22px 22px; }
   #stage-wrap.panning { cursor:grabbing; }
-  #stage { position:absolute; inset:0; transform-origin:0 0; }
-  #wires { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; transform-origin:0 0; }
+  #stage { position:absolute; inset:0; transform-origin:0 0; z-index:1; }
+  #wires { position:absolute; inset:0; width:100%; height:100%; transform-origin:0 0; z-index:2; pointer-events:none; }
+  #wires path.wire-hit { pointer-events:stroke; }
+  #wires path.wire { pointer-events:stroke; cursor:pointer; }
+  #wires path.wire:hover { stroke:#7dff9e; }
+  #wires path.wire.selected { stroke:var(--acc); }
   .node { position:absolute; width:190px; background:var(--panel);
           border:1px solid var(--line); border-radius:8px; font-size:12px;
           box-shadow:0 4px 14px rgba(0,0,0,.35); }
@@ -43,8 +47,12 @@
   .node .del { margin-left:auto; padding:0 6px; font-size:14px; line-height:1.4;
                 background:transparent; border:none; color:var(--dim); }
   .node .del:hover { color:#ff8080; border:none; }
-  .node .dot { width:10px; height:10px; border-radius:50%; background:#555;
-               border:1px solid #888; flex:none; }
+  .node .dot { width:12px; height:12px; border-radius:50%; background:#3ddc84;
+               border:1px solid #1d7a4c; flex:none; cursor:pointer; }
+  .node .dot:hover { filter:brightness(1.2); }
+  .node.bypassed .dot { background:#ff5555; border-color:#8a2020; }
+  .node.bypassed { opacity:.55; }
+  .node.bypassed .title { text-decoration:line-through; }
   .node .title { font-weight:600; flex:1; }
   .node .body { padding:7px 9px; color:var(--dim); }
   .node .body label { display:block; margin:4px 0; color:var(--txt); font-size:11px; }
@@ -52,15 +60,16 @@
     background:#101114; color:var(--txt); border:1px solid var(--line);
     border-radius:4px; padding:3px 5px; font-size:11px; }
   .node .body input[type=file] { padding:0; }
-  .port { position:absolute; top:50%; width:14px; height:14px; border-radius:50%;
-          background:#3a3d44; border:2px solid #888; cursor:crosshair;
-          transform:translateY(-50%); }
+  .port { position:absolute; top:calc(50% - 7px); width:14px; height:14px; border-radius:50%;
+          background:#3a3d44; border:2px solid #888; cursor:crosshair; }
   .port.in { left:-8px; }
   .port.out { right:-8px; }
   .port:hover, .port.armed { border-color:var(--acc); background:var(--acc); }
   #inspector { border-left:1px solid var(--line); padding:12px; overflow:auto; }
-  #inspector canvas { width:100%; image-rendering:pixelated; background:#000;
+  #inspector canvas { image-rendering:pixelated; background:#000;
     border-radius:6px; border:1px solid var(--line); }
+  #out-panel { width:128px; height:64px; }
+  #out-2x { width:256px; height:128px; }
   #inspector .row { display:flex; gap:8px; margin:6px 0; }
   #inspector .row > div { flex:1; }
   #inspector label { display:block; font-size:11px; color:var(--dim); margin:6px 0 2px; }
@@ -78,7 +87,7 @@
 <body>
 <header>
   <h1>lofi-cam preview pipeline playground</h1>
-  <p>drag blocks &middot; drag background to pan &middot; click <kbd>&cir;</kbd> out then <kbd>&cir;</kbd> in to wire &middot; <kbd>Del</kbd> removes selected &middot; <kbd>Ctrl+Z</kbd>/<kbd>Ctrl+Y</kbd> undo/redo &middot; Run executes left to right</p>
+  <p>drag blocks &middot; drag background to pan &middot; click <kbd>&cir;</kbd> out then <kbd>&cir;</kbd> in to wire &middot; click a wire to select, <kbd>Del</kbd> removes it &middot; click <kbd>&#9679;</kbd> or press <kbd>B</kbd> to bypass selected &middot; <kbd>Del</kbd> removes selected block &middot; <kbd>Ctrl+Z</kbd>/<kbd>Ctrl+Y</kbd> undo/redo &middot; Run executes left to right</p>
   <div class="spacer"></div>
   <button id="btn-run" class="primary">Run pipeline</button>
   <button id="btn-undo" title="undo (Ctrl+Z)">Undo</button>
@@ -107,10 +116,10 @@
   <div id="inspector">
     <h2>Output</h2>
     <div class="row">
-      <div><label>Panel preview (128&times;64 scaled)</label><canvas id="out-panel" width="128" height="64"></canvas></div>
+      <div><label>Panel preview (128&times;64 actual size)</label><canvas id="out-panel" width="128" height="64"></canvas></div>
     </div>
     <div class="row">
-      <div><label>Magnified (&times;4)</label><canvas id="out-big" width="512" height="256"></canvas></div>
+      <div><label>2&times; scaled</label><canvas id="out-2x" width="256" height="128"></canvas></div>
     </div>
     <label>Chain</label>
     <div id="chain" style="font-size:11px;color:var(--dim)">—</div>
@@ -394,7 +403,7 @@ const stageWrap = document.getElementById("stage-wrap");
 const wires = document.getElementById("wires");
 const logEl = document.getElementById("log");
 const chainEl = document.getElementById("chain");
-let nodes = [], edges = [], seq = 0, selected = null, armedPort = null;
+let nodes = [], edges = [], seq = 0, selected = null, selectedWire = -1, armedPort = null;
 let lastResult = null;
 let panX = 0, panY = 0;
 
@@ -405,7 +414,7 @@ const btnRedo = ()=>document.getElementById("btn-redo");
 function snapshot(){
   return {
     nodes: nodes.map(n=>({id:n.id, type:n.type, x:n.el.offsetLeft, y:n.el.offsetTop,
-      params:{...n.params}, hasFile:!!n.file, fileName:n.file?n.file.name:null})),
+      params:{...n.params, _bypassed:n.bypassed}, hasFile:!!n.file, fileName:n.file?n.file.name:null})),
     edges: edges.map(e=>({...e})),
     seq, panX, panY,
   };
@@ -460,7 +469,7 @@ function applyPan(){
 // Node headers stop propagation via their own pointer handlers, so a drag
 // starting on a node moves the node, not the canvas.
 stageWrap.addEventListener("pointerdown", e=>{
-  if(e.target.closest(".node") || e.target.closest(".port")) return;
+  if(e.target.closest(".node") || e.target.closest(".port") || e.target.closest("#wires")) return;
   stageWrap.classList.add("panning");
   try { stageWrap.setPointerCapture(e.pointerId); } catch(_){ /* synthetic events */ }
   const sx=e.clientX, sy=e.clientY, ox=panX, oy=panY;
@@ -495,12 +504,17 @@ function addNodeRaw(type, x, y, id, params){
   }
   if(type==="input") body += `<label>file<input data-k="file" type="file" accept="image/*"></label>`;
   body += `</div>`;
-  el.innerHTML = `<header><span class="dot"></span><span class="title">${def.title}</span><button class="del" title="delete block">&times;</button></header>${body}` +
+  el.innerHTML = `<header><span class="dot" title="click to bypass/enable (B)"></span><span class="title">${def.title}</span><button class="del" title="delete block">&times;</button></header>${body}` +
     (def.hasIn?`<div class="port in" data-port="in" title="input"></div>`:"") +
     (def.hasOut?`<div class="port out" data-port="out" title="output"></div>`:"");
   stage.appendChild(el);
-  const node = {id, type, def, el, params:{}};
+  const node = {id, type, def, el, params:{}, bypassed:false};
   for(const p of def.params) node.params[p.k]=(params && p.k in params)?params[p.k]:p.def;
+  if(params && params._bypassed) { node.bypassed = true; el.classList.add("bypassed"); }
+  el.querySelector(".dot").addEventListener("click", e=>{
+    e.stopPropagation();
+    toggleBypass(node);
+  });
   // reflect restored params in the inputs
   el.querySelectorAll("[data-k]").forEach(inp=>{
     const k = inp.dataset.k;
@@ -536,6 +550,7 @@ function addNodeRaw(type, x, y, id, params){
   el.addEventListener("click", e=>{
     document.querySelectorAll(".node").forEach(n=>n.classList.remove("selected"));
     el.classList.add("selected"); selected = node;
+    if(selectedWire!==-1){ selectedWire=-1; drawWires(); }
   });
   el.querySelector(".del").addEventListener("click", e=>{
     e.stopPropagation();
@@ -561,6 +576,13 @@ function addNodeRaw(type, x, y, id, params){
   return node;
 }
 
+function toggleBypass(node){
+  pushHistory();
+  node.bypassed = !node.bypassed;
+  node.el.classList.toggle("bypassed", node.bypassed);
+  log(`${node.def.title} ${node.bypassed?"bypassed (skipped by pipeline)":"enabled"}`);
+}
+
 function deleteNode(node){
   pushHistory();
   nodes = nodes.filter(n=>n.id!==node.id);
@@ -569,6 +591,7 @@ function deleteNode(node){
     armedPort.el.classList.remove("armed"); armedPort=null;
   }
   if(selected && selected.id===node.id) selected=null;
+  selectedWire = -1;
   node.el.remove();
   drawWires();
   log(`${node.def.title} removed`);
@@ -588,36 +611,79 @@ document.addEventListener("keydown", e=>{
     if(typing) return;
     e.preventDefault(); redo(); return;
   }
+  if(!mod && (e.key==="b" || e.key==="B")){
+    if(typing) return;
+    if(selected){
+      e.preventDefault();
+      toggleBypass(selected);
+    }
+    return;
+  }
   if(e.key!=="Delete" && e.key!=="Backspace") return;
   if(typing) return;
+  if(selectedWire!==-1){
+    e.preventDefault();
+    pushHistory();
+    edges.splice(selectedWire,1);
+    selectedWire = -1;
+    drawWires();
+    log("wire removed — click an out-port then an in-port to rewire");
+    return;
+  }
   if(selected){
     e.preventDefault();
     deleteNode(selected);
   }
 });
 
-function nodeCenter(id, side){
+function portCenter(id, side){
   const n = nodes.find(n=>n.id===id); if(!n) return null;
-  const r = n.el.getBoundingClientRect(), s = stage.getBoundingClientRect();
-  // stage is inside wrapper; wires svg covers wrapper — use offset within stage
-  const x = n.el.offsetLeft + (side==="out"?n.el.offsetWidth:0);
-  const y = n.el.offsetTop + 20;
-  return {x, y};
+  const port = n.el.querySelector(`.port.${side}`); if(!port) return null;
+  // port center relative to the stage (both live inside the panned stage).
+  // Anchor to the port's outer edge so the wire meets the circle's side.
+  const cx = n.el.offsetLeft + port.offsetLeft + port.offsetWidth/2;
+  const cy = n.el.offsetTop + port.offsetTop + port.offsetHeight/2;
+  const edge = side==="out" ? cx + port.offsetWidth/2 : cx - port.offsetWidth/2;
+  return {x: edge, y: cy};
 }
 function drawWires(){
-  const r = stage.getBoundingClientRect();
+  const r = stageWrap.getBoundingClientRect();
   wires.setAttribute("viewBox", `0 0 ${r.width} ${r.height}`);
   wires.innerHTML = "";
-  for(const e of edges){
-    const a = nodeCenter(e.from,"out"), b = nodeCenter(e.to,"in");
-    if(!a||!b) continue;
+  edges.forEach((e, idx)=>{
+    const a = portCenter(e.from,"out"), b = portCenter(e.to,"in");
+    if(!a||!b) return;
     const mx = (a.x+b.x)/2;
+    const d = `M ${a.x} ${a.y} C ${mx} ${a.y}, ${mx} ${b.y}, ${b.x} ${b.y}`;
+    // fat invisible hit path (easy to click) + thin visible wire on top
+    const hit = document.createElementNS("http://www.w3.org/2000/svg","path");
+    hit.setAttribute("d", d);
+    hit.setAttribute("stroke","rgba(0,0,0,0)");
+    hit.setAttribute("stroke-width","14");
+    hit.setAttribute("fill","none");
+    hit.classList.add("wire-hit");
+    hit.style.pointerEvents = "stroke";
+    hit.style.cursor = "pointer";
+    hit.innerHTML = `<title>click to select, Delete to remove</title>`;
+    hit.addEventListener("click", ev=>{
+      ev.stopPropagation();
+      selectedWire = (selectedWire===idx) ? -1 : idx;
+      // selecting a wire deselects any node
+      document.querySelectorAll(".node").forEach(n=>n.classList.remove("selected"));
+      selected = null;
+      drawWires();
+    });
     const p = document.createElementNS("http://www.w3.org/2000/svg","path");
-    p.setAttribute("d", `M ${a.x} ${a.y} C ${mx} ${a.y}, ${mx} ${b.y}, ${b.x} ${b.y}`);
-    p.setAttribute("stroke","#ffc460"); p.setAttribute("stroke-width","2");
+    p.setAttribute("d", d);
+    p.setAttribute("stroke", idx===selectedWire ? "#ffc460" : "#3ddc84");
+    p.setAttribute("stroke-width","2");
     p.setAttribute("fill","none");
+    p.classList.add("wire");
+    if(idx===selectedWire) p.classList.add("selected");
+    p.style.pointerEvents = "none";
+    wires.appendChild(hit);
     wires.appendChild(p);
-  }
+  });
 }
 window.addEventListener("resize", drawWires);
 
@@ -702,17 +768,20 @@ async function runPipeline(){
       cur = e ? byId[e.from] : null;
     }
     if(chain[0].type!=="input"){ log("an Output is not wired back to an Image input — skipping"); continue; }
-    chainEl.textContent = chain.map(n=>n.def.title).join(" → ");
+    const active = chain.filter(n=>!n.bypassed);
+    const skipped = chain.filter(n=>n.bypassed).map(n=>n.def.title);
+    chainEl.textContent = active.map(n=>n.def.title).join(" → ") + (skipped.length?`  (bypassed: ${skipped.join(", ")})`:"");
     try{
-      const result = await execChain(chain);
+      const result = await execChain(active);
       lastResult = result;
       paintResult(result);
-      log(`done: ${chain.map(n=>n.def.title).join(" → ")} → ${result.w}×${result.h} ${result.kind}`);
+      log(`done: ${active.map(n=>n.def.title).join(" → ")} → ${result.w}×${result.h} ${result.kind}` + (skipped.length?` [bypassed: ${skipped.join(", ")}]`:""));
     }catch(err){ log("ERROR: "+err.message); console.error(err); }
   }
 }
 
 async function execChain(chain){
+  chain = chain.filter(n=>!n.bypassed);
   let rgb=null, W=0, H=0, gray=null, w=0, h=0, mono=null, prev=null;
   for(const node of chain){
     const p = node.params;
@@ -776,7 +845,6 @@ async function execChain(chain){
 
 function paintResult(res){
   const panel = document.getElementById("out-panel");
-  const big = document.getElementById("out-big");
   // letterbox onto 128x64 like the firmware
   const disp = new Uint8Array(PANEL_W*PANEL_H).fill(0);
   const src = res.data;
@@ -789,10 +857,13 @@ function paintResult(res){
   const img = ctx.createImageData(PANEL_W,PANEL_H);
   for(let i=0;i<disp.length;i++){ img.data[i*4]=img.data[i*4+1]=img.data[i*4+2]=disp[i]; img.data[i*4+3]=255; }
   ctx.putImageData(img,0,0);
-  const bctx = big.getContext("2d");
-  bctx.imageSmoothingEnabled = false;
-  bctx.clearRect(0,0,big.width,big.height);
-  bctx.drawImage(panel,0,0,big.width,big.height);
+  const big = document.getElementById("out-2x");
+  if(big){
+    const bctx = big.getContext("2d");
+    bctx.imageSmoothingEnabled = false;
+    bctx.clearRect(0,0,big.width,big.height);
+    bctx.drawImage(panel,0,0,big.width,big.height);
+  }
 }
 
 document.getElementById("btn-run").onclick = runPipeline;
