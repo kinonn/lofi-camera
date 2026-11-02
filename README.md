@@ -118,7 +118,7 @@ Canny tunables (also `-D` overridable), defaults tuned for outline-only output:
 | `CANNY_HIGH` | `160` | Strong-edge threshold — the density knob. Raise for sparser output. |
 | `CANNY_LOW` | `80` | Weak-edge threshold; keep at roughly ⅓–½ of `CANNY_HIGH`. |
 
-Magnitudes are `|gx|+|gy|` on 0–255 input, so the usable range is 0–2040.
+Magnitudes are `|gx|+|gy|` on 0–255 input, with a maximum of 1530.
 If faces still show too much internal detail, raise `CANNY_BLUR_PASSES` to `3`
 before pushing `CANNY_HIGH` higher — blurring removes texture without
 thinning genuine object outlines.
