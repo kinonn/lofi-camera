@@ -7,26 +7,24 @@
 // ---------------------------------------------------------------------------
 // OLED viewfinder image processing, selected at compile time.
 //
-// Switch modes by adding a build flag in platformio.ini, e.g.
-//     build_flags = -DPREVIEW_MODE=PREVIEW_MODE_CANNY
-// or by editing the fallback #define below.
+// Select the supported renderer by setting PREVIEW_MODE in platformio.ini.
+// Floyd-Steinberg is the only firmware renderer; unsupported selections fail
+// below.
 //
 // This only affects what is drawn on the OLED. Saving full-resolution JPEGs
 // to the SD card goes through a completely separate path and is unaffected.
 // ---------------------------------------------------------------------------
-#define PREVIEW_MODE_DITHER 1
-#define PREVIEW_MODE_CANNY  2
+#define PREVIEW_MODE_FLOYD_STEINBERG 1
 
 #ifndef PREVIEW_MODE
-#define PREVIEW_MODE PREVIEW_MODE_DITHER
+#define PREVIEW_MODE PREVIEW_MODE_FLOYD_STEINBERG
 #endif
 
-#if (PREVIEW_MODE != PREVIEW_MODE_DITHER) && (PREVIEW_MODE != PREVIEW_MODE_CANNY)
-#error "PREVIEW_MODE must be PREVIEW_MODE_DITHER or PREVIEW_MODE_CANNY"
+#if PREVIEW_MODE != PREVIEW_MODE_FLOYD_STEINBERG
+#error "PREVIEW_MODE must be PREVIEW_MODE_FLOYD_STEINBERG"
 #endif
 
-#include "preview_dither.h"
-#include "preview_canny.h"
+#include "preview_floyd_steinberg.h"
 
 // Downscale `img` to fit the display while preserving aspect ratio, centring
 // the result (letterbox). Nearest-neighbour is deliberate: the source is
@@ -68,9 +66,5 @@ inline void previewPrepare(PreviewFrame& f, const uint8_t* img,
 // Render a prepared frame using the selected mode. Clearing the display and
 // pushing it to the panel stays with the caller, so renderers only draw.
 inline void previewDraw(Adafruit_SSD1306& disp, const PreviewFrame& f) {
-#if (PREVIEW_MODE == PREVIEW_MODE_DITHER)
-  ditherDraw(disp, f);
-#elif (PREVIEW_MODE == PREVIEW_MODE_CANNY)
-  cannyDraw(disp, f);
-#endif
+  floydSteinbergDraw(disp, f);
 }

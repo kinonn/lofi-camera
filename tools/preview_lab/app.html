@@ -20,10 +20,10 @@
   button:hover { border-color:var(--acc); }
   button.primary { background:var(--acc); color:#1a1a1a; border-color:var(--acc);
                    font-weight:600; }
-  #layout { display:grid; grid-template-columns:230px 1fr 300px; gap:0;
+  #layout { display:grid; grid-template-columns:230px minmax(0, 1fr); gap:0;
             height:calc(100vh - 57px); }
-  #palette { border-right:1px solid var(--line); padding:12px; overflow:auto; }
-  #palette h2, #inspector h2 { font-size:12px; text-transform:uppercase;
+  #palette { border-right:1px solid var(--line); padding:12px; overflow:auto; min-width:0; }
+  #palette h2 { font-size:12px; text-transform:uppercase;
     letter-spacing:.08em; color:var(--dim); margin:4px 0 8px; }
   #palette h3 { font-size:12px; margin:12px 0 6px; color:var(--txt); }
   .pal-btn { display:block; width:100%; text-align:left; margin:4px 0; }
@@ -40,6 +40,8 @@
   .node { position:absolute; width:190px; background:var(--panel);
           border:1px solid var(--line); border-radius:8px; font-size:12px;
           box-shadow:0 4px 14px rgba(0,0,0,.35); }
+  .node.output-node { width:300px; }
+  .node.output-node .port.in { top:28px; }
   .node.selected { border-color:var(--acc); }
   .node header { padding:7px 9px; cursor:grab; border-bottom:1px solid var(--line);
                  display:flex; align-items:center; gap:6px; }
@@ -59,25 +61,28 @@
   .node .body input, .node .body select { width:100%; margin-top:2px;
     background:#101114; color:var(--txt); border:1px solid var(--line);
     border-radius:4px; padding:3px 5px; font-size:11px; }
+  .node .body input[type=checkbox] { width:auto; vertical-align:middle; }
   .node .body input[type=file] { padding:0; }
   .port { position:absolute; top:calc(50% - 7px); width:14px; height:14px; border-radius:50%;
           background:#3a3d44; border:2px solid #888; cursor:crosshair; }
   .port.in { left:-8px; }
   .port.out { right:-8px; }
   .port:hover, .port.armed { border-color:var(--acc); background:var(--acc); }
-  #inspector { border-left:1px solid var(--line); padding:12px; overflow:auto; }
-  #inspector canvas { image-rendering:pixelated; background:#000;
-    border-radius:6px; border:1px solid var(--line); }
-  #out-panel { width:128px; height:64px; }
-  #out-2x { width:256px; height:128px; }
-  #inspector .row { display:flex; gap:8px; margin:6px 0; }
-  #inspector .row > div { flex:1; }
-  #inspector label { display:block; font-size:11px; color:var(--dim); margin:6px 0 2px; }
-  #inspector input, #inspector select { width:100%; background:#101114;
-    color:var(--txt); border:1px solid var(--line); border-radius:4px;
-    padding:4px 6px; font-size:12px; }
-  #log { font-size:11px; color:var(--dim); white-space:pre-wrap; margin-top:8px;
-         max-height:160px; overflow:auto; }
+  .output-content { padding:0 9px 9px; }
+  .output-actions { display:flex; align-items:center; gap:7px; margin:7px 0 4px; }
+  .output-actions button { padding:4px 7px; font-size:10px; }
+  .copy-status { color:var(--dim); font-size:10px; }
+  .output-content label { display:block; font-size:10px; color:var(--dim); margin:6px 0 3px; }
+  .output-content canvas { display:block; image-rendering:pixelated; background:#000;
+    border-radius:4px; border:1px solid var(--line); max-width:100%; height:auto; }
+  .output-panel { width:128px; height:64px; }
+  .output-2x { width:256px; height:128px; }
+  .output-chain, .output-meta { color:var(--dim); font-size:10px; overflow-wrap:anywhere; }
+  .output-log { margin-top:6px; padding:5px; color:var(--dim); background:#141518;
+    border-radius:4px; font:10px/1.4 ui-monospace,Consolas,monospace;
+    white-space:pre-wrap; max-height:72px; overflow:auto; }
+  #app-status { color:var(--dim); font-size:11px; min-width:0; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
   #hint { padding:8px 12px; font-size:11px; color:var(--dim);
           border-top:1px solid var(--line); }
   kbd { background:#26282e; border:1px solid var(--line); border-radius:4px;
@@ -87,7 +92,7 @@
 <body>
 <header>
   <h1>lofi-cam preview pipeline playground</h1>
-  <p>drag blocks &middot; drag background to pan &middot; click <kbd>&cir;</kbd> out then <kbd>&cir;</kbd> in to wire &middot; click a wire to select, <kbd>Del</kbd> removes it &middot; click <kbd>&#9679;</kbd> or press <kbd>B</kbd> to bypass selected &middot; <kbd>Del</kbd> removes selected block &middot; <kbd>Ctrl+Z</kbd>/<kbd>Ctrl+Y</kbd> undo/redo &middot; Run executes left to right</p>
+  <p>drag blocks &middot; pan background &middot; wire out to in &middot; <kbd>B</kbd> bypass &middot; <kbd>Del</kbd> delete &middot; <kbd>Ctrl+Z</kbd>/<kbd>Ctrl+Y</kbd> undo/redo &middot; Run sends results to each Output block</p>
   <div class="spacer"></div>
   <button id="btn-run" class="primary">Run pipeline</button>
   <button id="btn-undo" title="undo (Ctrl+Z)">Undo</button>
@@ -96,6 +101,7 @@
   <button id="btn-clear-wires">Clear wires</button>
   <button id="btn-clear-all">Clear canvas</button>
   <button id="btn-default">Default chain</button>
+  <span id="app-status" role="status" aria-live="polite">Ready</span>
 </header>
 <div id="layout">
   <div id="palette">
@@ -112,19 +118,6 @@
   <div id="stage-wrap">
     <svg id="wires"></svg>
     <div id="stage"></div>
-  </div>
-  <div id="inspector">
-    <h2>Output</h2>
-    <div class="row">
-      <div><label>Panel preview (128&times;64 actual size)</label><canvas id="out-panel" width="128" height="64"></canvas></div>
-    </div>
-    <div class="row">
-      <div><label>2&times; scaled</label><canvas id="out-2x" width="256" height="128"></canvas></div>
-    </div>
-    <label>Chain</label>
-    <div id="chain" style="font-size:11px;color:var(--dim)">—</div>
-    <label>Log</label>
-    <div id="log">Drop blocks onto the canvas, wire them, then Run.</div>
   </div>
 </div>
 <div id="hint">Tip: the <b>Image input</b> block can load a sample from <code>test-images/</code> (when opened from the repo) or any file you upload. <b>Resize</b> defaults to 128&times;64 area-average — switch to nearest only if the source is already panel-sized. Grayscale uses the firmware <code>decodePreviewGray</code> math (RGB565 quantise + 54/183/19).</div>
@@ -280,30 +273,33 @@ function atkinson(gray,w,h,threshold){
 
 // ---- CLAHE (lightweight) ----
 function clahe(gray,w,h,clip,tiles){
-  clip=Math.max(1,clip); const rows=Math.min(h,Math.max(1,tiles|0)), cols=rows;
-  const rh=Math.ceil(h/rows), cw=Math.ceil(w/cols);
+  clip=Math.max(1,clip);
+  const rows=Math.min(h,Math.max(1,tiles|0)), cols=Math.min(w,Math.max(1,tiles|0));
   const maps=[];
   for(let ty=0;ty<rows;ty++){ maps.push([]);
     for(let tx=0;tx<cols;tx++){
       const hist=new Array(256).fill(0);
       let n=0;
-      for(let y=ty*rh;y<Math.min(h,(ty+1)*rh);y++) for(let x=tx*cw;x<Math.min(w,(tx+1)*cw);x++){ hist[gray[y*w+x]]++; n++; }
+      const y0=Math.floor(ty*h/rows), y1=Math.floor((ty+1)*h/rows);
+      const x0=Math.floor(tx*w/cols), x1=Math.floor((tx+1)*w/cols);
+      for(let y=y0;y<y1;y++) for(let x=x0;x<x1;x++){ hist[gray[y*w+x]]++; n++; }
       const lim=clip*n/256; let ex=0;
       for(let i=0;i<256;i++){ if(hist[i]>lim){ ex+=hist[i]-lim; hist[i]=lim; } }
       for(let i=0;i<256;i++) hist[i]+=ex/256;
       let c=0; const cdf=hist.map(v=>{c+=v;return c;});
-      maps[ty].push(cdf.map(v=>v/c[n-1]*255));
+      const total=cdf[255];
+      maps[ty].push(total>0 ? cdf.map(v=>v/total*255) : Array.from({length:256},(_,i)=>i));
     }
   }
   const out=new Uint8Array(w*h);
   for(let y=0;y<h;y++) for(let x=0;x<w;x++){
-    const ty=Math.min(rows-1,(y/rh)|0), tx=Math.min(cols-1,(x/cw)|0);
+    const ty=Math.min(rows-1,Math.floor(y*rows/h)), tx=Math.min(cols-1,Math.floor(x*cols/w));
     out[y*w+x]=Math.round(clamp255(maps[ty][tx][gray[y*w+x]]));
   }
   return out;
 }
 
-// ---- Canny (compact port of preview_canny.h) ----
+// ---- Lab-only Canny edge detector ----
 function canny(gray,w,h,blurPasses,low,high){
   let src = Uint8Array.from(gray);
   for(let p=0;p<blurPasses;p++){ // 3x3 binomial, integer
@@ -348,49 +344,105 @@ function canny(gray,w,h,blurPasses,low,high){
    Block definitions
    ============================================================ */
 const DEFS = {
-  input:   {title:"Image input", group:"source", desc:"upload or sample",
-            params:[{k:"source",label:"source",type:"select",opts:["upload","img_0027","img_0037","img_0038","img_0045","gradient"],def:"img_0027"}],
-            hasIn:false, hasOut:true},
-  grayscale:{title:"Grayscale", group:"pre", desc:"decodePreviewGray math",
-            params:[], hasIn:true, hasOut:true},
-  resize:  {title:"Resize", group:"pre", desc:"area / nearest",
-            params:[{k:"w",label:"width",type:"number",def:128},{k:"h",label:"height",type:"number",def:64},
-                    {k:"method",label:"method",type:"select",opts:["area","nearest"],def:"area"}],
-            hasIn:true, hasOut:true},
-  tone:    {title:"Tone adjust", group:"pre", desc:"contrast · brightness",
-            params:[{k:"contrast",label:"contrast (gain)",type:"number",def:1.15,step:"0.01"},
-                    {k:"brightness",label:"brightness",type:"number",def:0,step:"0.01"}],
-            hasIn:true, hasOut:true},
-  blur:    {title:"Gaussian blur", group:"pre", desc:"soften before diffuse",
-            params:[{k:"sigma",label:"sigma px",type:"number",def:0.8,step:"0.1"}], hasIn:true, hasOut:true},
-  clahe:   {title:"CLAHE", group:"pre", desc:"local contrast",
-            params:[{k:"clip",label:"clip limit",type:"number",def:2.0,step:"0.1"},
-                    {k:"tiles",label:"tiles (per side)",type:"number",def:8}], hasIn:true, hasOut:true},
-  sharpen: {title:"Sharpen (unsharp)", group:"pre", desc:"amount · sigma",
-            params:[{k:"amount",label:"amount",type:"number",def:0.5,step:"0.1"},
-                    {k:"sigma",label:"sigma",type:"number",def:1.0,step:"0.1"}], hasIn:true, hasOut:true},
-  bayer:   {title:"Bayer dither", group:"dither", desc:"ordered Bayer matrix",
-            params:[{k:"size",label:"matrix size",type:"select",opts:["2×2","4×4","8×8"],def:"4×4"}],
-            hasIn:true, hasOut:true},
-  threshold:{title:"Threshold", group:"dither", desc:"plain cut",
-            params:[{k:"level",label:"level (0–255)",type:"number",def:128,min:0,max:255}], hasIn:true, hasOut:true},
-  floyd:   {title:"Floyd–Steinberg", group:"dither", desc:"threshold · strength",
-            params:[{k:"threshold",label:"threshold (0–255)",type:"number",def:128,min:0,max:255},
-                    {k:"strength",label:"strength 0–1",type:"number",def:0.9,step:"0.05"}],
-            hasIn:true, hasOut:true},
-  atkinson:{title:"Atkinson", group:"dither", desc:"punchy",
-            params:[{k:"threshold",label:"threshold (0–255)",type:"number",def:128,min:0,max:255}], hasIn:true, hasOut:true},
-  photo:   {title:"Photo Floyd", group:"dither", desc:"tone+FS",
-            params:[{k:"contrast",label:"contrast",type:"number",def:1.15,step:"0.01"},
-                    {k:"threshold",label:"threshold (0–255)",type:"number",def:128,min:0,max:255},
-                    {k:"strength",label:"strength",type:"number",def:0.9,step:"0.05"}],
-            hasIn:true, hasOut:true},
-  canny:   {title:"Canny", group:"analysis", desc:"blur · low · high",
-            params:[{k:"blur",label:"blur passes",type:"number",def:2},
-                    {k:"low",label:"low",type:"number",def:80},
-                    {k:"high",label:"high",type:"number",def:160}], hasIn:true, hasOut:true},
-  output:  {title:"Output", group:"source", desc:"128×64 panel",
-            params:[], hasIn:true, hasOut:false},
+  input:   {title:"Image input", operation:"image_input", group:"source", desc:"upload or sample",
+      params:[{k:"source",label:"source",type:"select",opts:["upload","img_0027","img_0037","img_0038","img_0045","gradient"],def:"img_0027"}],
+            contract:{input:"Decode the selected image to row-major RGB8 triplets; uploaded files are external artifacts, not embedded in this JSON.",
+              sampleFiles:{img_0027:"test-images/img_0027.jpg",img_0037:"test-images/img_0037.jpg",
+                img_0038:"test-images/img_0038.jpg",img_0045:"test-images/img_0045.jpg"},
+              gradient:"256x160 horizontal 8-bit grayscale ramp expanded to RGB; v = round(x / width * 255)",
+              missingUploadFallback:"try test-images/img_0027.jpg, then use gradient if unavailable",
+              unavailableSampleFallback:"gradient"},
+      hasIn:false, hasOut:true},
+  grayscale:{title:"Grayscale", operation:"grayscale", group:"pre", desc:"decodePreviewGray math",
+      params:[], contract:{algorithm:"Quantize RGB8 to RGB565, expand channels, then calculate integer Rec.709 luma.",
+        quantization:{redBits:5,greenBits:6,blueBits:5},
+        lumaFormula:"(54 * R8 + 183 * G8 + 19 * B8) >> 8"}, hasIn:true, hasOut:true},
+  resize:  {title:"Resize", operation:"resize", group:"pre", desc:"aspect-fit area / nearest",
+      params:[{k:"w",label:"width",type:"number",def:128},{k:"h",label:"height",type:"number",def:64},
+        {k:"maintainAspect",label:"maintain aspect ratio",type:"checkbox",def:true},
+        {k:"method",label:"method",type:"select",opts:["area","nearest"],def:"area"}],
+      contract:{dimensions:"w and h are maximum bounds when maintainAspect is true; otherwise exact output dimensions.",
+        aspectFit:"scale = min(w / inputWidth, h / inputHeight); floor scaled dimensions; no padding.",
+              methods:{area:"Area-weighted box resampling; include partial source-pixel overlap at boundaries and round the weighted average to the nearest integer.",
+    nearest:"Map each destination pixel to floor(destinationCoordinate * sourceSize / destinationSize)."}},
+      hasIn:true, hasOut:true},
+  tone:    {title:"Tone adjust", operation:"linear_tone_adjustment", group:"pre", desc:"contrast · brightness",
+      params:[{k:"contrast",label:"contrast (gain)",type:"number",def:1.15,step:"0.01"},
+        {k:"brightness",label:"brightness",type:"number",def:0,step:"0.01"}],
+      contract:{formula:"round(clamp((input - 128) * contrast + 128 + brightness * 255, 0, 255))",
+        brightnessUnits:"fraction of full-scale (255)"}, hasIn:true, hasOut:true},
+  blur:    {title:"Gaussian blur", operation:"gaussian_blur", group:"pre", desc:"soften before diffuse",
+      params:[{k:"sigma",label:"sigma px",type:"number",def:0.8,step:"0.1"}],
+            contract:{kernel:"separable Gaussian",radius:"max(1, ceil(3 * sigma))",
+              weights:"exp(-0.5 * (offset / sigma)^2), normalized to sum to 1",
+              boundary:"replicate edge pixels",intermediate:"retain floating-point horizontal pass; round and clamp after vertical pass",
+              nonpositiveSigma:"identity"}, hasIn:true, hasOut:true},
+  clahe:   {title:"CLAHE", operation:"clahe", group:"pre", desc:"local contrast",
+      params:[{k:"clip",label:"clip limit",type:"number",def:2.0,step:"0.1"},
+        {k:"tiles",label:"tiles (per side)",type:"number",def:8}],
+            contract:{grid:"tiles x tiles, capped to image height and width; partition dimensions with floor(index * size / tileCount)",
+              histogramBins:256,clipLimit:"max(1, clip) * tilePixelCount / 256",
+        redistribution:"uniformly redistribute clipped excess across all bins",
+              mapping:"normalize each tile cumulative histogram to 0..255; use the containing tile map without interpolation",
+              emptyTile:"identity lookup"},
+      hasIn:true, hasOut:true},
+  sharpen: {title:"Sharpen (unsharp)", operation:"unsharp_mask", group:"pre", desc:"amount · sigma",
+      params:[{k:"amount",label:"amount",type:"number",def:0.5,step:"0.1"},
+        {k:"sigma",label:"sigma",type:"number",def:1.0,step:"0.1"}],
+      contract:{formula:"round(clamp(input + amount * (input - gaussianBlur(input, sigma)), 0, 255))"},
+      hasIn:true, hasOut:true},
+  bayer:   {title:"Bayer dither", operation:"ordered_dithering", group:"dither", desc:"ordered Bayer matrix",
+      params:[{k:"size",label:"matrix size",type:"select",opts:["2×2","4×4","8×8"],def:"4×4"}],
+            contract:{matrixFamily:"Bayer ordered threshold matrix",
+              matrices:{"2×2":[[0,2],[3,1]],
+                "4×4":[[0,8,2,10],[12,4,14,6],[3,11,1,9],[15,7,13,5]],
+                "8×8":[[0,32,8,40,2,34,10,42],[48,16,56,24,50,18,58,26],
+                  [12,44,4,36,14,46,6,38],[60,28,52,20,62,30,54,22],
+                  [3,35,11,43,1,33,9,41],[51,19,59,27,49,17,57,25],
+                  [15,47,7,39,13,45,5,37],[63,31,55,23,61,29,53,21]]},
+              levels:"matrixSize squared",threshold:"matrix[y mod size][x mod size] * (256 / levels) + (128 / levels)",
+        decision:"white when input > threshold, else black"}, hasIn:true, hasOut:true},
+  threshold:{title:"Threshold", operation:"binary_threshold", group:"dither", desc:"plain cut",
+      params:[{k:"level",label:"level (0–255)",type:"number",def:128,min:0,max:255}],
+      contract:{decision:"white when input > clamped level, else black"}, hasIn:true, hasOut:true},
+  floyd:   {title:"Floyd–Steinberg", operation:"floyd_steinberg_dithering", group:"dither", desc:"threshold · strength",
+      params:[{k:"threshold",label:"threshold (0–255)",type:"number",def:128,min:0,max:255},
+        {k:"strength",label:"strength 0–1",type:"number",def:0.45,step:"0.05"}],
+            contract:{scan:"serpentine rows",
+        decision:"white when the adjusted pixel is >= the clamped threshold, else black",
+              neighbors:"for left-to-right rows distribute error to (x+1,y):7/16, (x-1,y+1):3/16, (x,y+1):5/16, (x+1,y+1):1/16; mirror horizontal offsets on right-to-left rows",
+              quantizationError:"(adjustedPixel - quantizedPixel) * strength, where strength is clamped to 0..1; add weighted error to in-bounds neighbors without intermediate clamping"}, hasIn:true, hasOut:true},
+  atkinson:{title:"Atkinson", operation:"atkinson_dithering", group:"dither", desc:"punchy",
+      params:[{k:"threshold",label:"threshold (0–255)",type:"number",def:128,min:0,max:255}],
+            contract:{scan:"serpentine rows",
+        decision:"white when the adjusted pixel is >= the clamped threshold, else black",
+              neighbors:{leftToRight:[[1,0],[2,0],[-1,1],[0,1],[1,1],[0,2]],
+                rightToLeft:[[-1,0],[-2,0],[1,1],[0,1],[-1,1],[0,2]]},
+              quantizationError:"(adjustedPixel - quantizedPixel) / 8; add to each in-bounds neighbor without intermediate clamping"},
+      hasIn:true, hasOut:true},
+  photo:   {title:"Photo Floyd", operation:"tone_adjust_then_floyd_steinberg", group:"dither", desc:"tone+FS",
+      params:[{k:"contrast",label:"contrast",type:"number",def:1.15,step:"0.01"},
+        {k:"threshold",label:"threshold (0–255)",type:"number",def:128,min:0,max:255},
+        {k:"strength",label:"strength",type:"number",def:0.9,step:"0.05"}],
+      contract:{stages:["linear_tone_adjustment with brightness 0", "floyd_steinberg_dithering"]},
+      hasIn:true, hasOut:true},
+  canny:   {title:"Canny", operation:"canny_edge_detection", group:"analysis", desc:"blur · low · high",
+      params:[{k:"blur",label:"blur passes",type:"number",def:2},
+        {k:"low",label:"low",type:"number",def:80},
+        {k:"high",label:"high",type:"number",def:160}],
+            contract:{blur:{passes:"blur",kernel:[[1,2,1],[2,4,2],[1,2,1]],divisor:16,
+                rounding:"integer right shift by 4 after summing",boundary:"replicate edge pixels"},
+              sobel:{gx:[[-1,0,1],[-2,0,2],[-1,0,1]],gy:[[-1,-2,-1],[0,0,0],[1,2,1]],
+                magnitude:"abs(gx) + abs(gy)",boundary:"replicate edge pixels"},
+              direction:"horizontal if abs(gy)*5 < abs(gx); vertical if abs(gx)*5 < abs(gy); otherwise diagonal, selected by the sign of gx XOR gy",
+              nonMaximumSuppression:"retain only when magnitude > the first directional neighbor and >= the second (one-sided tie rule); out-of-image magnitudes are 0",
+              thresholds:"strong if magnitude >= high; otherwise weak if magnitude >= low; others suppressed",
+              hysteresis:"promote weak pixels connected to a strong pixel by 8-connectivity"},
+      hasIn:true, hasOut:true},
+  output:  {title:"Output", operation:"display_output", group:"source", desc:"128×64 panel",
+            params:[], contract:{panel:{width:128,height:64},
+        fit:"contain and center; nearest-neighbor sampling; black letterbox",
+              acceptedData:["image/gray8","image/binary-gray8"]}, hasIn:true, hasOut:false},
 };
 const GROUPS = {source:"pal-source", pre:"pal-pre", dither:"pal-dither", analysis:"pal-analysis"};
 
@@ -400,10 +452,8 @@ const GROUPS = {source:"pal-source", pre:"pal-pre", dither:"pal-dither", analysi
 const stage = document.getElementById("stage");
 const stageWrap = document.getElementById("stage-wrap");
 const wires = document.getElementById("wires");
-const logEl = document.getElementById("log");
-const chainEl = document.getElementById("chain");
+const statusEl = document.getElementById("app-status");
 let nodes = [], edges = [], seq = 0, selected = null, selectedWire = -1, armedPort = null;
-let lastResult = null;
 let panX = 0, panY = 0;
 
 /* ---- undo / redo: snapshots of nodes + edges + params + pan ---- */
@@ -478,7 +528,25 @@ stageWrap.addEventListener("pointerdown", e=>{
   stageWrap.addEventListener("pointermove",mv); stageWrap.addEventListener("pointerup",up);
 });
 
-function log(msg){ logEl.textContent += "\n" + msg; logEl.scrollTop = logEl.scrollHeight; }
+function log(msg){ statusEl.textContent = msg; }
+
+function setOutputState(node, {chain, meta, message}){
+  node.el.querySelector('[data-output="chain"]').textContent = chain;
+  node.el.querySelector('[data-output="meta"]').textContent = meta;
+  const outputLog=node.el.querySelector('[data-output="log"]');
+  outputLog.textContent=message;
+  outputLog.scrollTop=outputLog.scrollHeight;
+}
+
+function clearOutput(node, message="Running…"){
+  for(const selector of ['[data-output="panel"]','[data-output="scaled"]']){
+    const canvas=node.el.querySelector(selector);
+    canvas.getContext("2d").clearRect(0,0,canvas.width,canvas.height);
+  }
+  node.lastConfig=null;
+  node.el.querySelector('[data-output="copy-config"]').disabled=true;
+  setOutputState(node,{chain:"—",meta:"Running",message});
+}
 
 function addNode(type, x, y){
   pushHistory();
@@ -497,16 +565,28 @@ function addNodeRaw(type, x, y, id, params){
   for(const p of def.params){
     if(p.type==="select"){
       body += `<label>${p.label}<select data-k="${p.k}">${p.opts.map(o=>`<option ${o===p.def?"selected":""}>${o}</option>`).join("")}</select></label>`;
+    } else if(p.type==="checkbox"){
+      body += `<label>${p.label}<input data-k="${p.k}" type="checkbox"${p.def?" checked":""}></label>`;
     } else {
       body += `<label>${p.label}<input data-k="${p.k}" type="number" value="${p.def}"` + (p.step ? ` step="${p.step}"` : "") + (p.min!==undefined ? ` min="${p.min}"` : "") + (p.max!==undefined ? ` max="${p.max}"` : "") + `></label>`;
     }
   }
   if(type==="input") body += `<label>file<input data-k="file" type="file" accept="image/*"></label>`;
+  if(type==="output") body += `<div class="output-content">
+    <div class="output-actions"><button type="button" data-output="copy-config" disabled>Copy last-run config</button>
+      <span class="copy-status" data-output="copy-status" aria-live="polite"></span></div>
+    <label>Panel preview (128×64)</label><canvas class="output-panel" data-output="panel" width="128" height="64"></canvas>
+    <label>2× scaled</label><canvas class="output-2x" data-output="scaled" width="256" height="128"></canvas>
+    <label>Pipeline</label><div class="output-chain" data-output="chain">—</div>
+    <div class="output-meta" data-output="meta">Not run</div>
+    <div class="output-log" data-output="log" aria-live="polite">Run the pipeline to see a result.</div>
+  </div>`;
   body += `</div>`;
   el.innerHTML = `<header><span class="dot" title="click to bypass/enable (B)"></span><span class="title">${def.title}</span><button class="del" title="delete block">&times;</button></header>${body}` +
     (def.hasIn?`<div class="port in" data-port="in" title="input"></div>`:"") +
     (def.hasOut?`<div class="port out" data-port="out" title="output"></div>`:"");
   stage.appendChild(el);
+  if(type==="output") el.classList.add("output-node");
   const node = {id, type, def, el, params:{}, bypassed:false};
   for(const p of def.params) node.params[p.k]=(params && p.k in params)?params[p.k]:p.def;
   if(params && params._bypassed) { node.bypassed = true; el.classList.add("bypassed"); }
@@ -514,17 +594,45 @@ function addNodeRaw(type, x, y, id, params){
     e.stopPropagation();
     toggleBypass(node);
   });
+  if(type==="output"){
+    el.querySelector('[data-output="copy-config"]').addEventListener("click",async e=>{
+      e.stopPropagation();
+      const status=el.querySelector('[data-output="copy-status"]');
+      try{
+        if(!node.lastConfig) throw new Error("run this output before copying its pipeline config");
+        const config=node.lastConfig;
+        await copyTextToClipboard(JSON.stringify(config,null,2));
+        status.textContent="Copied JSON";
+        log(`Copied pipeline config for ${node.def.title}.`);
+      }catch(err){
+        status.textContent="Copy failed";
+        log(`Could not copy config: ${err.message}`);
+      }
+    });
+  }
   // reflect restored params in the inputs
   el.querySelectorAll("[data-k]").forEach(inp=>{
     const k = inp.dataset.k;
     if(k in node.params && inp.type!=="file"){
       if(inp.tagName==="SELECT") inp.value = node.params[k];
+      else if(inp.type==="checkbox") inp.checked = Boolean(node.params[k]);
       else inp.value = node.params[k];
     }
   });
   el.querySelectorAll("[data-k]").forEach(inp=>{
     if(inp.type==="file"){ inp.addEventListener("change",()=>{ node.file = inp.files[0]||null; log(`${def.title}: attached ${node.file?node.file.name:"(none)"}`); }); return; }
-    inp.addEventListener("input",()=>{ node.params[inp.dataset.k] = inp.tagName==="SELECT"?inp.value:parseFloat(inp.value); });
+    inp.addEventListener("focus",()=>{ inp.dataset.historyStarted="false"; });
+    inp.addEventListener("blur",()=>{ inp.dataset.historyStarted="false"; });
+    inp.addEventListener("input",()=>{
+      const k=inp.dataset.k;
+      const value=inp.tagName==="SELECT" ? inp.value : inp.type==="checkbox" ? inp.checked : parseFloat(inp.value);
+      if(Object.is(node.params[k],value)) return;
+      if(inp.dataset.historyStarted!=="true"){
+        pushHistory();
+        inp.dataset.historyStarted="true";
+      }
+      node.params[k]=value;
+    });
   });
   // drag (position changes are history-tracked on release)
   const hdr = el.querySelector("header");
@@ -699,17 +807,146 @@ for(const [type,def] of Object.entries(DEFS)){
    ============================================================ */
 async function loadNodeImage(node){
   const src = node.params.source || "upload";
-  if(node.file){ return await fileToRGB(node.file); }
-  if(src==="gradient") return makeGradient();
+  if(node.file){
+    const image=await fileToRGB(node.file);
+    return {...image,sourceInfo:{kind:"uploaded_file",fileName:node.file.name,mimeType:node.file.type||null}};
+  }
+  if(src==="gradient") return {...makeGradient(),sourceInfo:{kind:"generated_gradient"}};
   const name = {img_0027:"img_0027.jpg",img_0037:"img_0037.jpg",img_0038:"img_0038.jpg",img_0045:"img_0045.jpg"}[src] || "img_0027.jpg";
   // try repo-relative test-images first, then lab out/ as fallback
   const urls = [`../../test-images/${name}`, `../test-images/${name}`, `test-images/${name}`];
-  for(const u of urls){
-    try{ return await urlToRGB(u); }catch(e){}
+  for(let i=0;i<urls.length;i++){
+    try{
+      const image=await urlToRGB(urls[i]);
+      return {...image,sourceInfo:{kind:"sample_file",path:`test-images/${name}`,resolvedUrl:urls[i]}};
+    }catch(e){}
   }
   log(`could not load ${name} — using gradient (open via repo or upload a file)`);
-  return makeGradient();
+  return {...makeGradient(),sourceInfo:{kind:"generated_gradient",fallbackFor:`test-images/${name}`}};
 }
+
+function buildPipelineConfig(outputNode){
+  const byId=Object.fromEntries(nodes.map(node=>[node.id,node]));
+  const reverseEdges=edges.filter(edge=>byId[edge.from]&&byId[edge.to]);
+  const upstreamByTarget=new Map(reverseEdges.map(edge=>[edge.to,byId[edge.from]]));
+  const chain=[];
+  const seen=new Set();
+  let current=outputNode;
+  while(current){
+    if(seen.has(current.id)) throw new Error("the upstream graph contains a cycle");
+    seen.add(current.id);
+    chain.unshift(current);
+    current=upstreamByTarget.get(current.id)||null;
+  }
+  if(chain[0]?.type!=="input") throw new Error("this Output is not connected to an Image input");
+
+  const portContracts={
+    input:{inputs:[],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
+    grayscale:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/gray8"}]},
+    resize:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/gray8"}]},
+    tone:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/gray8"}]},
+    blur:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/gray8"}]},
+    clahe:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/gray8"}]},
+    sharpen:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/gray8"}]},
+    bayer:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/binary-gray8"}]},
+    threshold:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/binary-gray8"}]},
+    floyd:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/binary-gray8"}]},
+    atkinson:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/binary-gray8"}]},
+    photo:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/binary-gray8"}]},
+    canny:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/binary-gray8"}]},
+    output:{inputs:[{id:"input",acceptedDataTypes:["image/gray8","image/binary-gray8"]}],outputs:[]},
+  };
+  const parameterNames={
+    input:{source:"source"},
+    resize:{w:"maxWidth",h:"maxHeight",maintainAspect:"maintainAspectRatio",method:"resamplingMethod"},
+    tone:{contrast:"contrastGain",brightness:"brightness"},
+    blur:{sigma:"sigmaPixels"},
+    clahe:{clip:"clipLimit",tiles:"tilesPerAxis"},
+    sharpen:{amount:"amount",sigma:"sigmaPixels"},
+    bayer:{size:"matrixSize"},
+    threshold:{level:"threshold"},
+    floyd:{threshold:"threshold",strength:"errorDiffusionStrength"},
+    atkinson:{threshold:"threshold"},
+    photo:{contrast:"contrastGain",threshold:"threshold",strength:"errorDiffusionStrength"},
+    canny:{blur:"gaussianBlurPasses",low:"lowThreshold",high:"highThreshold"},
+  };
+  let effectiveDataType=null;
+  const configNodes=chain.map((node,index)=>{
+    const definition=node.def;
+    const parameters=Object.fromEntries(Object.entries(node.params).map(([key,value])=>[
+      parameterNames[node.type]?.[key]||key,value,
+    ]));
+    if(node.type==="input" && node.file){
+      parameters.source="uploaded_file";
+      parameters.sourceAsset={fileName:node.file.name, mimeType:node.file.type||null,
+        sizeBytes:node.file.size, note:"The image bytes are not included; provide this file as input when implementing."};
+    }else if(node.type==="input"){
+      const samplePath=definition.contract.sampleFiles?.[parameters.source];
+      if(samplePath) parameters.sourceAsset={path:samplePath};
+      if(parameters.source==="upload") parameters.uploadFallbacks=["test-images/img_0027.jpg","gradient"];
+    }
+    const inputDataType=effectiveDataType;
+    if(!node.bypassed){
+      if(node.type==="input") effectiveDataType="image/rgb8-interleaved";
+      else if(node.type==="grayscale") effectiveDataType="image/gray8";
+      else if(["bayer","threshold","floyd","atkinson","photo","canny"].includes(node.type)) effectiveDataType="image/binary-gray8";
+    }
+    return {
+      id:node.id,
+      type:node.type,
+      operation:definition.operation,
+      operationVersion:1,
+      name:definition.title,
+      enabled:!node.bypassed,
+      parameters,
+      ports:portContracts[node.type],
+      effectiveInputDataType:inputDataType,
+      effectiveOutputDataType:node.type==="output"?null:effectiveDataType,
+      resolvedInput:node.type==="input"?node.lastInputInfo||null:undefined,
+      contract:definition.contract,
+      inputNodeIds:index>0?[chain[index-1].id]:[],
+    };
+  });
+  return {
+    schema:"lofi-camera.preview-pipeline",
+    schemaVersion:"1.0.0",
+    format:"lofi-camera-preview-pipeline",
+    purpose:"A reproducible, ordered image-processing graph for implementing this preview pipeline in code.",
+    semantics:{
+      graph:"Nodes are topologically ordered. Each node declares input/output ports; inputNodeIds lists dependencies, and edges explicitly name node and port endpoints. The schema supports adding node types, parameters, and ports in later versions.",
+      execution:"Apply enabled processing nodes in order. A disabled node is bypassed and passes its input through unchanged, including its data type; enabled-node output port types describe the active operation.",
+      pixelModel:{channelRange:"8-bit unsigned integers, 0..255",color:"RGB at image input; grayscale thereafter",
+        layouts:{"image/rgb8-interleaved":"row-major [R,G,B] byte triplets","image/gray8":"row-major one byte per pixel","image/binary-gray8":"row-major one byte per pixel; only values 0 and 255"},
+        rounding:"Follow the per-operation contract; otherwise use the explicitly described rounding and clamping.",
+        coordinates:"x increases rightward, y increases downward; pixel origin is top-left"},
+      inputResolution:"Use the original image dimensions unless a resize node specifies otherwise.",
+      output:{width:128,height:64,fit:"contain and center; nearest-neighbor sampling; black letterbox"},
+    },
+    nodes:configNodes,
+    edges:chain.slice(1).map((node,index)=>({id:`edge-${chain[index].id}-${node.id}`,
+      from:{nodeId:chain[index].id,portId:"output"},to:{nodeId:node.id,portId:"input"},
+      dataType:configNodes[index].effectiveOutputDataType})),
+    outputNodeId:outputNode.id,
+  };
+}
+
+async function copyTextToClipboard(text){
+  if(navigator.clipboard?.writeText){
+    try{ await navigator.clipboard.writeText(text); return; }
+    catch(err){ if(!document.execCommand) throw err; }
+  }
+  const textarea=document.createElement("textarea");
+  textarea.value=text;
+  textarea.setAttribute("readonly","");
+  textarea.style.position="fixed";
+  textarea.style.opacity="0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied=document.execCommand("copy");
+  textarea.remove();
+  if(!copied) throw new Error("clipboard access is unavailable in this browser context");
+}
+
 function imgElToRGB(img){
   const c = document.createElement("canvas");
   c.width = img.naturalWidth || img.width; c.height = img.naturalHeight || img.height;
@@ -721,16 +958,27 @@ function fileToRGB(file){
   return new Promise((res,rej)=>{
     const url = URL.createObjectURL(file);
     const img = new Image();
-    img.onload = ()=>{ const r = imgElToRGB(img); URL.revokeObjectURL(url); res(r); };
-    img.onerror = rej; img.src = url;
+    const cleanup=()=>URL.revokeObjectURL(url);
+    img.onload = ()=>{
+      try{ res(imgElToRGB(img)); }
+      catch(err){ rej(err); }
+      finally{ cleanup(); }
+    };
+    img.onerror = ()=>{ cleanup(); rej(new Error(`could not load uploaded image: ${file.name}`)); };
+    try{ img.src = url; }
+    catch(err){ cleanup(); rej(err); }
   });
 }
 function urlToRGB(url){
   return new Promise((res,rej)=>{
     const img = new Image();
-    img.onload = ()=>res(imgElToRGB(img));
+    img.onload = ()=>{
+      try{ res(imgElToRGB(img)); }
+      catch(err){ rej(err); }
+    };
     img.onerror = ()=>rej(new Error("load failed "+url));
-    img.src = url;
+    try{ img.src = url; }
+    catch(err){ rej(err); }
   });
 }
 function makeGradient(){
@@ -750,15 +998,22 @@ function threshold(gray,w,h,level){
 }
 
 async function runPipeline(){
-  logEl.textContent = "Running…";
+  statusEl.textContent = "Running pipelines…";
   if(!nodes.length){ log("canvas is empty — add blocks first"); return; }
   // order: follow wires from input nodes
   const byId = Object.fromEntries(nodes.map(n=>[n.id,n]));
-  const inputs = nodes.filter(n=>n.type==="input");
-  if(!inputs.length){ log("add an Image input block first"); return; }
   const outputs = nodes.filter(n=>n.type==="output");
   if(!outputs.length){ log("add an Output block to see the result"); return; }
+  outputs.forEach(node=>clearOutput(node));
+  const inputs = nodes.filter(n=>n.type==="input");
+  if(!inputs.length){
+    const message="Add an Image input block and wire it to this Output.";
+    outputs.forEach(node=>setOutputState(node,{chain:"Unconnected",meta:"No input",message}));
+    log(message);
+    return;
+  }
   // simple: for each output, walk backwards to an input
+  let completed=0;
   for(const outNode of outputs){
     const chain = [];
     let cur = outNode, guard = 0;
@@ -767,17 +1022,37 @@ async function runPipeline(){
       const e = edges.find(e=>e.to===cur.id);
       cur = e ? byId[e.from] : null;
     }
-    if(chain[0].type!=="input"){ log("an Output is not wired back to an Image input — skipping"); continue; }
+    if(chain[0].type!=="input"){
+      const message="This Output is not wired back to an Image input.";
+      setOutputState(outNode,{chain:"Unconnected",meta:"No result",message});
+      log(message);
+      continue;
+    }
     const active = chain.filter(n=>!n.bypassed);
     const skipped = chain.filter(n=>n.bypassed).map(n=>n.def.title);
-    chainEl.textContent = active.map(n=>n.def.title).join(" → ") + (skipped.length?`  (bypassed: ${skipped.join(", ")})`:"");
+    const chainText=active.map(n=>n.def.title).join(" → ") + (skipped.length?`  (bypassed: ${skipped.join(", ")})`:"");
+    setOutputState(outNode,{chain:chainText,meta:"Running",message:"Processing this output…"});
     try{
       const result = await execChain(active);
-      lastResult = result;
-      paintResult(result);
-      log(`done: ${active.map(n=>n.def.title).join(" → ")} → ${result.w}×${result.h} ${result.kind}` + (skipped.length?` [bypassed: ${skipped.join(", ")}]`:""));
-    }catch(err){ log("ERROR: "+err.message); console.error(err); }
+      paintResult(outNode,result);
+      const config=buildPipelineConfig(outNode);
+      config.execution={status:"succeeded",result:{width:result.w,height:result.h,kind:result.kind},
+        display:{width:PANEL_W,height:PANEL_H,fit:"contain_center_nearest_black_letterbox"}};
+      outNode.lastConfig=config;
+      outNode.el.querySelector('[data-output="copy-config"]').disabled=false;
+      const details=`${result.w}×${result.h} ${result.kind}` + (skipped.length?` · bypassed: ${skipped.join(", ")}`:"");
+      const message=`Done: ${active.map(n=>n.def.title).join(" → ")} → ${details}`;
+      setOutputState(outNode,{chain:chainText,meta:details,message});
+      log(`Completed ${outNode.def.title}: ${details}`);
+      completed++;
+    }catch(err){
+      const message="ERROR: "+err.message;
+      setOutputState(outNode,{chain:chainText,meta:"Failed",message});
+      log(`${outNode.def.title}: ${message}`);
+      console.error(err);
+    }
   }
+  if(completed) log(`Finished ${completed} output${completed===1?"":"s"}.`);
 }
 
 async function execChain(chain){
@@ -788,6 +1063,7 @@ async function execChain(chain){
     switch(node.type){
       case "input": {
         const im = await loadNodeImage(node);
+        node.lastInputInfo={width:im.w,height:im.h,source:im.sourceInfo};
         rgb=im.rgb; W=im.w; H=im.h; gray=null; mono=null;
         break;
       }
@@ -798,26 +1074,33 @@ async function execChain(chain){
       }
       case "resize": {
         if(!gray) throw new Error("Resize needs grayscale upstream");
-        const dw=p.w||128, dh=p.h||64;
+        const maxW=Math.max(1,Math.floor(Number(p.w)||128));
+        const maxH=Math.max(1,Math.floor(Number(p.h)||64));
+        let dw=maxW, dh=maxH;
+        if(p.maintainAspect!==false){
+          const scale=Math.min(maxW/w,maxH/h);
+          dw=Math.max(1,Math.floor(w*scale));
+          dh=Math.max(1,Math.floor(h*scale));
+        }
         gray = (p.method==="nearest"?nearestResize:areaResize)(gray,w,h,dw,dh);
-        w=dw; h=dh;
+        w=dw; h=dh; mono=null;
         break;
       }
       case "tone": {
         if(!gray) throw new Error("Tone needs grayscale upstream");
-        gray = toneAdjust(gray,p.contrast??1.15,(p.brightness??0)); break;
+        gray = toneAdjust(gray,p.contrast??1.15,(p.brightness??0)); mono=null; break;
       }
       case "blur": {
         if(!gray) throw new Error("Blur needs grayscale upstream");
-        gray = gaussianBlur(gray,w,h,p.sigma??0.8); break;
+        gray = gaussianBlur(gray,w,h,p.sigma??0.8); mono=null; break;
       }
       case "clahe": {
         if(!gray) throw new Error("CLAHE needs grayscale upstream");
-        gray = clahe(gray,w,h,p.clip??2.0,p.tiles??8); break;
+        gray = clahe(gray,w,h,p.clip??2.0,p.tiles??8); mono=null; break;
       }
       case "sharpen": {
         if(!gray) throw new Error("Sharpen needs grayscale upstream");
-        gray = unsharpMask(gray,w,h,p.amount??0.5,p.sigma??1.0); break;
+        gray = unsharpMask(gray,w,h,p.amount??0.5,p.sigma??1.0); mono=null; break;
       }
       case "bayer": {
         const sz = p.size || "4×4";
@@ -842,21 +1125,27 @@ async function execChain(chain){
   throw new Error("chain produced nothing (need Grayscale after Input)");
 }
 
-function paintResult(res){
-  const panel = document.getElementById("out-panel");
-  // letterbox onto 128x64 like the firmware
+function paintResult(outputNode,res){
+  const panel=outputNode.el.querySelector('[data-output="panel"]');
+  // Fit and centre the result on the panel, preserving its aspect ratio.
   const disp = new Uint8Array(PANEL_W*PANEL_H).fill(0);
   const src = res.data;
-  // if result isn't panel-sized, centre-crop/pad
-  for(let y=0;y<Math.min(PANEL_H,res.h);y++) for(let x=0;x<Math.min(PANEL_W,res.w);x++){
-    const sx = Math.round(x*res.w/PANEL_W), sy = Math.round(y*res.h/PANEL_H);
-    disp[y*PANEL_W+x] = src[Math.min(res.h-1,sy)*res.w+Math.min(res.w-1,sx)];
+  if(res.w>0 && res.h>0){
+    const scale=Math.min(PANEL_W/res.w,PANEL_H/res.h);
+    const fitW=Math.min(PANEL_W,Math.max(1,Math.floor(res.w*scale)));
+    const fitH=Math.min(PANEL_H,Math.max(1,Math.floor(res.h*scale)));
+    const left=Math.floor((PANEL_W-fitW)/2), top=Math.floor((PANEL_H-fitH)/2);
+    for(let y=0;y<fitH;y++) for(let x=0;x<fitW;x++){
+      const sx=Math.min(res.w-1,Math.floor(x*res.w/fitW));
+      const sy=Math.min(res.h-1,Math.floor(y*res.h/fitH));
+      disp[(top+y)*PANEL_W+left+x]=src[sy*res.w+sx];
+    }
   }
   const ctx = panel.getContext("2d");
   const img = ctx.createImageData(PANEL_W,PANEL_H);
   for(let i=0;i<disp.length;i++){ img.data[i*4]=img.data[i*4+1]=img.data[i*4+2]=disp[i]; img.data[i*4+3]=255; }
   ctx.putImageData(img,0,0);
-  const big = document.getElementById("out-2x");
+  const big=outputNode.el.querySelector('[data-output="scaled"]');
   if(big){
     const bctx = big.getContext("2d");
     bctx.imageSmoothingEnabled = false;

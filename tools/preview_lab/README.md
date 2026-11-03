@@ -1,28 +1,43 @@
 # Preview lab
 
-Host-side simulator for the lofi-camera **OLED viewfinder** — the dither and
-Canny preview modes in `src/preview.h`, `src/preview_dither.h` and
-`src/preview_canny.h`. It renders both modes over the sample captures in
-`../../test-images/` so the 1-bit look can be judged **before** flashing
-anything. No firmware file is touched by this tool.
+Host-side simulator for the lofi-camera **OLED viewfinder**. It renders the
+firmware's Floyd–Steinberg mode and lab-only Bayer/Canny alternatives over
+sample captures in `../../test-images/` or evenly sampled video frames so the
+1-bit look can be judged **before** flashing anything. No firmware file is
+touched by this tool.
 
 ## What it simulates
 
-Per image, mirroring the device pipeline:
+Per image or sampled video frame, mirroring the device pipeline:
 
 ```
 RGB -> Rec.709 luma -> aspect-fit letterbox (nearest neighbour, 128x64)
--> dither variant / Canny edge detection
+-> Floyd–Steinberg or a lab-only dither variant / Canny edge detection
 ```
 
-`dither` is the exact firmware 4x4 Bayer renderer. The extra dither modes
-(`bayer2`, `bayer8`, `floyd`, `atkinson`, `threshold`, `clahe-floyd`,
-`blur-atkinson`, `photo`) are lab-only alternatives for judging what a
-different 1-bit
-mapping would look like on the same panel.
+`floyd` uses the firmware's serpentine Floyd–Steinberg renderer (threshold
+128, strength 0.45). `dither` is a lab-only 4×4 Bayer alternative. The other
+lab-only modes (`bayer2`, `bayer8`, `atkinson`, `threshold`, `clahe-floyd`,
+`blur-atkinson`, `photo`, and `canny`) are alternatives for judging different
+1-bit mappings on the same panel.
 
 `blur-atkinson` runs after grayscale as slight Gaussian blur -> Atkinson,
 sharing the `--clahe-blur` sigma with the CLAHE chain (`0` = off).
+
+The interactive `Resize` block defaults to maintaining the input aspect ratio
+within its width/height bounds (128x64 by default); clear the checkbox to
+stretch to the exact dimensions instead.
+
+After running a pipeline, each Output block enables **Copy last-run config**.
+The clipboard contains versioned JSON with ordered nodes and explicit edges,
+stable operation identifiers (for example, `gaussian_blur`,
+`floyd_steinberg_dithering`, and `canny_edge_detection`), descriptive
+parameter values, typed ports (including accepted input types and each edge's
+effective data type), algorithm contracts, pixel conventions, and output
+dimensions. The last-run config records the resolved input source and decoded
+dimensions. Uploaded image bytes are not embedded; the config records the file
+name and metadata so an implementation can be supplied with that source asset
+separately. If an upload is unavailable, its fallback order is included too.
 
 `clahe-floyd` runs after grayscale as CLAHE -> slight Gaussian blur ->
 Floyd-Steinberg, all on the letterboxed tile. Tune it with `--clahe-clip`
@@ -30,9 +45,10 @@ Floyd-Steinberg, all on the letterboxed tile. Tune it with `--clahe-clip`
 `--clahe-blur` (pre-diffusion softening, `0` = off), and
 `--clahe-contrast` (firmware-style stretch before CLAHE).
 
-The Canny path follows the firmware step for step: optional binomial blur
-passes, Sobel `|gx| + |gy|` gradients with quantised direction, one-sided
-non-maximum suppression, double threshold, and hysteresis.
+The host-only Canny path uses optional binomial blur passes, Sobel
+`|gx| + |gy|` gradients with quantised direction, one-sided non-maximum
+suppression, double threshold, and hysteresis. Canny is not included in the
+firmware; the device's only preview renderer is Floyd–Steinberg.
 
 ## Setup
 
@@ -46,7 +62,7 @@ uv pip install --python .venv\Scripts\python.exe -r tools/preview_lab/requiremen
 ## Run
 
 ```powershell
-# both modes over every sample image
+# all configured lab modes over every sample image
 .venv\Scripts\python.exe tools\preview_lab\run_preview_lab.py
 
 # what are the modes?
@@ -56,12 +72,16 @@ uv pip install --python .venv\Scripts\python.exe -r tools/preview_lab/requiremen
 .venv\Scripts\python.exe tools\preview_lab\run_preview_lab.py --modes dither
 .venv\Scripts\python.exe tools\preview_lab\run_preview_lab.py --input test-images/img_0027.jpg
 
-# tune the firmware knobs
+# sample 12 chronological frames from a video; photo alpha blends each with
+# temporal state from its previous sampled frame
+.venv\Scripts\python.exe tools\preview_lab\run_preview_lab.py --input clip.mp4 --modes photo --video-frames 12 --photo-alpha 0.8
+
+# tune preview contrast and lab-only Canny parameters
 .venv\Scripts\python.exe tools\preview_lab\run_preview_lab.py --dither-contrast 130 --blur-passes 2 --low 80 --high 160
 ```
 
 Then open `tools/preview_lab/out/index.html` — it shows the original next to
-both 1-bit previews per sample photo.
+the selected 1-bit previews for each input image or sampled video frame.
 
 ### Output layout
 
@@ -79,29 +99,39 @@ Every output filename carries the preview mode, so a result is never ambiguous.
 
 ---
 
-## Tunables (mirror the `-D` firmware flags)
+## Tunables
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--dither-contrast` | `130` | `DITHER_CONTRAST`: linear stretch around mid-grey (`100` = unchanged) |
-| `--blur-passes` | `2` | `CANNY_BLUR_PASSES`: 3x3 binomial blur repetitions (`0` = off) |
-| `--low` | `80` | `CANNY_LOW`: weak-edge threshold |
-| `--high` | `160` | `CANNY_HIGH`: strong-edge threshold (the density knob) |
+| `--dither-contrast` | `130` | `DITHER_CONTRAST`: linear stretch around mid-grey before dithering (`100` = unchanged) |
+| `--blur-passes` | `2` | Canny 3x3 binomial blur repetitions (`0` = off; lab-only) |
+| `--low` | `80` | Canny weak-edge threshold (lab-only) |
+| `--high` | `160` | Canny strong-edge threshold (lab-only density knob) |
 | `--preview-scale` | `4` | Magnify 128x64 previews for viewing (nearest neighbour) |
 | `--modes` | all ten | Which preview modes to render (`dither bayer2 bayer8 floyd atkinson threshold clahe-floyd blur-atkinson photo canny`) |
 | `--photo-contrast` / `--photo-brightness` / `--photo-gamma` | `1.15` / `0` / `1.0` | Photo tone: gain around mid-grey, flat offset, power curve |
-| `--photo-alpha` | `0.80` | Photo temporal weight on past frames (`0` = no memory) |
+| `--photo-alpha` | `0.80` | Photo temporal weight on the previous frame (`0` = no memory); single still images have no prior frame to blend |
 | `--photo-strength` | `0.90` | Photo diffused error fraction (`1.0` = classic Floyd-Steinberg) |
 | `--photo-threshold` | `128` | Photo black/white decision point |
 | `--photo-sharpen` | `0` | Photo unsharp-mask amount (`0` = off) |
 | `--photo-blur` | `0` | Photo Gaussian sigma before diffusion (`0` = off) |
-| `--photo-resize` | `area` | Photo downsampler: `area` averaging, or `nearest` only if already 128x64 |
+| `--photo-resize` | `area` | Photo downsampler: `area` averaging or the preview's `nearest`-neighbour resize |
+| `--video-frames` | `12` | Number of evenly spaced source frames to sample from each supported video; sampled frames are processed in order |
 
 ## Notes
 
-- The simulator uses the same integer weights and thresholds as the firmware
-  (`54/183/19` luma, `*16 + 8` Bayer thresholds, one-sided NMS), so the
-  outputs should match the panel pixel-for-pixel for the same input luma.
-- Input images are converted with Rec.709 luma; the device decodes its SXGA
-  JPEG stream at 1/8 scale first, so expect slightly softer edges on-device
-  than from these full-resolution samples.
+- When `photo` is selected for video input, sampled frames are processed in
+  chronological order, carrying temporal state from each frame to the next
+  within that clip. Separate clips and still images do not share prior-frame
+  state.
+- Videos are decoded with OpenCV. The lab requirements use
+  `opencv-python-headless`, avoiding GUI libraries; supported containers and
+  codecs depend on the OpenCV build.
+- The `floyd` mode uses the same grayscale input and Floyd–Steinberg threshold
+  and strength as the firmware, but the host simulator's image-source and
+  letterboxing path can differ from the device. Canny's one-sided NMS is part
+  of the lab-only implementation, not firmware.
+- Input images are quantised to RGB565, expanded, then converted with the
+  firmware's integer Rec.709 luma weights; the device decodes its SXGA JPEG
+  stream at 1/8 scale first, so fine detail can differ from these full-resolution
+  samples.

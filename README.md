@@ -70,8 +70,8 @@ Use the silkscreen labels on the ESP32-CAM header.
   - That also removes the old washed-out / green-cast failure, which came from
     re-initialising the sensor and grabbing before AWB had converged.
 - The sensor runs neutral tone (contrast 0) since it feeds both the preview and
-  the saved JPEG; the contrast a 1-bit panel wants is applied in the dither
-  renderer (`DITHER_CONTRAST`, default `130`).
+  the saved JPEG; preview contrast is applied in the Floyd–Steinberg renderer
+  (`DITHER_CONTRAST`, default `130`).
 - `AE_LEVEL` in `src/main.cpp` is the auto-exposure bias (-2..+2, 0 neutral);
   lower it if highlights blow out.
 - `CAM_VFLIP` / `CAM_HMIRROR` (both `1` by default) rotate the image 180° for
@@ -84,44 +84,19 @@ Use the silkscreen labels on the ESP32-CAM header.
   Repeated failures back off 1 s → 2 s → 4 s → 8 s, showing
   `Camera offline / retry Ns`, instead of oscillating between messages.
 
-## Preview modes
+## Preview renderer
 
 The OLED viewfinder image processing is chosen at **compile time**. Saving
 full-resolution JPEGs to the SD card is a separate path and never changes.
 
-| `PREVIEW_MODE` | Renderer | Notes |
-|---|---|---|
-| `PREVIEW_MODE_DITHER` (default) | 4×4 Bayer ordered dither | Cheapest, shows tone and greys |
-| `PREVIEW_MODE_CANNY` | Canny edge detection | Wireframe look, ~48 KB extra RAM |
-
-Switch it in the existing `build_flags` block in `platformio.ini` — keep the
-other lines, only the `PREVIEW_MODE` value changes:
-
-```ini
-build_flags =
- -DJPEG_FILTER_SWAP565=1
- -DPREVIEW_MODE=PREVIEW_MODE_CANNY
- -DJPEG_FILTER=JPEG_FILTER_WHITE_BORDER
-```
-
-or for a one-off build:
-
-```powershell
-$env:PLATFORMIO_BUILD_FLAGS="-DPREVIEW_MODE=PREVIEW_MODE_CANNY"; pio run
-```
-
-Canny tunables (also `-D` overridable), defaults tuned for outline-only output:
-
-| Macro | Default | Effect |
-|---|---|---|
-| `CANNY_BLUR_PASSES` | `2` | 3×3 binomial blur repetitions (`0` = off). More passes kill skin texture, hair and sensor noise. |
-| `CANNY_HIGH` | `160` | Strong-edge threshold — the density knob. Raise for sparser output. |
-| `CANNY_LOW` | `80` | Weak-edge threshold; keep at roughly ⅓–½ of `CANNY_HIGH`. |
-
-Magnitudes are `|gx|+|gy|` on 0–255 input, with a maximum of 1530.
-If faces still show too much internal detail, raise `CANNY_BLUR_PASSES` to `3`
-before pushing `CANNY_HIGH` higher — blurring removes texture without
-thinning genuine object outlines.
+The firmware supports one renderer: `PREVIEW_MODE_FLOYD_STEINBERG`, using
+serpentine Floyd–Steinberg error diffusion with a threshold of `128` and an
+error-diffusion strength of `0.45`. `DITHER_CONTRAST` (default `130`) applies a
+linear contrast stretch around mid-grey before error diffusion. These settings
+are compile-time tunables and may be overridden with `-D` build flags:
+`FLOYD_STEINBERG_THRESHOLD`, `FLOYD_STEINBERG_STRENGTH`, and
+`DITHER_CONTRAST`. Canny edge detection remains available as a host-side
+`tools/preview_lab/` experiment; it is not compiled into the firmware.
 
 **Adding a mode:** create `src/preview_<name>.h` with
 `void <name>Draw(Adafruit_SSD1306&, const PreviewFrame&)`, add its id and
@@ -129,9 +104,10 @@ thinning genuine object outlines.
 frame arrives already aspect-fit, letterboxed and downscaled, so a renderer
 only has to map `PreviewFrame::px` onto the panel.
 
-Measured RAM: dither ≈ 59 KB, Canny ≈ 108 KB (of 320 KB). The baseline rose
-with the unified stream, which needs a 160×128 grayscale decode buffer plus
-tjgd's work area.
+Measured firmware RAM after replacing ordered dither with Floyd–Steinberg:
+≈ 60 KB (of 320 KB). The renderer uses two 128-float scanline error buffers;
+the unified stream also needs a 160×128 grayscale decode buffer plus tjgd's
+work area.
 
 ## JPEG filters (SD capture)
 
@@ -150,7 +126,7 @@ Enable it in the existing `build_flags` block in `platformio.ini`:
 ```ini
 build_flags =
  -DJPEG_FILTER_SWAP565=1
- -DPREVIEW_MODE=PREVIEW_MODE_DITHER
+ -DPREVIEW_MODE=PREVIEW_MODE_FLOYD_STEINBERG
  -DJPEG_FILTER=JPEG_FILTER_WHITE_BORDER
 ```
 
@@ -259,8 +235,7 @@ packages in `tools/film_lab/requirements.txt`; see its
 - `src/main.cpp` — firmware: setup, viewfinder loop, SD capture
 - `src/preview.h` — `PREVIEW_MODE` selection, aspect-fit downscale, dispatch
 - `src/preview_types.h` — `PreviewFrame` shared by all renderers
-- `src/preview_dither.h` — ordered-dither renderer (default)
-- `src/preview_canny.h` — Canny edge-detection renderer
+- `src/preview_floyd_steinberg.h` — serpentine Floyd–Steinberg renderer
 - `src/jpeg_filter.h` — compile-time JPEG filter pipeline for SD capture
 - `platformio.ini` — `esp32cam` board, Arduino framework, 115200 monitor,
   460800 upload

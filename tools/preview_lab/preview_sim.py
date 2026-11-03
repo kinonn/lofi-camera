@@ -1,18 +1,16 @@
 """Host-side simulation of the lofi-camera OLED preview pipeline.
 
-Mirrors ``src/preview.h`` + ``src/preview_dither.h`` + ``src/preview_canny.h``
-without touching the firmware:
+Mirrors the firmware Floyd-Steinberg path and provides lab-only alternatives,
+including Bayer and Canny, without touching firmware:
 
     RGB -> Rec.709 luma -> aspect-fit letterbox (nearest neighbour)
-    -> dither variant or Canny edge detection
+    -> Floyd-Steinberg, another dither variant, or Canny edge detection
 
-``dither_render`` is the exact firmware 4x4 Bayer renderer. The extra
-``*_render`` helpers below are lab-only alternatives for judging what a
-different 1-bit mapping would look like on the same 128x64 panel.
-
-The Canny path follows the firmware step for step: optional binomial blur
-passes, Sobel ``|gx| + |gy|`` gradients with quantised direction, one-sided
-non-maximum suppression, double threshold, and hysteresis.
+``floyd_steinberg_render`` uses the firmware's error-diffusion defaults. The
+other ``*_render`` helpers, including Bayer and Canny, are lab-only alternatives
+for judging different 1-bit mappings on the same 128x64 panel. Canny uses
+optional binomial blur passes, Sobel ``|gx| + |gy|`` gradients with quantised
+direction, one-sided non-maximum suppression, double threshold, and hysteresis.
 """
 
 from __future__ import annotations
@@ -56,10 +54,13 @@ class PreviewFrame:
 
 
 def rgb_to_luma(rgb: np.ndarray) -> np.ndarray:
-    """Rec.709 luma, matching the firmware's integer weights (54/183/19)."""
-    rgb = np.asarray(rgb, dtype=np.float64)
-    luma = (54.0 * rgb[..., 0] + 183.0 * rgb[..., 1] + 19.0 * rgb[..., 2]) / 256.0
-    return np.clip(np.round(luma), 0, 255).astype(np.uint8)
+    """Rec.709 luma after the firmware's RGB565 quantise/expand step."""
+    rgb = np.asarray(rgb, dtype=np.uint32)
+    r5, g6, b5 = rgb[..., 0] >> 3, rgb[..., 1] >> 2, rgb[..., 2] >> 3
+    r = (r5 << 3) | (r5 >> 2)
+    g = (g6 << 2) | (g6 >> 4)
+    b = (b5 << 3) | (b5 >> 2)
+    return ((54 * r + 183 * g + 19 * b) >> 8).astype(np.uint8)
 
 
 def preview_prepare(gray: np.ndarray) -> PreviewFrame:
@@ -93,7 +94,10 @@ def preview_prepare(gray: np.ndarray) -> PreviewFrame:
 
 def _stretch_contrast(gray: np.ndarray, contrast: int) -> np.ndarray:
     """Firmware contrast stretch around mid-grey (100 = unchanged)."""
-    stretched = 128 + (gray.astype(np.int32) - 128) * int(contrast) // 100
+    product = (gray.astype(np.int64) - 128) * int(contrast)
+    # C++ signed integer division truncates toward zero; Python // floors.
+    quotient = np.where(product >= 0, product // 100, -((-product) // 100))
+    stretched = 128 + quotient
     return np.clip(stretched, 0, 255).astype(np.uint8)
 
 
@@ -119,7 +123,7 @@ def _bayer_render(frame: PreviewFrame, matrix: np.ndarray, contrast: int = 130) 
 
 
 def dither_render(frame: PreviewFrame, contrast: int = 130) -> np.ndarray:
-    """4x4 Bayer ordered dither with the firmware's contrast stretch."""
+    """Lab-only 4x4 Bayer ordered dither with a contrast stretch."""
     return _bayer_render(frame, BAYER_4X4, contrast)
 
 
@@ -128,8 +132,8 @@ def dither_bayer2_render(frame: PreviewFrame, contrast: int = 130) -> np.ndarray
     return _bayer_render(frame, BAYER_2X2, contrast)
 
 
-# 8x8 Bayer matrix (values 0-63). Spreads the quantisation error over a wider
-# area than the firmware 4x4, so smooth gradients band less at the cost of a
+# 8x8 Bayer matrix (values 0-63). Spreads quantisation over a wider area
+# than the 4x4 alternative, so smooth gradients band less at the cost of a
 # coarser visible dot pattern.
 BAYER_8X8 = np.array(
     [
@@ -236,6 +240,21 @@ def tone_adjust(
     return np.clip(np.round(out * 255.0), 0, 255).astype(np.uint8)
 
 
+def temporal_stabilise(
+    current: np.ndarray, previous: np.ndarray | None, alpha: float = 0.8
+) -> np.ndarray:
+    """Blend a frame with the previous stabilised tile (alpha weights the past)."""
+    cur = np.asarray(current, dtype=np.float64)
+    if previous is None:
+        return np.clip(np.round(cur), 0, 255).astype(np.uint8)
+    prev = np.asarray(previous, dtype=np.float64)
+    if prev.shape != cur.shape:
+        return np.clip(np.round(cur), 0, 255).astype(np.uint8)
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    out = alpha * prev + (1.0 - alpha) * cur
+    return np.clip(np.round(out), 0, 255).astype(np.uint8)
+
+
 def unsharp_mask(
     gray: np.ndarray, amount: float = 0.0, sigma: float = 1.0
 ) -> np.ndarray:
@@ -258,33 +277,41 @@ def photo_floyd_render(
     blur_sigma: float = 0.0,
     threshold: float = 128.0,
     strength: float = 0.9,
-) -> np.ndarray:
+    previous: np.ndarray | None = None,
+    alpha: float = 0.8,
+) -> tuple[np.ndarray, np.ndarray]:
     """Lab-only photo chain on the letterboxed tile.
 
     Grayscale -> tone adjust -> optional unsharp mask -> optional blur
-    -> Floyd-Steinberg. Single still, so no temporal smoothing.
+    -> temporal stabilisation -> Floyd-Steinberg.
+
+    Returns the display buffer and stabilised grayscale tile. Feed the tile
+    back as ``previous`` when processing successive frames.
     """
     out = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH), dtype=np.uint8)
     if frame.w <= 0 or frame.h <= 0:
-        return out
+        return out, np.zeros((0, 0), dtype=np.uint8)
 
     toned = tone_adjust(frame.px, contrast=contrast, brightness=brightness, gamma=gamma)
     sharpened = unsharp_mask(toned, amount=sharpen_amount, sigma=1.0)
     softened = gaussian_blur(sharpened, sigma=blur_sigma)
-    mask = _floyd_steinberg_gray(softened, threshold=threshold, strength=strength)
-    return _blit(out, frame, mask)
+    stabilised = temporal_stabilise(softened, previous, alpha=alpha)
+    mask = _floyd_steinberg_gray(stabilised, threshold=threshold, strength=strength)
+    return _blit(out, frame, mask), stabilised
 
 
 def floyd_steinberg_render(
-    frame: PreviewFrame, contrast: int = 130
+    frame: PreviewFrame, contrast: int = 130, threshold: float = 128.0,
+    strength: float = 0.45,
 ) -> np.ndarray:
-    """Lab-only Floyd-Steinberg error diffusion (smooth tones, some worming)."""
+    """Floyd-Steinberg error diffusion matching the firmware defaults."""
     out = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH), dtype=np.uint8)
     if frame.w <= 0 or frame.h <= 0:
         return out
 
     stretched = _stretch_contrast(frame.px, contrast)
-    return _blit(out, frame, _floyd_steinberg_gray(stretched))
+    return _blit(out, frame, _floyd_steinberg_gray(
+        stretched, threshold=threshold, strength=strength))
 
 
 def _atkinson_gray(gray: np.ndarray) -> np.ndarray:
@@ -559,7 +586,7 @@ def canny_render(
     low: int = 80,
     high: int = 160,
 ) -> np.ndarray:
-    """Full firmware Canny chain rendered onto a 128x64 1-bit image."""
+    """Lab-only Canny chain rendered onto a 128x64 1-bit image."""
     out = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH), dtype=np.uint8)
     if frame.w <= 0 or frame.h <= 0:
         return out

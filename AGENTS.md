@@ -38,7 +38,7 @@ changing firmware.
 - SD writes stream through `JpegWriteFn`; keep the encoded JPEG out of RAM
   (peak PSRAM is ~2.9 MB of 4 MB and depends on it).
 - No per-frame or per-shot heap allocation. Use `static`/file-scope buffers
-  (`PreviewFrame`, the Canny scratch arrays, the once-allocated `previewRgb`).
+  (`PreviewFrame`, the once-allocated `previewRgb`).
 
 ## Conventions
 

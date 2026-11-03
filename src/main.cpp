@@ -49,7 +49,7 @@
 #define DBG(...) do { if (DBG_ENABLED) Serial.printf(__VA_ARGS__); } while (0)
 
 // Auto-exposure target bias: -2 (darker) .. +2 (brighter), 0 = neutral.
-// The 1-bit dithered preview is very high contrast, so -1 often keeps
+// The 1-bit error-diffused preview is very high contrast, so -1 often keeps
 // highlights from blowing out; the JPEG stills use the same setting.
 #define AE_LEVEL 0
 
@@ -229,9 +229,9 @@ static bool cameraBegin(framesize_t size, int fbCount) {
     s->set_vflip(s, CAM_VFLIP);
     s->set_hmirror(s, CAM_HMIRROR);
 
-    // Neutral tone: this single stream feeds both the dithered preview and the
-    // saved JPEG, so per-mode contrast is no longer possible. The contrast the
-    // 1-bit panel wants is applied in the dither renderer instead.
+    // Neutral tone: this single stream feeds both the preview and the
+    // saved JPEG, so per-mode contrast is no longer possible. The panel's
+    // contrast is applied in the preview renderer instead.
     s->set_brightness(s, 0);
     s->set_contrast(s, 0);
     s->set_saturation(s, 1);
