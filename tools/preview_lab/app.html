@@ -380,11 +380,10 @@ const DEFS = {
             hasIn:true, hasOut:true},
   atkinson:{title:"Atkinson", group:"dither", desc:"punchy",
             params:[{k:"threshold",label:"threshold (0–255)",type:"number",def:128,min:0,max:255}], hasIn:true, hasOut:true},
-  photo:   {title:"Photo Floyd", group:"dither", desc:"tone+temporal+FS",
+  photo:   {title:"Photo Floyd", group:"dither", desc:"tone+FS",
             params:[{k:"contrast",label:"contrast",type:"number",def:1.15,step:"0.01"},
                     {k:"threshold",label:"threshold (0–255)",type:"number",def:128,min:0,max:255},
-                    {k:"strength",label:"strength",type:"number",def:0.9,step:"0.05"},
-                    {k:"alpha",label:"temporal α",type:"number",def:0.8,step:"0.05"}],
+                    {k:"strength",label:"strength",type:"number",def:0.9,step:"0.05"}],
             hasIn:true, hasOut:true},
   canny:   {title:"Canny", group:"analysis", desc:"blur · low · high",
             params:[{k:"blur",label:"blur passes",type:"number",def:2},
@@ -691,7 +690,7 @@ window.addEventListener("resize", drawWires);
 for(const [type,def] of Object.entries(DEFS)){
   const b = document.createElement("button");
   b.className = "pal-btn"; b.innerHTML = `${def.title}<small>${def.desc}</small>`;
-  b.onclick = ()=> addNode(type, 40-panX+Math.random()*220, 40-panY+Math.random()*260);
+  b.onclick = ()=> addNode(type, 40-panX+(seq*30)%220, 40-panY+(seq*47)%260);
   document.getElementById(GROUPS[def.group]).appendChild(b);
 }
 
@@ -711,28 +710,28 @@ async function loadNodeImage(node){
   log(`could not load ${name} — using gradient (open via repo or upload a file)`);
   return makeGradient();
 }
+function imgElToRGB(img){
+  const c = document.createElement("canvas");
+  c.width = img.naturalWidth || img.width; c.height = img.naturalHeight || img.height;
+  c.getContext("2d").drawImage(img,0,0);
+  const d = c.getContext("2d").getImageData(0,0,c.width,c.height);
+  return {rgb:new Uint8Array(d.data.filter((_,i)=>i%4!==3)), w:c.width, h:c.height};
+}
 function fileToRGB(file){
   return new Promise((res,rej)=>{
     const url = URL.createObjectURL(file);
     const img = new Image();
-    img.onload = ()=>{ const r = drawToCanvas(img); URL.revokeObjectURL(url); res(r); };
+    img.onload = ()=>{ const r = imgElToRGB(img); URL.revokeObjectURL(url); res(r); };
     img.onerror = rej; img.src = url;
   });
 }
 function urlToRGB(url){
   return new Promise((res,rej)=>{
     const img = new Image();
-    img.onload = ()=>res(drawToCanvas(img));
+    img.onload = ()=>res(imgElToRGB(img));
     img.onerror = ()=>rej(new Error("load failed "+url));
     img.src = url;
   });
-}
-function drawToCanvas(img){
-  const c = document.createElement("canvas");
-  c.width = img.naturalWidth || img.width; c.height = img.naturalHeight || img.height;
-  c.getContext("2d").drawImage(img,0,0);
-  const d = c.getContext("2d").getImageData(0,0,c.width,c.height);
-  return {rgb:new Uint8Array(d.data.filter((_,i)=>i%4!==3)), w:c.width, h:c.height};
 }
 function makeGradient(){
   const w=256,h=160, rgb=new Uint8Array(w*h*3);
@@ -743,9 +742,10 @@ function makeGradient(){
   return {rgb,w,h};
 }
 
-function applyStretch(gray, contrast100){
-  const out = new Uint8Array(gray.length);
-  for(let i=0;i<gray.length;i++) out[i]=Math.round(clamp255(128+(gray[i]-128)*contrast100/100));
+function threshold(gray,w,h,level){
+  const lv = clamp255(level);
+  const out = new Uint8Array(w*h);
+  for(let i=0;i<gray.length;i++) out[i]=gray[i]>lv?255:0;
   return out;
 }
 
@@ -824,12 +824,11 @@ async function execChain(chain){
         const [mat, lv] = sz==="2×2" ? [BAYER2,4] : sz==="8×8" ? [BAYER8,64] : [BAYER4,16];
         mono=bayer(gray,w,h,mat,lv); break;
       }
-      case "threshold": mono=(()=>{const lv=clamp255(p.level??128);const o=new Uint8Array(w*h);for(let i=0;i<gray.length;i++)o[i]=gray[i]>lv?255:0;return o;})(); break;
-      case "floyd": gray=applyStretch(gray,100), mono=floydSteinberg(gray,w,h,p.threshold??128,p.strength??0.9); break;
-      case "atkinson": gray=applyStretch(gray,100), mono=atkinson(gray,w,h,p.threshold??128); break;
+      case "threshold": mono=threshold(gray,w,h,p.level??128); break;
+      case "floyd": mono=floydSteinberg(gray,w,h,p.threshold??128,p.strength??0.9); break;
+      case "atkinson": mono=atkinson(gray,w,h,p.threshold??128); break;
       case "photo": {
         gray = toneAdjust(gray,p.contrast??1.15,0);
-        // temporal: single still → blend toward itself is a no-op; kept for parity
         mono = floydSteinberg(gray,w,h,p.threshold??128,p.strength??0.9);
         break;
       }

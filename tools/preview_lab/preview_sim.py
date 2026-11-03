@@ -20,11 +20,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from PIL import Image, ImageFilter
 
 SCREEN_WIDTH = 128
 SCREEN_HEIGHT = 64
-PREVIEW_MAX_W = 128
-PREVIEW_MAX_H = 64
 
 BAYER_2X2 = np.array(
     [
@@ -63,11 +62,7 @@ def rgb_to_luma(rgb: np.ndarray) -> np.ndarray:
     return np.clip(np.round(luma), 0, 255).astype(np.uint8)
 
 
-def preview_prepare(
-    gray: np.ndarray,
-    screen_w: int = SCREEN_WIDTH,
-    screen_h: int = SCREEN_HEIGHT,
-) -> PreviewFrame:
+def preview_prepare(gray: np.ndarray) -> PreviewFrame:
     """Aspect-fit + letterbox with nearest neighbour, like ``previewPrepare``."""
     gray = np.asarray(gray, dtype=np.uint8)
     if gray.ndim != 2:
@@ -77,11 +72,11 @@ def preview_prepare(
         empty = np.zeros((0, 0), dtype=np.uint8)
         return PreviewFrame(px=empty, w=0, h=0, x=0, y=0)
 
-    scale = min(screen_w / src_w, screen_h / src_h)
+    scale = min(SCREEN_WIDTH / src_w, SCREEN_HEIGHT / src_h)
     dw = int(src_w * scale)
     dh = int(src_h * scale)
-    dw = min(max(dw, 1), PREVIEW_MAX_W)
-    dh = min(max(dh, 1), PREVIEW_MAX_H)
+    dw = min(max(dw, 1), SCREEN_WIDTH)
+    dh = min(max(dh, 1), SCREEN_HEIGHT)
 
     # Firmware mapping: dst[x] = row[x * srcW / dw] with integer division.
     ys = (np.arange(dh, dtype=np.int64) * src_h) // dh
@@ -91,8 +86,8 @@ def preview_prepare(
         px=px,
         w=dw,
         h=dh,
-        x=(screen_w - dw) // 2,
-        y=(screen_h - dh) // 2,
+        x=(SCREEN_WIDTH - dw) // 2,
+        y=(SCREEN_HEIGHT - dh) // 2,
     )
 
 
@@ -110,28 +105,27 @@ def _blit(out: np.ndarray, frame: PreviewFrame, white: np.ndarray) -> np.ndarray
     return out
 
 
-def dither_render(frame: PreviewFrame, contrast: int = 130) -> np.ndarray:
-    """4x4 Bayer ordered dither with the firmware's contrast stretch."""
+def _bayer_render(frame: PreviewFrame, matrix: np.ndarray, contrast: int = 130) -> np.ndarray:
+    """Ordered dither with any square Bayer matrix (levels = n*n)."""
     out = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH), dtype=np.uint8)
     if frame.w <= 0 or frame.h <= 0:
         return out
-
+    n = matrix.shape[0]
+    step = 256 // (n * n)
     stretched = _stretch_contrast(frame.px, contrast).astype(np.int32)
     yy, xx = np.mgrid[0 : frame.h, 0 : frame.w]
-    threshold = BAYER_4X4[yy & 3, xx & 3] * 16 + 8
+    threshold = matrix[yy % n, xx % n] * step + step // 2
     return _blit(out, frame, stretched > threshold)
+
+
+def dither_render(frame: PreviewFrame, contrast: int = 130) -> np.ndarray:
+    """4x4 Bayer ordered dither with the firmware's contrast stretch."""
+    return _bayer_render(frame, BAYER_4X4, contrast)
 
 
 def dither_bayer2_render(frame: PreviewFrame, contrast: int = 130) -> np.ndarray:
     """Lab-only 2x2 Bayer ordered dither (tight dots, only 4 gray steps)."""
-    out = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH), dtype=np.uint8)
-    if frame.w <= 0 or frame.h <= 0:
-        return out
-
-    stretched = _stretch_contrast(frame.px, contrast).astype(np.int32)
-    yy, xx = np.mgrid[0 : frame.h, 0 : frame.w]
-    threshold = BAYER_2X2[yy & 1, xx & 1] * 64 + 32
-    return _blit(out, frame, stretched > threshold)
+    return _bayer_render(frame, BAYER_2X2, contrast)
 
 
 # 8x8 Bayer matrix (values 0-63). Spreads the quantisation error over a wider
@@ -154,26 +148,40 @@ BAYER_8X8 = np.array(
 
 def dither_bayer8_render(frame: PreviewFrame, contrast: int = 130) -> np.ndarray:
     """Lab-only 8x8 Bayer ordered dither (finer tones, coarser dots)."""
-    out = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH), dtype=np.uint8)
-    if frame.w <= 0 or frame.h <= 0:
-        return out
-
-    stretched = _stretch_contrast(frame.px, contrast).astype(np.int32)
-    yy, xx = np.mgrid[0 : frame.h, 0 : frame.w]
-    threshold = BAYER_8X8[yy & 7, xx & 7] * 4 + 2
-    return _blit(out, frame, stretched > threshold)
+    return _bayer_render(frame, BAYER_8X8, contrast)
 
 
-def threshold_render(
-    frame: PreviewFrame, contrast: int = 130, level: int = 128
-) -> np.ndarray:
+def threshold_render(frame: PreviewFrame, contrast: int = 130) -> np.ndarray:
     """Lab-only plain threshold (no dither): stark black/white posterisation."""
     out = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH), dtype=np.uint8)
     if frame.w <= 0 or frame.h <= 0:
         return out
 
     stretched = _stretch_contrast(frame.px, contrast)
-    return _blit(out, frame, stretched > int(level))
+    return _blit(out, frame, stretched > 128)
+
+
+def _error_diffuse(
+    gray: np.ndarray, threshold: float, taps: list[tuple[int, int, float]]
+) -> np.ndarray:
+    """Serpentine error diffusion with mirrored taps on odd rows."""
+    img = gray.astype(np.float64)
+    h, w = img.shape
+    for y in range(h):
+        ltr = (y & 1) == 0
+        xs = range(w) if ltr else range(w - 1, -1, -1)
+        for x in xs:
+            old = img[y, x]
+            new = 255.0 if old >= threshold else 0.0
+            img[y, x] = new
+            err = old - new
+            for dx, dy, f in taps:
+                if not ltr:
+                    dx = -dx
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < w and 0 <= ny < h:
+                    img[ny, nx] += err * f
+    return (img >= threshold).astype(bool)
 
 
 def _floyd_steinberg_gray(
@@ -185,80 +193,26 @@ def _floyd_steinberg_gray(
     much quantisation error is diffused (1.0 = classic Floyd-Steinberg, lower
     values calm worming at the cost of flatter mid-tones).
     """
-    img = gray.astype(np.float64)
     strength = float(np.clip(strength, 0.0, 1.0))
-    h, w = img.shape
-    for y in range(h):
-        left_to_right = (y & 1) == 0
-        xs = range(w) if left_to_right else range(w - 1, -1, -1)
-        for x in xs:
-            old = img[y, x]
-            new = 255.0 if old >= threshold else 0.0
-            img[y, x] = new
-            err = (old - new) * strength
-            if left_to_right:
-                if x + 1 < w:
-                    img[y, x + 1] += err * 7 / 16
-                if y + 1 < h:
-                    if x > 0:
-                        img[y + 1, x - 1] += err * 3 / 16
-                    img[y + 1, x] += err * 5 / 16
-                    if x + 1 < w:
-                        img[y + 1, x + 1] += err * 1 / 16
-            else:
-                if x > 0:
-                    img[y, x - 1] += err * 7 / 16
-                if y + 1 < h:
-                    if x + 1 < w:
-                        img[y + 1, x + 1] += err * 3 / 16
-                    img[y + 1, x] += err * 5 / 16
-                    if x > 0:
-                        img[y + 1, x - 1] += err * 1 / 16
-    return (img >= threshold).astype(bool)
+    taps = [(1, 0, 7 / 16 * strength), (-1, 1, 3 / 16 * strength),
+            (0, 1, 5 / 16 * strength), (1, 1, 1 / 16 * strength)]
+    return _error_diffuse(gray, threshold, taps)
 
 
 def area_resize(gray: np.ndarray, dst_w: int, dst_h: int) -> np.ndarray:
-    """Area-averaging downscale (box filter), edge-inclusive.
-
-    Each destination pixel averages the source pixels whose centres fall in
-    its box. Unlike nearest-neighbour this preserves photographic energy when
-    downsampling (no aliasing shimmer); use nearest only when the source is
-    already at panel size.
-    """
-    img = np.asarray(gray, dtype=np.float64)
+    """Area-averaging downscale via Pillow's box filter."""
+    img = np.asarray(gray, dtype=np.uint8)
     if img.ndim != 2:
         raise ValueError("area_resize expects 2D grayscale input")
-    src_h, src_w = img.shape
     dst_w = max(1, int(dst_w))
     dst_h = max(1, int(dst_h))
-    if (src_h, src_w) == (dst_h, dst_w):
-        return np.clip(np.round(img), 0, 255).astype(np.uint8)
-
-    row_edges = np.linspace(0, src_h, dst_h + 1)
-    col_edges = np.linspace(0, src_w, dst_w + 1)
-    out = np.zeros((dst_h, dst_w), dtype=np.float64)
-    for dy in range(dst_h):
-        y0, y1 = row_edges[dy], row_edges[dy + 1]
-        iy0, iy1 = int(np.floor(y0)), int(np.ceil(y1))
-        for dx in range(dst_w):
-            x0, x1 = col_edges[dx], col_edges[dx + 1]
-            ix0, ix1 = int(np.floor(x0)), int(np.ceil(x1))
-            acc = 0.0
-            area = 0.0
-            for iy in range(max(iy0, 0), min(iy1, src_h)):
-                oy0, oy1 = max(y0, iy), min(y1, iy + 1)
-                wy = max(0.0, oy1 - oy0)
-                if wy <= 0:
-                    continue
-                for ix in range(max(ix0, 0), min(ix1, src_w)):
-                    ox0, ox1 = max(x0, ix), min(x1, ix + 1)
-                    wx = max(0.0, ox1 - ox0)
-                    if wx <= 0:
-                        continue
-                    acc += img[iy, ix] * wy * wx
-                    area += wy * wx
-            out[dy, dx] = acc / area if area > 0 else img[min(iy0, src_h - 1), min(ix0, src_w - 1)]
-    return np.clip(np.round(out), 0, 255).astype(np.uint8)
+    if img.shape == (dst_h, dst_w):
+        return img.copy()
+    # ponytail: Pillow BOX, custom loop if Pillow falls short on edge handling
+    return np.asarray(
+        Image.fromarray(img, mode="L").resize((dst_w, dst_h), Image.BOX),
+        dtype=np.uint8,
+    )
 
 
 def tone_adjust(
@@ -282,25 +236,6 @@ def tone_adjust(
     return np.clip(np.round(out * 255.0), 0, 255).astype(np.uint8)
 
 
-def temporal_stabilise(
-    current: np.ndarray, previous: np.ndarray | None, alpha: float = 0.8
-) -> np.ndarray:
-    """First-order IIR blend towards the previous stabilised frame.
-
-    ``alpha`` weights the past (0 = no memory, 1 = frozen). ``previous=None``
-    returns ``current`` unchanged (first frame). Both inputs are uint8 tiles.
-    """
-    cur = np.asarray(current, dtype=np.float64)
-    if previous is None:
-        return np.clip(np.round(cur), 0, 255).astype(np.uint8)
-    prev = np.asarray(previous, dtype=np.float64)
-    if prev.shape != cur.shape:
-        return np.clip(np.round(cur), 0, 255).astype(np.uint8)
-    alpha = float(np.clip(alpha, 0.0, 1.0))
-    out = alpha * prev + (1.0 - alpha) * cur
-    return np.clip(np.round(out), 0, 255).astype(np.uint8)
-
-
 def unsharp_mask(
     gray: np.ndarray, amount: float = 0.0, sigma: float = 1.0
 ) -> np.ndarray:
@@ -320,33 +255,24 @@ def photo_floyd_render(
     brightness: float = 0.0,
     gamma: float = 1.0,
     sharpen_amount: float = 0.0,
-    sharpen_sigma: float = 1.0,
     blur_sigma: float = 0.0,
     threshold: float = 128.0,
     strength: float = 0.9,
-    previous: np.ndarray | None = None,
-    alpha: float = 0.8,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
     """Lab-only photo chain on the letterboxed tile.
 
-    Grayscale -> tone adjust (contrast/brightness/gamma) -> optional unsharp
-    mask -> optional Gaussian blur -> temporal stabilise -> Floyd-Steinberg
-    with adjustable threshold and diffusion strength.
-
-    Returns ``(display_buffer, stabilised_tile)``; feed the stabilised tile
-    back as ``previous`` for the next frame to get temporal smoothing.
+    Grayscale -> tone adjust -> optional unsharp mask -> optional blur
+    -> Floyd-Steinberg. Single still, so no temporal smoothing.
     """
     out = np.zeros((SCREEN_HEIGHT, SCREEN_WIDTH), dtype=np.uint8)
     if frame.w <= 0 or frame.h <= 0:
-        empty = np.zeros((0, 0), dtype=np.uint8)
-        return out, empty
+        return out
 
     toned = tone_adjust(frame.px, contrast=contrast, brightness=brightness, gamma=gamma)
-    sharpened = unsharp_mask(toned, amount=sharpen_amount, sigma=sharpen_sigma)
+    sharpened = unsharp_mask(toned, amount=sharpen_amount, sigma=1.0)
     softened = gaussian_blur(sharpened, sigma=blur_sigma)
-    stabilised = temporal_stabilise(softened, previous, alpha=alpha)
-    mask = _floyd_steinberg_gray(stabilised, threshold=threshold, strength=strength)
-    return _blit(out, frame, mask), stabilised
+    mask = _floyd_steinberg_gray(softened, threshold=threshold, strength=strength)
+    return _blit(out, frame, mask)
 
 
 def floyd_steinberg_render(
@@ -363,28 +289,9 @@ def floyd_steinberg_render(
 
 def _atkinson_gray(gray: np.ndarray) -> np.ndarray:
     """Serpentine Atkinson error diffusion (1/8 spread, higher contrast)."""
-    img = gray.astype(np.float64)
-    h, w = img.shape
-    for y in range(h):
-        left_to_right = (y & 1) == 0
-        xs = range(w) if left_to_right else range(w - 1, -1, -1)
-        step = 1 if left_to_right else -1
-        for x in xs:
-            old = img[y, x]
-            new = 255.0 if old >= 128.0 else 0.0
-            img[y, x] = new
-            err = (old - new) / 8.0
-            if left_to_right:
-                neighbours = [(y, x + 1), (y, x + 2), (y + 1, x - 1),
-                              (y + 1, x), (y + 1, x + 1), (y + 2, x)]
-            else:
-                neighbours = [(y, x - 1), (y, x - 2), (y + 1, x + 1),
-                              (y + 1, x), (y + 1, x - 1), (y + 2, x)]
-            _ = step
-            for ny, nx in neighbours:
-                if 0 <= ny < h and 0 <= nx < w:
-                    img[ny, nx] += err
-    return (img >= 128).astype(bool)
+    taps = [(1, 0, 1 / 8), (2, 0, 1 / 8), (-1, 1, 1 / 8),
+            (0, 1, 1 / 8), (1, 1, 1 / 8), (0, 2, 1 / 8)]
+    return _error_diffuse(gray, 128.0, taps)
 
 
 def atkinson_render(frame: PreviewFrame, contrast: int = 130) -> np.ndarray:
@@ -470,29 +377,16 @@ def clahe(
 
 
 def gaussian_blur(gray: np.ndarray, sigma: float = 0.8) -> np.ndarray:
-    """Lab-only slight Gaussian blur (separable, edge-replicated).
-
-    ``sigma`` is in pixels; radius is ``ceil(3 * sigma)``. ``sigma <= 0``
-    returns the input unchanged.
-    """
-    img = np.asarray(gray, dtype=np.float64)
+    """Lab-only slight Gaussian blur. ``sigma <= 0`` returns input unchanged."""
+    img = np.asarray(gray, dtype=np.uint8)
     sigma = float(sigma)
     if sigma <= 0:
-        return np.clip(np.round(img), 0, 255).astype(np.uint8)
-    radius = max(1, int(np.ceil(3 * sigma)))
-    xs = np.arange(-radius, radius + 1)
-    kernel = np.exp(-0.5 * (xs / sigma) ** 2)
-    kernel = kernel / kernel.sum()
-
-    padded = np.pad(img, ((0, 0), (radius, radius)), mode="edge")
-    tmp = np.zeros_like(img)
-    for i in range(2 * radius + 1):
-        tmp += kernel[i] * padded[:, i : i + img.shape[1]]
-    padded = np.pad(tmp, ((radius, radius), (0, 0)), mode="edge")
-    out = np.zeros_like(img)
-    for i in range(2 * radius + 1):
-        out += kernel[i] * padded[i : i + img.shape[0], :]
-    return np.clip(np.round(out), 0, 255).astype(np.uint8)
+        return img.copy()
+    # ponytail: Pillow radius≈sigma, custom separable loop if edge handling matters
+    return np.asarray(
+        Image.fromarray(img, mode="L").filter(ImageFilter.GaussianBlur(radius=sigma)),
+        dtype=np.uint8,
+    )
 
 
 def clahe_floyd_render(

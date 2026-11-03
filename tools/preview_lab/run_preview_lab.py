@@ -23,13 +23,14 @@ import argparse
 import sys
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from preview_sim import (  # noqa: E402
-    SCREEN_HEIGHT,
     SCREEN_WIDTH,
+    PreviewFrame,
     area_resize,
     atkinson_render,
     blur_atkinson_render,
@@ -54,8 +55,18 @@ ACCENT = (255, 196, 96)
 
 MODES = ("dither", "bayer2", "bayer8", "floyd", "atkinson", "threshold",
          "clahe-floyd", "blur-atkinson", "photo", "canny")
-DITHER_MODES = ("dither", "bayer2", "bayer8", "floyd", "atkinson", "threshold",
-                "clahe-floyd", "blur-atkinson", "photo")
+MODE_HELP = {
+    "dither": "firmware 4x4 Bayer ordered dither (DITHER_CONTRAST, default 130)",
+    "bayer2": "lab-only 2x2 Bayer (tight dots, only 4 gray steps)",
+    "bayer8": "lab-only 8x8 Bayer (finer tones, coarser dots)",
+    "floyd": "lab-only Floyd-Steinberg error diffusion (smooth tones)",
+    "atkinson": "lab-only Atkinson error diffusion (punchy, posterised)",
+    "threshold": "lab-only plain threshold (stark black/white)",
+    "clahe-floyd": "lab-only CLAHE -> slight Gaussian blur -> Floyd-Steinberg",
+    "blur-atkinson": "lab-only slight Gaussian blur -> Atkinson",
+    "photo": "lab-only area resize + tone + Floyd-Steinberg",
+    "canny": "edge detection (CANNY_BLUR_PASSES=2, CANNY_LOW=80, CANNY_HIGH=160)",
+}
 
 
 # --------------------------------------------------------------------------
@@ -91,30 +102,42 @@ def upscale_nearest(img: Image.Image, scale: int) -> Image.Image:
     )
 
 
+def save_preview(out_dir: Path, slug: str, stem: str, mono: np.ndarray,
+                 scale: int) -> tuple[str, Image.Image, Image.Image]:
+    """Save 1x + scaled PNGs, return (href, small, big)."""
+    small = Image.fromarray(mono, mode="L")
+    big = upscale_nearest(small, scale)
+    folder = out_dir / slug
+    folder.mkdir(parents=True, exist_ok=True)
+    small.save(folder / f"{stem}__{slug}.png")
+    big.save(folder / f"{stem}__{slug}_x{scale}.png")
+    return f"{slug}/{stem}__{slug}_x{scale}.png", small, big
+
+
 def build_contact_sheet(
     original: Image.Image,
     rendered: list[tuple[str, str, Image.Image]],
     cols: int = 3,
     thumb_w: int = 512,
-    label_h: int = 30,
-    gap: int = 10,
 ) -> Image.Image:
     """Grid of ``original`` first, then every (number, label, image) entry."""
+    label_h, gap = 30, 10
     cells: list[tuple[str, Image.Image, bool]] = [("00  ORIGINAL", original, True)]
     for number, label, img in rendered:
         cells.append((f"{number}  {label}", img, False))
 
-    def thumb(img: Image.Image) -> Image.Image:
-        height = max(1, round(thumb_w * img.height / img.width))
-        # NEAREST keeps the 1-bit preview pixels crisp in the sheet.
-        resample = (
-            Image.Resampling.NEAREST
-            if img.width <= SCREEN_WIDTH * 2
-            else Image.Resampling.LANCZOS
-        )
-        return img.resize((thumb_w, height), resample)
+    def _thumb_h(img: Image.Image) -> int:
+        return max(1, round(thumb_w * img.height / img.width))
 
-    prepared = [(label, thumb(img), is_original) for label, img, is_original in cells]
+    prepared = [
+        (label,
+         img.resize((thumb_w, _thumb_h(img)),
+                    Image.Resampling.NEAREST
+                    if img.width <= SCREEN_WIDTH * 2
+                    else Image.Resampling.LANCZOS),
+         is_original)
+        for label, img, is_original in cells
+    ]
     cell_h = max(pic.height for _, pic, _ in prepared) + label_h
     rows = (len(prepared) + cols - 1) // cols
 
@@ -235,8 +258,6 @@ def main(argv: list[str] | None = None) -> int:
                         help="photo mode brightness offset in gray levels (default: 0)")
     parser.add_argument("--photo-gamma", type=float, default=1.0,
                         help="photo mode gamma power curve (default: 1.0 = off)")
-    parser.add_argument("--photo-alpha", type=float, default=0.8,
-                        help="photo mode temporal weight on past frames (default: 0.80)")
     parser.add_argument("--photo-strength", type=float, default=0.9,
                         help="photo mode diffused error fraction (default: 0.90)")
     parser.add_argument("--photo-threshold", type=float, default=128.0,
@@ -245,8 +266,6 @@ def main(argv: list[str] | None = None) -> int:
                         help="photo mode unsharp-mask amount (default: 0 = off)")
     parser.add_argument("--photo-blur", type=float, default=0.0,
                         help="photo mode Gaussian sigma before diffusion (default: 0 = off)")
-    parser.add_argument("--photo-resize", choices=["area", "nearest"], default="area",
-                        help="photo mode downsampler (default: area; nearest only if already 128x64)")
     parser.add_argument("--clahe-clip", type=float, default=2.0,
                         help="CLAHE clip limit for clahe-floyd (default: 2.0)")
     parser.add_argument("--clahe-tiles", type=int, nargs=2, default=[8, 8],
@@ -274,16 +293,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list:
         print("preview modes:\n")
-        print("  dither     firmware 4x4 Bayer ordered dither (DITHER_CONTRAST, default 130)")
-        print("  bayer2     lab-only 2x2 Bayer (tight dots, only 4 gray steps)")
-        print("  bayer8     lab-only 8x8 Bayer (finer tones, coarser dots)")
-        print("  floyd      lab-only Floyd-Steinberg error diffusion (smooth tones)")
-        print("  atkinson   lab-only Atkinson error diffusion (punchy, posterised)")
-        print("  threshold  lab-only plain threshold (stark black/white)")
-        print("  clahe-floyd  lab-only CLAHE -> slight Gaussian blur -> Floyd-Steinberg")
-        print("  blur-atkinson  lab-only slight Gaussian blur -> Atkinson")
-        print("  photo      lab-only area resize + tone + temporal Floyd-Steinberg")
-        print("  canny      edge detection (CANNY_BLUR_PASSES=2, CANNY_LOW=80, CANNY_HIGH=160)")
+        for m in MODES:
+            print(f"  {m:13s} {MODE_HELP[m]}")
         return 0
 
     src_dir = Path(args.input)
@@ -304,9 +315,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"images  : {len(images)}   modes: {', '.join(args.modes)}")
     print(f"dither  : contrast={args.dither_contrast}")
     print(f"photo   : contrast={args.photo_contrast} brightness={args.photo_brightness} "
-          f"gamma={args.photo_gamma} alpha={args.photo_alpha} strength={args.photo_strength} "
-          f"threshold={args.photo_threshold} sharpen={args.photo_sharpen} blur={args.photo_blur} "
-          f"resize={args.photo_resize}")
+          f"gamma={args.photo_gamma} strength={args.photo_strength} "
+          f"threshold={args.photo_threshold} sharpen={args.photo_sharpen} blur={args.photo_blur}")
     print(f"clahe   : contrast={args.clahe_contrast} clip={args.clahe_clip} "
           f"tiles={args.clahe_tiles[0]}x{args.clahe_tiles[1]} blur={args.clahe_blur}")
     print(f"canny   : blur_passes={args.blur_passes} low={args.low} high={args.high}\n")
@@ -317,7 +327,6 @@ def main(argv: list[str] | None = None) -> int:
     for image_path in images:
         with Image.open(image_path) as handle:
             rgb = handle.convert("RGB")
-        import numpy as np
 
         luma = rgb_to_luma(np.asarray(rgb))
         frame = preview_prepare(luma)
@@ -326,70 +335,53 @@ def main(argv: list[str] | None = None) -> int:
         items: list[tuple[str, str, str]] = []
         rendered: list[tuple[str, str, Image.Image]] = []
 
-        from preview_sim import PreviewFrame  # noqa: E402
-
-        dither_specs = [
-            ("dither", "dither", lambda f: dither_render(f, contrast=args.dither_contrast)),
-            ("bayer2", "bayer2", lambda f: dither_bayer2_render(f, contrast=args.dither_contrast)),
-            ("bayer8", "bayer8", lambda f: dither_bayer8_render(f, contrast=args.dither_contrast)),
-            ("floyd", "floyd-steinberg", lambda f: floyd_steinberg_render(f, contrast=args.dither_contrast)),
-            ("atkinson", "atkinson", lambda f: atkinson_render(f, contrast=args.dither_contrast)),
-            ("threshold", "threshold", lambda f: threshold_render(f, contrast=args.dither_contrast)),
-            ("clahe-floyd", "clahe-floyd", lambda f: clahe_floyd_render(
-                f, contrast=args.clahe_contrast, clip_limit=args.clahe_clip,
-                tiles=(args.clahe_tiles[0], args.clahe_tiles[1]), sigma=args.clahe_blur)),
-            ("blur-atkinson", "blur-atkinson", lambda f: blur_atkinson_render(
-                f, contrast=args.dither_contrast, sigma=args.clahe_blur)),
-            ("photo", "photo", None),
-        ]
-        number = 0
-        photo_state: dict[str, object] = {}
-        for mode, slug, fn in dither_specs:
-            if mode not in args.modes:
-                continue
-            number += 1
-            num = f"{number:02d}"
+        def render(mode: str) -> tuple[str, np.ndarray, str]:
+            """Return (slug, mono, label) for one mode."""
+            dc = args.dither_contrast
+            if mode == "dither":
+                return "dither", dither_render(frame, contrast=dc), f"dither (contrast {dc})"
+            if mode == "bayer2":
+                return "bayer2", dither_bayer2_render(frame, contrast=dc), f"bayer2 (contrast {dc})"
+            if mode == "bayer8":
+                return "bayer8", dither_bayer8_render(frame, contrast=dc), f"bayer8 (contrast {dc})"
+            if mode == "floyd":
+                return "floyd-steinberg", floyd_steinberg_render(frame, contrast=dc), f"floyd-steinberg (contrast {dc})"
+            if mode == "atkinson":
+                return "atkinson", atkinson_render(frame, contrast=dc), f"atkinson (contrast {dc})"
+            if mode == "threshold":
+                return "threshold", threshold_render(frame, contrast=dc), f"threshold (contrast {dc})"
+            if mode == "clahe-floyd":
+                mono = clahe_floyd_render(
+                    frame, contrast=args.clahe_contrast, clip_limit=args.clahe_clip,
+                    tiles=(args.clahe_tiles[0], args.clahe_tiles[1]), sigma=args.clahe_blur)
+                return "clahe-floyd", mono, (f"clahe-floyd (contrast {args.clahe_contrast}, clip {args.clahe_clip}, "
+                    f"tiles {args.clahe_tiles[0]}x{args.clahe_tiles[1]}, blur {args.clahe_blur})")
+            if mode == "blur-atkinson":
+                mono = blur_atkinson_render(frame, contrast=dc, sigma=args.clahe_blur)
+                return "blur-atkinson", mono, f"blur-atkinson (contrast {dc}, blur {args.clahe_blur})"
             if mode == "photo":
-                if args.photo_resize == "area":
-                    import numpy as _np
-                    small_gray = area_resize(luma, frame.w, frame.h)
-                    photo_frame = PreviewFrame(px=small_gray, w=frame.w, h=frame.h,
-                                               x=frame.x, y=frame.y)
-                else:
-                    photo_frame = frame
-                mono, stabilised = photo_floyd_render(
+                small_gray = area_resize(luma, frame.w, frame.h)
+                photo_frame = PreviewFrame(px=small_gray, w=frame.w, h=frame.h,
+                                           x=frame.x, y=frame.y)
+                mono = photo_floyd_render(
                     photo_frame, contrast=args.photo_contrast,
                     brightness=args.photo_brightness, gamma=args.photo_gamma,
                     sharpen_amount=args.photo_sharpen, blur_sigma=args.photo_blur,
-                    threshold=args.photo_threshold, strength=args.photo_strength,
-                    previous=photo_state.get(stem), alpha=args.photo_alpha)
-                photo_state[stem] = stabilised
-            else:
-                assert fn is not None
-                mono = fn(frame)
-            small = Image.fromarray(mono, mode="L")
-            big = upscale_nearest(small, args.preview_scale)
+                    threshold=args.photo_threshold, strength=args.photo_strength)
+                return "photo", mono, (f"photo (contrast {args.photo_contrast}, bright {args.photo_brightness}, "
+                    f"gamma {args.photo_gamma}, strength {args.photo_strength}, thr {args.photo_threshold}, "
+                    f"sharpen {args.photo_sharpen}, blur {args.photo_blur})")
+            raise ValueError(mode)
 
-            folder = out_dir / slug
-            folder.mkdir(parents=True, exist_ok=True)
-            small_path = folder / f"{stem}__{slug}.png"
-            big_path = folder / f"{stem}__{slug}_x{args.preview_scale}.png"
-            small.save(small_path)
-            big.save(big_path)
-
-            if mode == "photo":
-                label = (f"{slug} (contrast {args.photo_contrast}, bright {args.photo_brightness}, "
-                         f"gamma {args.photo_gamma}, alpha {args.photo_alpha}, "
-                         f"strength {args.photo_strength}, thr {args.photo_threshold}, "
-                         f"sharpen {args.photo_sharpen}, blur {args.photo_blur}, {args.photo_resize})")
-            elif mode == "clahe-floyd":
-                label = (f"{slug} (contrast {args.clahe_contrast}, clip {args.clahe_clip}, "
-                         f"tiles {args.clahe_tiles[0]}x{args.clahe_tiles[1]}, blur {args.clahe_blur})")
-            elif mode == "blur-atkinson":
-                label = f"{slug} (contrast {args.dither_contrast}, blur {args.clahe_blur})"
-            else:
-                label = f"{slug} (contrast {args.dither_contrast})"
-            items.append((num, label, f"{slug}/{big_path.name}"))
+        number = 0
+        for mode in MODES:
+            if mode == "canny" or mode not in args.modes:
+                continue
+            number += 1
+            slug, mono, label = render(mode)
+            href, _, big = save_preview(out_dir, slug, stem, mono, args.preview_scale)
+            num = f"{number:02d}"
+            items.append((num, label, href))
             print(f"  {stem}  <- {num} {label}")
             if not args.no_sheet:
                 rendered.append((num, label, big.convert("RGB")))
@@ -401,20 +393,12 @@ def main(argv: list[str] | None = None) -> int:
                 low=args.low,
                 high=args.high,
             )
-            small = Image.fromarray(mono, mode="L")
-            big = upscale_nearest(small, args.preview_scale)
-
-            folder = out_dir / "canny"
-            folder.mkdir(parents=True, exist_ok=True)
-            small_path = folder / f"{stem}__canny.png"
-            big_path = folder / f"{stem}__canny_x{args.preview_scale}.png"
-            small.save(small_path)
-            big.save(big_path)
+            href, _, big = save_preview(out_dir, "canny", stem, mono, args.preview_scale)
 
             label = (f"canny (blur {args.blur_passes}, "
                      f"low {args.low}, high {args.high})")
             num = f"{len(items) + 1:02d}"
-            items.append((num, label, f"canny/{big_path.name}"))
+            items.append((num, label, href))
             print(f"  {stem}  <- {num} {label}")
             if not args.no_sheet:
                 rendered.append((num, label, big.convert("RGB")))
