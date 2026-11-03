@@ -120,7 +120,7 @@
     <div id="stage"></div>
   </div>
 </div>
-<div id="hint">Tip: the <b>Image input</b> block can load a sample from <code>test-images/</code> (when opened from the repo) or any file you upload. <b>Resize</b> defaults to 128&times;64 area-average — switch to nearest only if the source is already panel-sized. Grayscale uses the firmware <code>decodePreviewGray</code> math (RGB565 quantise + 54/183/19).</div>
+<div id="hint">Tip: the <b>Image input</b> block can load a sample from <code>test-images/</code> (when opened from the repo) or any file you upload. Set its width and height to choose the exact RGB input dimensions. The downstream <b>Resize</b> block independently defaults to 128&times;64 area-average. Grayscale uses the firmware <code>decodePreviewGray</code> math (RGB565 quantise + 54/183/19).</div>
 
 <script>
 "use strict";
@@ -165,6 +165,38 @@ function areaResize(gray, sw, sh, dw, dh){
         }
       }
       out[dy*dw+dx] = Math.round(area>0 ? acc/area : gray[Math.min(iy0,sh-1)*sw+Math.min(ix0,sw-1)]);
+    }
+  }
+  return out;
+}
+
+function areaResizeRGB(rgb, sw, sh, dw, dh){
+  dw = Math.max(1,dw|0); dh = Math.max(1,dh|0);
+  if(sw===dw && sh===dh) return Uint8Array.from(rgb);
+  const out = new Uint8Array(dw*dh*3);
+  const sx = sw/dw, sy = sh/dh;
+  for(let dy=0;dy<dh;dy++){
+    const y0=dy*sy, y1=(dy+1)*sy;
+    const iy0=Math.floor(y0), iy1=Math.ceil(y1);
+    for(let dx=0;dx<dw;dx++){
+      const x0=dx*sx, x1=(dx+1)*sx;
+      const ix0=Math.floor(x0), ix1=Math.ceil(x1);
+      let area=0, r=0, g=0, b=0;
+      for(let iy=Math.max(0,iy0);iy<Math.min(iy1,sh);iy++){
+        const wy=Math.min(y1,iy+1)-Math.max(y0,iy);
+        if(wy<=0) continue;
+        for(let ix=Math.max(0,ix0);ix<Math.min(ix1,sw);ix++){
+          const wx=Math.min(x1,ix+1)-Math.max(x0,ix);
+          if(wx<=0) continue;
+          const weight=wx*wy, index=(iy*sw+ix)*3;
+          r+=rgb[index]*weight; g+=rgb[index+1]*weight; b+=rgb[index+2]*weight;
+          area+=weight;
+        }
+      }
+      const target=(dy*dw+dx)*3;
+      out[target]=Math.round(area>0?r/area:0);
+      out[target+1]=Math.round(area>0?g/area:0);
+      out[target+2]=Math.round(area>0?b/area:0);
     }
   }
   return out;
@@ -345,8 +377,11 @@ function canny(gray,w,h,blurPasses,low,high){
    ============================================================ */
 const DEFS = {
   input:   {title:"Image input", operation:"image_input", group:"source", desc:"upload or sample",
-      params:[{k:"source",label:"source",type:"select",opts:["upload","img_0027","img_0037","img_0038","img_0045","gradient"],def:"img_0027"}],
+      params:[{k:"source",label:"source",type:"select",opts:["upload","img_0027","img_0037","img_0038","img_0045","gradient"],def:"img_0027"},
+        {k:"w",label:"width (px)",type:"number",def:128,min:1,max:4096},{k:"h",label:"height (px)",type:"number",def:64,min:1,max:4096}],
             contract:{input:"Decode the selected image to row-major RGB8 triplets; uploaded files are external artifacts, not embedded in this JSON.",
+                    dimensions:"Resize the decoded image to the requested width and height before processing; pixel dimensions are exact and may change aspect ratio. Width and height are clamped to 1..4096 pixels.",
+                      resizeMethod:"Area-weighted RGB resampling with partial source-pixel overlap; round weighted channel averages to nearest integer before grayscale conversion.",
               sampleFiles:{img_0027:"test-images/img_0027.jpg",img_0037:"test-images/img_0037.jpg",
                 img_0038:"test-images/img_0038.jpg",img_0045:"test-images/img_0045.jpg"},
               gradient:"256x160 horizontal 8-bit grayscale ramp expanded to RGB; v = round(x / width * 255)",
@@ -857,7 +892,7 @@ function buildPipelineConfig(outputNode){
     output:{inputs:[{id:"input",acceptedDataTypes:["image/gray8","image/binary-gray8"]}],outputs:[]},
   };
   const parameterNames={
-    input:{source:"source"},
+    input:{source:"source",w:"width",h:"height"},
     resize:{w:"maxWidth",h:"maxHeight",maintainAspect:"maintainAspectRatio",method:"resamplingMethod"},
     tone:{contrast:"contrastGain",brightness:"brightness"},
     blur:{sigma:"sigmaPixels"},
@@ -919,7 +954,8 @@ function buildPipelineConfig(outputNode){
         layouts:{"image/rgb8-interleaved":"row-major [R,G,B] byte triplets","image/gray8":"row-major one byte per pixel","image/binary-gray8":"row-major one byte per pixel; only values 0 and 255"},
         rounding:"Follow the per-operation contract; otherwise use the explicitly described rounding and clamping.",
         coordinates:"x increases rightward, y increases downward; pixel origin is top-left"},
-      inputResolution:"Use the original image dimensions unless a resize node specifies otherwise.",
+      inputResolution:"Resize the decoded image to the Input node's requested width and height before processing; later Resize nodes may change dimensions again.",
+      inputResize:{method:"area_weighted_rgb",widthRange:[1,4096],heightRange:[1,4096]},
       output:{width:128,height:64,fit:"contain and center; nearest-neighbor sampling; black letterbox"},
     },
     nodes:configNodes,
@@ -1063,8 +1099,16 @@ async function execChain(chain){
     switch(node.type){
       case "input": {
         const im = await loadNodeImage(node);
-        node.lastInputInfo={width:im.w,height:im.h,source:im.sourceInfo};
-        rgb=im.rgb; W=im.w; H=im.h; gray=null; mono=null;
+        const targetW=Math.max(1,Math.floor(Number(p.w)||128));
+        const targetH=Math.max(1,Math.floor(Number(p.h)||64));
+        node.lastInputInfo={decodedWidth:im.w,decodedHeight:im.h,
+          width:targetW,height:targetH,source:im.sourceInfo};
+        if(targetW===im.w && targetH===im.h){
+          rgb=im.rgb;
+        }else{
+          rgb=areaResizeRGB(im.rgb,im.w,im.h,targetW,targetH);
+        }
+        W=targetW; H=targetH; gray=null; mono=null;
         break;
       }
       case "grayscale": {

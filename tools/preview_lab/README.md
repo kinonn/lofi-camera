@@ -24,9 +24,12 @@ lab-only modes (`bayer2`, `bayer8`, `atkinson`, `threshold`, `clahe-floyd`,
 `blur-atkinson` runs after grayscale as slight Gaussian blur -> Atkinson,
 sharing the `--clahe-blur` sigma with the CLAHE chain (`0` = off).
 
-The interactive `Resize` block defaults to maintaining the input aspect ratio
-within its width/height bounds (128x64 by default); clear the checkbox to
-stretch to the exact dimensions instead.
+The interactive `Image input` block has editable target width and height
+(128x64 by default). Its decoded RGB image is area-resized to those exact
+dimensions before processing, so set the dimensions to the source size to keep
+it unchanged. The downstream `Resize` block is separate: it defaults to
+maintaining the input aspect ratio within its width/height bounds (128x64);
+clear its checkbox to stretch to the exact dimensions instead.
 
 After running a pipeline, each Output block enables **Copy last-run config**.
 The clipboard contains versioned JSON with ordered nodes and explicit edges,
@@ -35,9 +38,10 @@ stable operation identifiers (for example, `gaussian_blur`,
 parameter values, typed ports (including accepted input types and each edge's
 effective data type), algorithm contracts, pixel conventions, and output
 dimensions. The last-run config records the resolved input source and decoded
-dimensions. Uploaded image bytes are not embedded; the config records the file
-name and metadata so an implementation can be supplied with that source asset
-separately. If an upload is unavailable, its fallback order is included too.
+dimensions as well as the Input node's requested target dimensions. Uploaded
+image bytes are not embedded; the config records the file name and metadata so
+an implementation can be supplied with that source asset separately. If an
+upload is unavailable, its fallback order is included too.
 
 `clahe-floyd` runs after grayscale as CLAHE -> slight Gaussian blur ->
 Floyd-Steinberg, all on the letterboxed tile. Tune it with `--clahe-clip`
