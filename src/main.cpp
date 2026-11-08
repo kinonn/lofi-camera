@@ -54,7 +54,8 @@
 #define AE_LEVEL 0
 
 // Still JPEG quality, esp32-camera scale 0-63 (lower = better and larger).
-// Also the quality used when a JPEG_FILTER re-encodes the image.
+// The re-encode quality is a separate macro, JPEG_REENCODE_QUALITY, living in
+// jpeg_filter.h -- the encoder (fmt2jpg/jpge) uses the opposite scale.
 #define JPEG_QUALITY 10
 
 // Camera orientation. 1 = flip. Setting both to 1 rotates the image 180
@@ -471,7 +472,7 @@ PhotoResult captureStill(char* name, size_t nameLen) {
           FileSink sink = { &f, false };
           size_t written = 0;
           uint16_t ow = 0, oh = 0;
-          const bool okFilter = jpegFilterStream(fb, JPEG_QUALITY, fileSinkWrite,
+          const bool okFilter = jpegFilterStream(fb, JPEG_REENCODE_QUALITY, fileSinkWrite,
                                                  &sink, &written, &ow, &oh);
           f.close();
           if (!okFilter) {

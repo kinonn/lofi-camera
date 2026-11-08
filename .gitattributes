@@ -1,0 +1,15 @@
+# Store all text files with LF in the repository and check them out with LF
+# everywhere, so files look identical on Windows, macOS and Linux.
+# (Overrides core.autocrlf; prevents the repo-wide CRLF<->LF churn between OSes.)
+* text=auto eol=lf
+
+# Windows-only files genuinely need CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Mark known binary types so text heuristics can never normalize them.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary

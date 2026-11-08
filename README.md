@@ -120,6 +120,7 @@ or re-encode, so it costs nothing.
 |---|---|---|
 | `JPEG_FILTER_NONE` (default) | Pass-through | SXGA 1280×1024 |
 | `JPEG_FILTER_WHITE_BORDER` | Paints a 20 px white band over all four frame edges; edge pixels are lost and the visible image area is 1240×984 | SXGA 1280×1024 (canvas unchanged) |
+| `JPEG_FILTER_SUPERIA_USM` | Fuji Superia 400 film look + gaussian unsharp sharpen, ported from the `tools/preview_lab` chain with the lab's default parameters. One decode, one fused colour pass, sharpen as a second pass, one re-encode — no intermediate JPEG round trips. The lab's grain stage is not ported (its default is 0 = off). Capture takes a few seconds. | SXGA 1280×1024 |
 
 Enable it in the existing `build_flags` block in `platformio.ini`:
 
@@ -135,8 +136,16 @@ Tunables (all `-D` overridable):
 | Macro | Default | Effect |
 |---|---|---|
 | `JPEG_FILTER_BORDER_PX` | `20` | Border thickness in output pixels, each side |
-| `JPEG_FILTER_SWAP565` | `0` | Set to `1` if a filtered photo shows red/blue swapped |
-| `JPEG_QUALITY` | `10` | Camera JPEG quality *and* re-encode quality |
+| `JPEG_FILTER_SWAP565` | `0` | WHITE_BORDER only: one RGB565 byte-swap pass before re-encode — `fmt2jpg` reads RGB565 input big-endian while the decoder writes the canvas little-endian, so the swap keeps red/blue true. SUPERIA ignores it (it always swaps pre-encode). |
+| `JPEG_QUALITY` | `10` | Camera JPEG quality (esp32-camera scale: lower = better) |
+| `JPEG_REENCODE_QUALITY` | `60` | Re-encode quality after a filter runs (fmt2jpg scale: higher = better). The two scales are unrelated — encoder quality 10 means ~5.5× scaled tables plus 4:2:0 subsampling, which visibly solarizes smooth dusk gradients. |
+
+The Superia filter inlines the preview lab's node defaults as `SUPERIA_*`
+macros (auto balance 0.55, auto contrast 0.56, white balance 0.98/1.01/1.00,
+midtone gamma 0.97, shadow/highlight tint, vignette 0.50, unsharp amount 0.90
+at sigma 1.00). Each is overridable with
+`-DSUPERIA_<NAME>=<value>`; see the tunables block at the top of the
+`JPEG_FILTER_SUPERIA_USM` branch in `src/jpeg_filter.h`.
 
 **Memory.** The border does not grow the frame: it paints over the outer 20
 pixels on each edge (no scaling or resampling), so the canvas stays
@@ -153,7 +162,18 @@ to the SD file via `fmt2jpg_cb`, so the JPEG is never held in RAM either.
 
 Border width is free: it does not change the memory requirement, only the
 painted area. `jpegFilterWorstCaseBytes()` reports an upper bound (0.25
-bytes/pixel) so the free-space check can run before the file is opened.
+bytes/pixel at encoder quality 10) so the free-space check can run before the
+file is opened; with the default `JPEG_REENCODE_QUALITY` of 60 the budget
+doubles to 0.5 bytes/pixel.
+
+The Superia filter shares the canvas and bound above and adds one row-ring
+buffer for the sharpen blur (2·radius+1 already-blurred rows, ~54 KB at
+SXGA) plus ~64 KB of once-allocated LUTs — peak **~3.0 MB** of 4 MB PSRAM.
+That stays at the border filter's proven ~2.9 MB envelope on purpose: the
+first implementation used a ~0.67 MB band buffer instead, pushed the peak to
+~3.6 MB, and this board's PSRAM delivered block-garbage into the canvas at
+that pressure (psychedelic capture output). It uses the same quality-scaled
+bound.
 
 Adding a filter: extend the `#if` chain in `src/jpeg_filter.h` with a new
 `JPEG_FILTER_*` id and a `jpegFilterStream()` that pushes bytes to the
@@ -201,7 +221,7 @@ pio run --target upload --upload-port COM6   # upload to explicit port
 pio device monitor -b 115200 -p COM6     # serial monitor
 ```
 
-Build output (typical): RAM ~8.4 %, Flash ~14.5 %.
+Build output (typical, `JPEG_FILTER_NONE`): RAM ~21 %, Flash ~14.5 %.
 
 ### Upload checklist
 

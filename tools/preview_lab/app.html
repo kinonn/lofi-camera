@@ -72,11 +72,14 @@
   .output-actions { display:flex; align-items:center; gap:7px; margin:7px 0 4px; }
   .output-actions button { padding:4px 7px; font-size:10px; }
   .copy-status { color:var(--dim); font-size:10px; }
+  .output-content { padding:0 9px 9px; overflow:auto; }
   .output-content label { display:block; font-size:10px; color:var(--dim); margin:6px 0 3px; }
   .output-content canvas { display:block; image-rendering:pixelated; background:#000;
-    border-radius:4px; border:1px solid var(--line); max-width:100%; height:auto; }
-  .output-panel { width:128px; height:64px; }
-  .output-2x { width:256px; height:128px; }
+    border-radius:4px; border:1px solid var(--line); }
+  .output-content canvas.output-panel[hidden] { display:none; }
+  .input-preview { display:block; width:100%; height:auto; image-rendering:pixelated; background:#000;
+    border-radius:4px; border:1px solid var(--line); margin-top:6px; }
+  .input-preview[hidden] { display:none; }
   .output-chain, .output-meta { color:var(--dim); font-size:10px; overflow-wrap:anywhere; }
   .output-log { margin-top:6px; padding:5px; color:var(--dim); background:#141518;
     border-radius:4px; font:10px/1.4 ui-monospace,Consolas,monospace;
@@ -222,6 +225,153 @@ function toneAdjust(gray, contrast, brightness){
   return out;
 }
 
+function vibranceRGB(rgb, amount){
+  const out = new Uint8Array(rgb.length);
+  for(let i=0;i<rgb.length;i+=3){
+    const r=rgb[i], g=rgb[i+1], b=rgb[i+2];
+    const mx=Math.max(r,g,b), mn=Math.min(r,g,b);
+    const sat = mx ? (mx-mn)/mx : 0;
+    const gain = 1 + amount*(1-sat);
+    const avg = (r+g+b)/3;
+    out[i]   = Math.round(clamp255(avg+(r-avg)*gain));
+    out[i+1] = Math.round(clamp255(avg+(g-avg)*gain));
+    out[i+2] = Math.round(clamp255(avg+(b-avg)*gain));
+  }
+  return out;
+}
+
+// ---- Fuji Superia 400 look: port of the tools/film_lab fuji_superia_400 recipe ----
+const srgbToLin = x => x<=0.04045 ? x/12.92 : Math.pow((x+0.055)/1.055,2.4);
+const linToSrgb = x => { x=Math.max(x,0); return x<=0.0031308 ? x*12.92 : 1.055*Math.pow(x,1/2.4)-0.055; };
+function percentileSorted(sorted,q){
+  const idx=q/100*(sorted.length-1), lo=Math.floor(idx), hi=Math.min(lo+1,sorted.length-1);
+  return sorted[lo]+(sorted[hi]-sorted[lo])*(idx-lo);
+}
+function boxPass(a,W,H,r,horizontal){
+  const out=new Float32Array(a.length), k=2*r+1;
+  for(let y=0;y<H;y++) for(let x=0;x<W;x++){
+    let s=0;
+    for(let d=-r;d<=r;d++){
+      const xx=horizontal?Math.min(W-1,Math.max(0,x+d)):x;
+      const yy=horizontal?y:Math.min(H-1,Math.max(0,y+d));
+      s+=a[yy*W+xx];
+    }
+    out[y*W+x]=s/k;
+  }
+  return out;
+}
+function gaussPlane(a,W,H,sigma){
+  if(sigma<0.3) return a;
+  const r=Math.max(1,Math.round((Math.sqrt(4*sigma*sigma+1)-1)/2));
+  let out=a;
+  for(let i=0;i<3;i++) out=boxPass(boxPass(out,W,H,r,true),W,H,r,false);
+  return out;
+}
+function stdDev(a){
+  let m=0; for(const v of a) m+=v; m/=a.length;
+  let s=0; for(const v of a) s+=(v-m)*(v-m);
+  return Math.sqrt(s/a.length);
+}
+function superiaLook(rgb,W,H,p){
+  const n=W*H, f=new Float32Array(n*3);
+  for(let i=0;i<n*3;i++) f[i]=rgb[i]/255;
+  const lum=i=>f[i*3]*0.2126+f[i*3+1]*0.7152+f[i*3+2]*0.0722;
+  const scale=(i,s)=>{ f[i*3]*=s; f[i*3+1]*=s; f[i*3+2]*=s; };
+
+  if(p.autoBalance>0){
+    const sum=[0,0,0]; let cnt=0;
+    for(let i=0;i<n;i++){
+      const L=lum(i);
+      if(L>0.10 && L<0.90){ sum[0]+=f[i*3]; sum[1]+=f[i*3+1]; sum[2]+=f[i*3+2]; cnt++; }
+    }
+    if(cnt>=200){
+      const means=sum.map(v=>v/cnt), target=(means[0]+means[1]+means[2])/3;
+      const gains=means.map(m=>1+(target/Math.max(m,1e-4)-1)*p.autoBalance);
+      for(let i=0;i<n;i++) for(let c=0;c<3;c++) f[i*3+c]*=gains[c];
+    }
+  }
+
+  if(p.autoContrast>0){
+    const L=new Float32Array(n);
+    for(let i=0;i<n;i++) L[i]=lum(i);
+    const sorted=L.slice().sort();
+    const lo=percentileSorted(sorted,1), hi=percentileSorted(sorted,99);
+    if(hi-lo>=0.02){
+      for(let i=0;i<n;i++){
+        const t=Math.min(1,Math.max(0,(L[i]-lo)/(hi-lo)));
+        const s=0.015+t*(0.960-0.015);
+        scale(i,(L[i]+(s-L[i])*p.autoContrast)/Math.max(L[i],1e-4));
+      }
+    }
+  }
+
+  const wb=[p.wbR,p.wbG,p.wbB];
+  if(wb.some(g=>g!==1)){
+    for(let i=0;i<n*3;i++) f[i]=linToSrgb(srgbToLin(f[i])*wb[i%3]);
+  }
+
+  for(let i=0;i<n;i++){
+    const L=lum(i);
+    let v=L;
+    if(p.midtoneGamma!==1) v=Math.pow(Math.min(1,Math.max(0,L)),p.midtoneGamma);
+    scale(i,Math.min(1,Math.max(0,v))/Math.max(L,1e-4));
+  }
+
+  const sh=[p.shadowR,p.shadowG,p.shadowB], hi=[p.highlightR,p.highlightG,p.highlightB];
+  if(sh.some(Boolean) || hi.some(Boolean)){
+    for(let i=0;i<n;i++){
+      const L=Math.min(1,Math.max(0,lum(i)));
+      for(let c=0;c<3;c++) f[i*3+c]+=sh[c]*(1-L)*(1-L)+hi[c]*L*L;
+    }
+  }
+
+  if(p.vignette>0){
+    const cx=(W-1)/2, cy=(H-1)/2;
+    for(let y=0;y<H;y++){
+      const yy=(y-cy)/Math.max(cy,1);
+      for(let x=0;x<W;x++){
+        const xx=(x-cx)/Math.max(cx,1);
+        const r=Math.min(1,Math.sqrt((yy*yy+xx*xx)/2));
+        scale(y*W+x,Math.max(0,1-p.vignette*Math.pow(r,2.4)));
+      }
+    }
+  }
+
+  if(p.grain>0){
+    let seed=1; // fixed seed: grain is stable between runs
+    const rnd=()=>{ seed=(seed+0x6D2B79F5)|0; let t=Math.imul(seed^(seed>>>15),1|seed); t=(t+Math.imul(t^(t>>>7),61|t))^t; return ((t^(t>>>14))>>>0)/4294967296; };
+    const gauss=()=>{ let u=0; while(u===0) u=rnd(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*rnd()); };
+    const norm=a=>{ const sd=Math.max(stdDev(a),1e-4); for(let i=0;i<a.length;i++) a[i]/=sd; };
+    const size=Math.max(p.grainSize,0);
+
+    let noise=new Float32Array(n);
+    for(let i=0;i<n;i++) noise[i]=gauss();
+    if(size>1){ noise=gaussPlane(noise,W,H,(size-1)*0.9); norm(noise); }
+
+    const chroma=new Float32Array(n*3);
+    for(let i=0;i<n*3;i++) chroma[i]=gauss();
+    if(size>1){
+      for(let c=0;c<3;c++){
+        const plane=new Float32Array(n);
+        for(let i=0;i<n;i++) plane[i]=chroma[i*3+c];
+        const b=gaussPlane(plane,W,H,(size-1)*1.2);
+        for(let i=0;i<n;i++) chroma[i*3+c]=b[i];
+      }
+      norm(chroma);
+    }
+
+    for(let i=0;i<n;i++){
+      const L=Math.min(1,Math.max(0,lum(i)));
+      const w=(0.35+0.65*(1-Math.abs(2*L-1)))*p.grain;
+      for(let c=0;c<3;c++) f[i*3+c]+=(noise[i]*0.85+chroma[i*3+c]*0.12)*w;
+    }
+  }
+
+  const out=new Uint8Array(n*3);
+  for(let i=0;i<n*3;i++) out[i]=Math.round(Math.min(1,Math.max(0,f[i]))*255);
+  return out;
+}
+
 function gaussianKernel(sigma){
   const r = Math.max(1, Math.ceil(3*sigma));
   const k = [];
@@ -249,6 +399,25 @@ function unsharpMask(gray,w,h,amount,sigma){
   const out = new Uint8Array(gray.length);
   for(let i=0;i<gray.length;i++) out[i]=Math.round(clamp255(gray[i]+amount*(gray[i]-b[i])));
   return out;
+}
+
+// Single helper for "run a plane op on each channel of interleaved RGB" — the
+// blur never mixes channels (channel-blind blur would smear R into G/B).
+function mapRGBPlanes(rgb,w,h,fn){
+  const n=w*h, out=new Uint8Array(rgb.length);
+  for(let c=0;c<3;c++){
+    const plane=new Uint8Array(n);
+    for(let i=0;i<n;i++) plane[i]=rgb[i*3+c];
+    const res=fn(plane,w,h);
+    for(let i=0;i<n;i++) out[i*3+c]=res[i];
+  }
+  return out;
+}
+function unsharpMaskRGB(rgb,w,h,amount,sigma){
+  return mapRGBPlanes(rgb,w,h,plane=>unsharpMask(plane,w,h,amount,sigma));
+}
+function gaussianBlurRGB(rgb,w,h,sigma){
+  return mapRGBPlanes(rgb,w,h,plane=>gaussianBlur(plane,w,h,sigma));
 }
 
 // ---- ordered dither ----
@@ -377,17 +546,38 @@ function canny(gray,w,h,blurPasses,low,high){
    ============================================================ */
 const DEFS = {
   input:   {title:"Image input", operation:"image_input", group:"source", desc:"upload or sample",
-      params:[{k:"source",label:"source",type:"select",opts:["upload","img_0027","img_0037","img_0038","img_0045","gradient"],def:"img_0027"},
-        {k:"w",label:"width (px)",type:"number",def:128,min:1,max:4096},{k:"h",label:"height (px)",type:"number",def:64,min:1,max:4096}],
-            contract:{input:"Decode the selected image to row-major RGB8 triplets; uploaded files are external artifacts, not embedded in this JSON.",
-                    dimensions:"Resize the decoded image to the requested width and height before processing; pixel dimensions are exact and may change aspect ratio. Width and height are clamped to 1..4096 pixels.",
-                      resizeMethod:"Area-weighted RGB resampling with partial source-pixel overlap; round weighted channel averages to nearest integer before grayscale conversion.",
+      params:[{k:"source",label:"source",type:"select",opts:["upload","img_0027","img_0037","img_0038","img_0045","gradient"],def:"img_0027"}],
+            contract:{input:"Decode the selected image to row-major RGB8 triplets at its native size; uploaded files are external artifacts, not embedded in this JSON.",
               sampleFiles:{img_0027:"test-images/img_0027.jpg",img_0037:"test-images/img_0037.jpg",
                 img_0038:"test-images/img_0038.jpg",img_0045:"test-images/img_0045.jpg"},
               gradient:"256x160 horizontal 8-bit grayscale ramp expanded to RGB; v = round(x / width * 255)",
               missingUploadFallback:"try test-images/img_0027.jpg, then use gradient if unavailable",
               unavailableSampleFallback:"gradient"},
       hasIn:false, hasOut:true},
+  vibrance:{title:"Vibrance", operation:"vibrance", group:"pre", desc:"boosts muted colours",
+      params:[{k:"amount",label:"amount",type:"number",def:0.5,step:"0.05"}],
+      contract:{formula:"avg + (channel - avg) * (1 + amount * (1 - saturation)), saturation = (max - min) / max, per pixel",
+        channelRange:"round and clamp to 0..255"}, hasIn:true, hasOut:true},
+  superia:  {title:"Fuji Superia 400", operation:"film_look_fuji_superia_400", group:"pre", desc:"punchy greens · grain",
+      params:[{k:"autoBalance",label:"auto balance",type:"number",def:0.55,step:"0.05"},
+        {k:"autoContrast",label:"auto contrast",type:"number",def:0.56,step:"0.05"},
+        {k:"wbR",label:"white balance R",type:"number",def:0.98,step:"0.01"},
+        {k:"wbG",label:"white balance G",type:"number",def:1.01,step:"0.01"},
+        {k:"wbB",label:"white balance B",type:"number",def:1.00,step:"0.01"},
+        {k:"midtoneGamma",label:"midtone gamma",type:"number",def:0.97,step:"0.01"},
+        {k:"shadowR",label:"shadow tint R",type:"number",def:-0.010,step:"0.002"},
+        {k:"shadowG",label:"shadow tint G",type:"number",def:0.010,step:"0.002"},
+        {k:"shadowB",label:"shadow tint B",type:"number",def:0.010,step:"0.002"},
+        {k:"highlightR",label:"highlight tint R",type:"number",def:0.020,step:"0.002"},
+        {k:"highlightG",label:"highlight tint G",type:"number",def:0.014,step:"0.002"},
+        {k:"highlightB",label:"highlight tint B",type:"number",def:-0.006,step:"0.002"},
+        {k:"vignette",label:"vignette",type:"number",def:0.5,step:"0.01"},
+        {k:"grain",label:"grain",type:"number",def:0,step:"0.001"},
+        {k:"grainSize",label:"grain size",type:"number",def:0,step:"0.1"}],
+      contract:{recipe:"tools/film_lab fuji_superia_400",
+        stages:["auto_balance", "auto_contrast", "linear white balance", "midtone gamma", "shadow/highlight tint", "vignette", "grain"],
+        grainRandomness:"fixed-seed PRNG; values differ from the numpy stream used by the lab"},
+      hasIn:true, hasOut:true},
   grayscale:{title:"Grayscale", operation:"grayscale", group:"pre", desc:"decodePreviewGray math",
       params:[], contract:{algorithm:"Quantize RGB8 to RGB565, expand channels, then calculate integer Rec.709 luma.",
         quantization:{redBits:5,greenBits:6,blueBits:5},
@@ -402,16 +592,18 @@ const DEFS = {
     nearest:"Map each destination pixel to floor(destinationCoordinate * sourceSize / destinationSize)."}},
       hasIn:true, hasOut:true},
   tone:    {title:"Tone adjust", operation:"linear_tone_adjustment", group:"pre", desc:"contrast · brightness",
-      params:[{k:"contrast",label:"contrast (gain)",type:"number",def:1.15,step:"0.01"},
+      params:[{k:"contrast",label:"contrast (gain)",type:"number",def:1.05,step:"0.01"},
         {k:"brightness",label:"brightness",type:"number",def:0,step:"0.01"}],
       contract:{formula:"round(clamp((input - 128) * contrast + 128 + brightness * 255, 0, 255))",
+        channels:"element-wise, applied per sample; accepts gray8 or interleaved rgb8 and preserves the input colour space",
         brightnessUnits:"fraction of full-scale (255)"}, hasIn:true, hasOut:true},
   blur:    {title:"Gaussian blur", operation:"gaussian_blur", group:"pre", desc:"soften before diffuse",
       params:[{k:"sigma",label:"sigma px",type:"number",def:0.8,step:"0.1"}],
             contract:{kernel:"separable Gaussian",radius:"max(1, ceil(3 * sigma))",
               weights:"exp(-0.5 * (offset / sigma)^2), normalized to sum to 1",
               boundary:"replicate edge pixels",intermediate:"retain floating-point horizontal pass; round and clamp after vertical pass",
-              nonpositiveSigma:"identity"}, hasIn:true, hasOut:true},
+              nonpositiveSigma:"identity",
+              channels:"blur runs on a single plane per channel (rgb8 input is de-interleaved, each plane blurred separately, re-interleaved); preserves the input colour space"}, hasIn:true, hasOut:true},
   clahe:   {title:"CLAHE", operation:"clahe", group:"pre", desc:"local contrast",
       params:[{k:"clip",label:"clip limit",type:"number",def:2.0,step:"0.1"},
         {k:"tiles",label:"tiles (per side)",type:"number",def:8}],
@@ -422,9 +614,10 @@ const DEFS = {
               emptyTile:"identity lookup"},
       hasIn:true, hasOut:true},
   sharpen: {title:"Sharpen (unsharp)", operation:"unsharp_mask", group:"pre", desc:"amount · sigma",
-      params:[{k:"amount",label:"amount",type:"number",def:0.5,step:"0.1"},
+      params:[{k:"amount",label:"amount",type:"number",def:0.9,step:"0.1"},
         {k:"sigma",label:"sigma",type:"number",def:1.0,step:"0.1"}],
-      contract:{formula:"round(clamp(input + amount * (input - gaussianBlur(input, sigma)), 0, 255))"},
+      contract:{formula:"round(clamp(input + amount * (input - gaussianBlur(input, sigma)), 0, 255))",
+        channels:"blur runs on a single plane per channel (rgb8 input is de-interleaved, each plane blurred separately, re-interleaved); preserves the input colour space"},
       hasIn:true, hasOut:true},
   bayer:   {title:"Bayer dither", operation:"ordered_dithering", group:"dither", desc:"ordered Bayer matrix",
       params:[{k:"size",label:"matrix size",type:"select",opts:["2×2","4×4","8×8"],def:"4×4"}],
@@ -474,10 +667,10 @@ const DEFS = {
               thresholds:"strong if magnitude >= high; otherwise weak if magnitude >= low; others suppressed",
               hysteresis:"promote weak pixels connected to a strong pixel by 8-connectivity"},
       hasIn:true, hasOut:true},
-  output:  {title:"Output", operation:"display_output", group:"source", desc:"128×64 panel",
+  output:  {title:"Output", operation:"display_output", group:"source", desc:"shows input at its size",
             params:[], contract:{panel:{width:128,height:64},
-        fit:"contain and center; nearest-neighbor sampling; black letterbox",
-              acceptedData:["image/gray8","image/binary-gray8"]}, hasIn:true, hasOut:false},
+        fit:"native size, centred; pixels outside the panel are cropped; unused panel pixels are black",
+              acceptedData:["image/rgb8-interleaved","image/gray8","image/binary-gray8"]}, hasIn:true, hasOut:false},
 };
 const GROUPS = {source:"pal-source", pre:"pal-pre", dither:"pal-dither", analysis:"pal-analysis"};
 
@@ -574,10 +767,8 @@ function setOutputState(node, {chain, meta, message}){
 }
 
 function clearOutput(node, message="Running…"){
-  for(const selector of ['[data-output="panel"]','[data-output="scaled"]']){
-    const canvas=node.el.querySelector(selector);
-    canvas.getContext("2d").clearRect(0,0,canvas.width,canvas.height);
-  }
+  const canvas=node.el.querySelector('[data-output="panel"]');
+  canvas.hidden=true;
   node.lastConfig=null;
   node.el.querySelector('[data-output="copy-config"]').disabled=true;
   setOutputState(node,{chain:"—",meta:"Running",message});
@@ -606,12 +797,11 @@ function addNodeRaw(type, x, y, id, params){
       body += `<label>${p.label}<input data-k="${p.k}" type="number" value="${p.def}"` + (p.step ? ` step="${p.step}"` : "") + (p.min!==undefined ? ` min="${p.min}"` : "") + (p.max!==undefined ? ` max="${p.max}"` : "") + `></label>`;
     }
   }
-  if(type==="input") body += `<label>file<input data-k="file" type="file" accept="image/*"></label>`;
+  if(type==="input") body += `<label>file<input data-k="file" type="file" accept="image/*"></label><canvas class="input-preview" data-input="preview" hidden></canvas>`;
   if(type==="output") body += `<div class="output-content">
     <div class="output-actions"><button type="button" data-output="copy-config" disabled>Copy last-run config</button>
       <span class="copy-status" data-output="copy-status" aria-live="polite"></span></div>
-    <label>Panel preview (128×64)</label><canvas class="output-panel" data-output="panel" width="128" height="64"></canvas>
-    <label>2× scaled</label><canvas class="output-2x" data-output="scaled" width="256" height="128"></canvas>
+    <label>Result</label><canvas class="output-panel" data-output="panel" hidden></canvas>
     <label>Pipeline</label><div class="output-chain" data-output="chain">—</div>
     <div class="output-meta" data-output="meta">Not run</div>
     <div class="output-log" data-output="log" aria-live="polite">Run the pipeline to see a result.</div>
@@ -877,22 +1067,24 @@ function buildPipelineConfig(outputNode){
 
   const portContracts={
     input:{inputs:[],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
+    vibrance:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
+    superia:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
     grayscale:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/gray8"}]},
     resize:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/gray8"}]},
-    tone:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/gray8"}]},
-    blur:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/gray8"}]},
+    tone:{inputs:[{id:"input",acceptedDataTypes:["image/gray8","image/rgb8-interleaved"]}],outputs:[{id:"output",acceptedDataTypes:["image/gray8","image/rgb8-interleaved"]}]},
+    blur:{inputs:[{id:"input",acceptedDataTypes:["image/gray8","image/rgb8-interleaved"]}],outputs:[{id:"output",acceptedDataTypes:["image/gray8","image/rgb8-interleaved"]}]},
     clahe:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/gray8"}]},
-    sharpen:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/gray8"}]},
+    sharpen:{inputs:[{id:"input",acceptedDataTypes:["image/gray8","image/rgb8-interleaved"]}],outputs:[{id:"output",acceptedDataTypes:["image/gray8","image/rgb8-interleaved"]}]},
     bayer:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/binary-gray8"}]},
     threshold:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/binary-gray8"}]},
     floyd:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/binary-gray8"}]},
     atkinson:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/binary-gray8"}]},
     photo:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/binary-gray8"}]},
     canny:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/binary-gray8"}]},
-    output:{inputs:[{id:"input",acceptedDataTypes:["image/gray8","image/binary-gray8"]}],outputs:[]},
+    output:{inputs:[{id:"input",acceptedDataTypes:["image/rgb8-interleaved","image/gray8","image/binary-gray8"]}],outputs:[]},
   };
   const parameterNames={
-    input:{source:"source",w:"width",h:"height"},
+    input:{source:"source"},
     resize:{w:"maxWidth",h:"maxHeight",maintainAspect:"maintainAspectRatio",method:"resamplingMethod"},
     tone:{contrast:"contrastGain",brightness:"brightness"},
     blur:{sigma:"sigmaPixels"},
@@ -950,13 +1142,12 @@ function buildPipelineConfig(outputNode){
     semantics:{
       graph:"Nodes are topologically ordered. Each node declares input/output ports; inputNodeIds lists dependencies, and edges explicitly name node and port endpoints. The schema supports adding node types, parameters, and ports in later versions.",
       execution:"Apply enabled processing nodes in order. A disabled node is bypassed and passes its input through unchanged, including its data type; enabled-node output port types describe the active operation.",
-      pixelModel:{channelRange:"8-bit unsigned integers, 0..255",color:"RGB at image input; grayscale thereafter",
+      pixelModel:{channelRange:"8-bit unsigned integers, 0..255",color:"RGB from input until (and unless) a grayscale node runs; Tone, Blur and Sharpen preserve the input colour space",
         layouts:{"image/rgb8-interleaved":"row-major [R,G,B] byte triplets","image/gray8":"row-major one byte per pixel","image/binary-gray8":"row-major one byte per pixel; only values 0 and 255"},
         rounding:"Follow the per-operation contract; otherwise use the explicitly described rounding and clamping.",
         coordinates:"x increases rightward, y increases downward; pixel origin is top-left"},
-      inputResolution:"Resize the decoded image to the Input node's requested width and height before processing; later Resize nodes may change dimensions again.",
-      inputResize:{method:"area_weighted_rgb",widthRange:[1,4096],heightRange:[1,4096]},
-      output:{width:128,height:64,fit:"contain and center; nearest-neighbor sampling; black letterbox"},
+      inputResolution:"The Input node passes the decoded image at its native size; no resampling occurs.",
+      output:{width:128,height:64,fit:"native size, centred; pixels outside the panel are cropped; unused panel pixels are black"},
     },
     nodes:configNodes,
     edges:chain.slice(1).map((node,index)=>({id:`edge-${chain[index].id}-${node.id}`,
@@ -1073,7 +1264,7 @@ async function runPipeline(){
       paintResult(outNode,result);
       const config=buildPipelineConfig(outNode);
       config.execution={status:"succeeded",result:{width:result.w,height:result.h,kind:result.kind},
-        display:{width:PANEL_W,height:PANEL_H,fit:"contain_center_nearest_black_letterbox"}};
+        display:{width:PANEL_W,height:PANEL_H,fit:"native_centre_crop_black_background"}};
       outNode.lastConfig=config;
       outNode.el.querySelector('[data-output="copy-config"]').disabled=false;
       const details=`${result.w}×${result.h} ${result.kind}` + (skipped.length?` · bypassed: ${skipped.join(", ")}`:"");
@@ -1091,6 +1282,17 @@ async function runPipeline(){
   if(completed) log(`Finished ${completed} output${completed===1?"":"s"}.`);
 }
 
+function paintInputPreview(node, im){
+  const cv = node.el.querySelector('[data-input="preview"]');
+  cv.width = im.w; cv.height = im.h; cv.hidden = false;
+  const ctx = cv.getContext("2d");
+  const img = ctx.createImageData(im.w, im.h);
+  for(let i=0;i<im.w*im.h;i++){
+    img.data[i*4]=im.rgb[i*3]; img.data[i*4+1]=im.rgb[i*3+1]; img.data[i*4+2]=im.rgb[i*3+2]; img.data[i*4+3]=255;
+  }
+  ctx.putImageData(img,0,0);
+}
+
 async function execChain(chain){
   chain = chain.filter(n=>!n.bypassed);
   let rgb=null, W=0, H=0, gray=null, w=0, h=0, mono=null, prev=null;
@@ -1099,17 +1301,18 @@ async function execChain(chain){
     switch(node.type){
       case "input": {
         const im = await loadNodeImage(node);
-        const targetW=Math.max(1,Math.floor(Number(p.w)||128));
-        const targetH=Math.max(1,Math.floor(Number(p.h)||64));
-        node.lastInputInfo={decodedWidth:im.w,decodedHeight:im.h,
-          width:targetW,height:targetH,source:im.sourceInfo};
-        if(targetW===im.w && targetH===im.h){
-          rgb=im.rgb;
-        }else{
-          rgb=areaResizeRGB(im.rgb,im.w,im.h,targetW,targetH);
-        }
-        W=targetW; H=targetH; gray=null; mono=null;
+        node.lastInputInfo={decodedWidth:im.w,decodedHeight:im.h,source:im.sourceInfo};
+        rgb=im.rgb; W=im.w; H=im.h; gray=null; mono=null;
+        paintInputPreview(node,im);
         break;
+      }
+      case "vibrance": {
+        if(!rgb || gray) throw new Error("Vibrance must come after Input and before Grayscale");
+        rgb = vibranceRGB(rgb,p.amount??0.5); break;
+      }
+      case "superia": {
+        if(!rgb || gray) throw new Error("Fuji Superia 400 must come after Input and before Grayscale");
+        rgb = superiaLook(rgb,W,H,p); break;
       }
       case "grayscale": {
         if(!rgb) throw new Error("Grayscale needs an image upstream");
@@ -1131,20 +1334,23 @@ async function execChain(chain){
         break;
       }
       case "tone": {
-        if(!gray) throw new Error("Tone needs grayscale upstream");
-        gray = toneAdjust(gray,p.contrast??1.15,(p.brightness??0)); mono=null; break;
+        if(gray){ gray = toneAdjust(gray,p.contrast??1.05,(p.brightness??0)); mono=null; break; }
+        if(rgb){ rgb = toneAdjust(rgb,p.contrast??1.05,(p.brightness??0)); break; }
+        throw new Error("Tone needs an image upstream");
       }
       case "blur": {
-        if(!gray) throw new Error("Blur needs grayscale upstream");
-        gray = gaussianBlur(gray,w,h,p.sigma??0.8); mono=null; break;
+        if(gray){ gray = gaussianBlur(gray,w,h,p.sigma??0.8); mono=null; break; }
+        if(rgb){ rgb = gaussianBlurRGB(rgb,W,H,p.sigma??0.8); break; }
+        throw new Error("Blur needs an image upstream");
       }
       case "clahe": {
         if(!gray) throw new Error("CLAHE needs grayscale upstream");
         gray = clahe(gray,w,h,p.clip??2.0,p.tiles??8); mono=null; break;
       }
       case "sharpen": {
-        if(!gray) throw new Error("Sharpen needs grayscale upstream");
-        gray = unsharpMask(gray,w,h,p.amount??0.5,p.sigma??1.0); mono=null; break;
+        if(gray){ gray = unsharpMask(gray,w,h,p.amount??0.9,p.sigma??1.0); mono=null; break; }
+        if(rgb){ rgb = unsharpMaskRGB(rgb,W,H,p.amount??0.9,p.sigma??1.0); break; }
+        throw new Error("Sharpen needs an image upstream");
       }
       case "bayer": {
         const sz = p.size || "4×4";
@@ -1163,39 +1369,29 @@ async function execChain(chain){
       case "output": break;
     }
   }
-  // what to show: mono if any 1-bit stage ran, else gray
+  // what to show: mono if any 1-bit stage ran, else gray, else RGB
   if(mono) return {kind:"mono", w, h, data:mono};
   if(gray) return {kind:"gray", w, h, data:gray};
-  throw new Error("chain produced nothing (need Grayscale after Input)");
+  if(rgb) return {kind:"rgb", w:W, h:H, data:rgb};
+  throw new Error("chain produced nothing (need an Image input)");
 }
 
 function paintResult(outputNode,res){
   const panel=outputNode.el.querySelector('[data-output="panel"]');
-  // Fit and centre the result on the panel, preserving its aspect ratio.
-  const disp = new Uint8Array(PANEL_W*PANEL_H).fill(0);
+  // Canvas takes the input's size so the image is never scaled or cropped.
+  panel.width=res.w; panel.height=res.h; panel.hidden=false;
   const src = res.data;
-  if(res.w>0 && res.h>0){
-    const scale=Math.min(PANEL_W/res.w,PANEL_H/res.h);
-    const fitW=Math.min(PANEL_W,Math.max(1,Math.floor(res.w*scale)));
-    const fitH=Math.min(PANEL_H,Math.max(1,Math.floor(res.h*scale)));
-    const left=Math.floor((PANEL_W-fitW)/2), top=Math.floor((PANEL_H-fitH)/2);
-    for(let y=0;y<fitH;y++) for(let x=0;x<fitW;x++){
-      const sx=Math.min(res.w-1,Math.floor(x*res.w/fitW));
-      const sy=Math.min(res.h-1,Math.floor(y*res.h/fitH));
-      disp[(top+y)*PANEL_W+left+x]=src[sy*res.w+sx];
+  const ctx = panel.getContext("2d");
+  const img = ctx.createImageData(res.w,res.h);
+  for(let i=0;i<res.w*res.h;i++){
+    img.data[i*4+3]=255;
+    if(res.kind==="rgb"){
+      for(let c=0;c<3;c++) img.data[i*4+c]=src[i*3+c];
+    }else{
+      img.data[i*4]=img.data[i*4+1]=img.data[i*4+2]=src[i];
     }
   }
-  const ctx = panel.getContext("2d");
-  const img = ctx.createImageData(PANEL_W,PANEL_H);
-  for(let i=0;i<disp.length;i++){ img.data[i*4]=img.data[i*4+1]=img.data[i*4+2]=disp[i]; img.data[i*4+3]=255; }
   ctx.putImageData(img,0,0);
-  const big=outputNode.el.querySelector('[data-output="scaled"]');
-  if(big){
-    const bctx = big.getContext("2d");
-    bctx.imageSmoothingEnabled = false;
-    bctx.clearRect(0,0,big.width,big.height);
-    bctx.drawImage(panel,0,0,big.width,big.height);
-  }
 }
 
 document.getElementById("btn-run").onclick = runPipeline;

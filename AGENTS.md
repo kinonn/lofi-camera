@@ -7,7 +7,7 @@ changing firmware.
 
 ## Commands
 
-- Build: `pio run` — expect ~8.4 % RAM, ~14.5 % flash; a large jump means
+- Build: `pio run` — expect ~23 % RAM, ~14.7 % flash; a large jump means
   something got linked that should not have been.
 - Upload: `pio run --target upload --upload-port COM<n>` — OLED SCL must be
   disconnected first (see the README upload checklist).
