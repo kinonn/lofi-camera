@@ -120,7 +120,7 @@ or re-encode, so it costs nothing.
 |---|---|---|
 | `JPEG_FILTER_NONE` (default) | Pass-through | SXGA 1280×1024 |
 | `JPEG_FILTER_WHITE_BORDER` | Paints a 20 px white band over all four frame edges; edge pixels are lost and the visible image area is 1240×984 | SXGA 1280×1024 (canvas unchanged) |
-| `JPEG_FILTER_SUPERIA_USM` | Fuji Superia 400 film look + gaussian unsharp sharpen, ported from the `tools/preview_lab` chain with the lab's default parameters. One decode, one fused colour pass, sharpen as a second pass, one re-encode — no intermediate JPEG round trips. The lab's grain stage is not ported (its default is 0 = off). Capture takes a few seconds. | SXGA 1280×1024 |
+| `JPEG_FILTER_SUPERIA_USM` | Fuji Superia 400 film look + gaussian unsharp sharpen, ported from the `tools/preview_lab` chain with the lab's default parameters. One decode, one fused colour pass, sharpen as a second pass, one re-encode — no intermediate JPEG round trips. The lab's grain stage is not ported (its default is 0 = off). Capture takes about 14–15 s per shot on the board (measured at 240 MHz, `-O2`). | SXGA 1280×1024 |
 
 Enable it in the existing `build_flags` block in `platformio.ini`:
 
@@ -166,14 +166,15 @@ bytes/pixel at encoder quality 10) so the free-space check can run before the
 file is opened; with the default `JPEG_REENCODE_QUALITY` of 60 the budget
 doubles to 0.5 bytes/pixel.
 
-The Superia filter shares the canvas and bound above and adds one row-ring
-buffer for the sharpen blur (2·radius+1 already-blurred rows, ~54 KB at
-SXGA) plus ~64 KB of once-allocated LUTs — peak **~3.0 MB** of 4 MB PSRAM.
-That stays at the border filter's proven ~2.9 MB envelope on purpose: the
-first implementation used a ~0.67 MB band buffer instead, pushed the peak to
-~3.6 MB, and this board's PSRAM delivered block-garbage into the canvas at
-that pressure (psychedelic capture output). It uses the same quality-scaled
-bound.
+The Superia filter shares the canvas and bound above. Its sharpen row-ring
+(2·radius+1 blurred rows, 8-bit, ~27 KB at SXGA) and its LUTs (~4 KB) live in
+internal DRAM, not PSRAM, so peak PSRAM stays at the border filter's ~2.9 MB
+envelope. Keep it there: an earlier version used a ~0.67 MB band buffer in
+PSRAM, pushed the peak to ~3.6 MB, and this board's PSRAM delivered
+block-garbage into the canvas at that pressure (psychedelic capture output).
+The ring also sped the sharpen pass up: PSRAM access, not arithmetic, was the
+hot path there. Internal DRAM is tight (the ring alone is near its limit), so
+check the link size after any change to these buffers.
 
 Adding a filter: extend the `#if` chain in `src/jpeg_filter.h` with a new
 `JPEG_FILTER_*` id and a `jpegFilterStream()` that pushes bytes to the
