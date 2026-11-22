@@ -1,17 +1,17 @@
 # AGENTS.md — lofi-camera
 
-ESP32-CAM firmware (PlatformIO + Arduino framework) in `src/`, plus a host-side
+ESP32-S3-CAM firmware (PlatformIO + Arduino framework) in `src/`, plus a host-side
 Python film-look lab in `tools/film_lab/`. `README.md` is the source of truth for
 hardware, behaviour and every tunable macro — read the relevant section before
 changing firmware.
 
 ## Commands
 
-- Build: `pio run` — expect ~23 % RAM, ~14.7 % flash; a large jump means
+- Build: `pio run` — expect ~44 % RAM, ~14 % flash; a large jump means
   something got linked that should not have been.
-- Upload: `pio run --target upload --upload-port COM<n>` — OLED SCL must be
-  disconnected first (see the README upload checklist).
-- Serial monitor only works in builds where GPIO1 is not OLED SCL.
+- Upload: `pio run --target upload --upload-port COM<n>` — native USB-C
+  (USB-Serial-JTAG); no peripherals need disconnecting.
+- Serial monitor works over USB CDC; `DBG()` is always compiled in.
 - Film lab: `.venv\Scripts\python.exe tools\film_lab\run_film_lab.py`, then open
   `tools/film_lab/out/index.html`.
 - There is no test suite. A clean `pio run` is the only automated check;
@@ -20,11 +20,17 @@ changing firmware.
 
 ## Hardware invariants (never break)
 
-- GPIO 0,5,18,19,21,22,23,25,26,27,32,34,35,36,39 = camera; 2,14,15 = SD (1-bit);
-  16 = PSRAM CS; 33 = red LED only; 12 = MTDI strapping (must be LOW at boot);
-  4 = flash LED. Never assign these to a peripheral.
-- GPIO1 is both UART TX and OLED SCL. Never add `Serial` output while the OLED
-  owns GPIO1 — use `DBG()`, which compiles itself out when logging is disabled.
+- Camera: 4,5 = SCCB; 6,7 = VSYNC/HREF; 8,9,10,11,12,13 = data + PCLK;
+  15,16,17,18 = XCLK + D5-D7. 38,39,40 = SD (1-bit, D1-D3 unconnected);
+  19,20 = USB; 26-37 = in-package flash + octal PSRAM; 43,44 = UART0;
+  45,46 = strapping. 0 = BOOT/shutter, 2 = status LED, 3 = flash LEDs.
+  Never assign these to a peripheral.
+- The camera has no PWDN or sensor reset GPIO (`CAM_RST` is only pulled up):
+  keep both at -1.
+- GPIO41/42 are the OLED I2C pins and the JTAG MTDI/MTMS pins; external JTAG
+  is unavailable (USB-Serial-JTAG still works).
+- The SD slot wires DAT0 only and has no card-detect switch: keep the 1-bit
+  mount and the filesystem liveness probe.
 - The SD card is mandatory at boot and at runtime. The `NO SD CARD` wait loop
   must stay re-entrant so a reinserted card resumes without a power cycle.
 
@@ -43,7 +49,8 @@ changing firmware.
 ## Conventions
 
 - Modules are header-only and pulled in by `preview.h` / `main.cpp`. Match that;
-  only add a `.cpp` when unavoidable.
+  only add a `.cpp` when unavoidable. The one exception is `src/usm_simd.S`, the
+  S3 PIE dot-product kernel behind the Superia sharpen.
 - Every tunable is an `#ifndef MACRO` / `#define MACRO default` pair so
   `build_flags` (`-D...`) can override it without editing code.
 - Invalid compile-time selections must fail the build (`#error`), never silently

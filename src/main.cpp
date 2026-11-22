@@ -12,40 +12,36 @@
 #include "esp_system.h"
 
 // ---------- User config ----------
-// Verified pin map (AI Thinker ESP32-CAM, SD in 1-bit mode):
-//   Camera (fixed, do not reuse): D0-D7 = 5,18,19,21,36,39,34,35;
-//     XCLK=0, PCLK=22, VSYNC=25, HREF=23, SCCB SDA=26, SCL=27, PWDN=32.
-//   SD_MMC 1-bit (fixed): CLK=14, CMD=15, DATA0=2. (GPIO4/12/13 freed
-//     by 1-bit mode; GPIO4 left alone to avoid flash-LED interference.)
-//   DO NOT USE: GPIO16 (PSRAM chip-select, crashes after photos),
-//     GPIO33 (internal red LED only, NOT on the header),
-//     GPIO0/5/18/19/21/22/23/25/26/27/32/34/35/36/39 (camera),
-//     GPIO2/14/15 (SD), GPIO12 (MTDI strapping, must be LOW at boot),
-//     GPIO4 (white flash LED -- avoided for clean OLED I2C).
+// Verified pin map (ESP32-S3-CAM, ESP32-S3R8, 8 MB octal PSRAM):
+//   Camera (fixed, do not reuse): D0-D7 = 11,9,8,10,12,18,17,16;
+//     XCLK=15, PCLK=13, VSYNC=6, HREF=7, SCCB SDA=4, SCL=5 (the driver uses
+//     I2C port 1, so Wire on port 0 is free). Neither PWDN nor sensor reset
+//     is wired (CAM_RST only has a pull-up), so both stay -1.
+//   SD_MMC 1-bit (fixed): CLK=39, CMD=38, DATA0=40; D1-D3 are unconnected.
+//   DO NOT USE: GPIO0 (BOOT strapping -- it is the shutter here),
+//     GPIO2 (onboard yellow-green LED via 1k), GPIO3 (flash LEDs, active
+//     HIGH), GPIO4-13/15-18 (camera), GPIO19/20 (USB D-/D+),
+//     GPIO26-37 (in-package flash + octal PSRAM), GPIO38/39/40 (SD),
+//     GPIO43/44 (UART0), GPIO45/46 (strapping; 45 is not on the header).
+//   Free header pins: 1, 14, 47, 48 (left header).
 //   Wiring (use silkscreen labels on the header):
-//   OLED SDA -> IO13, OLED SCL -> U0T (GPIO1), VCC -> 3V3, GND -> GND.
-//     GPIO1 is the serial TX line: Serial.print debug output is
-//     disabled in this config, and the OLED must be disconnected
-//     for upload via the MB adapter.
-//   Button: one side -> U0R (GPIO3), other side -> GND (internal
-//     pull-up, active LOW; 1k series resistor recommended while the
-//     MB adapter is attached). Do not press during upload.
+//   OLED SDA -> IO41, OLED SCL -> IO42, VCC -> 3V3, GND -> GND.
+//     Both sit on the right-hand header; 41/42 are the JTAG MTDI/MTMS pins,
+//     so external JTAG is unavailable (USB-Serial-JTAG still works).
+//   Button: the onboard BOOT button (GPIO0, 10k pull-up) is the shutter.
+//     GPIO0 is sampled only at reset; pressing it at runtime is just a GPIO
+//     read. Holding it through a reset enters ROM download mode.
 //   SD card: FAT32 microSD in the onboard slot.
-#define OLED_SDA 13
-#define OLED_SCL 1
-#define BUTTON_PIN 3
+#define OLED_SDA 41
+#define OLED_SCL 42
+#define BUTTON_PIN 0
 #define OLED_ADDR 0x3C
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 
-// Serial TX is GPIO1, which this build also uses for OLED SCL. Writing
-// to Serial therefore glitches the I2C clock, so debug logging is
-// compiled out whenever the OLED owns GPIO1.
-#if (OLED_SDA == 1) || (OLED_SCL == 1)
-#define DBG_ENABLED 0
-#else
+// Debug logging goes to the native USB-C CDC port (ARDUINO_USB_CDC_ON_BOOT),
+// so it shares a pin with nothing and no longer has to be compiled out.
 #define DBG_ENABLED 1
-#endif
 #define DBG(...) do { if (DBG_ENABLED) Serial.printf(__VA_ARGS__); } while (0)
 
 // Auto-exposure target bias: -2 (darker) .. +2 (brighter), 0 = neutral.
@@ -73,23 +69,24 @@
 #define CAM_BACKOFF_MIN_MS 1000
 #define CAM_BACKOFF_MAX_MS 8000
 
-// AI Thinker ESP32-CAM pin map
-#define PWDN_GPIO_NUM 32
+// ESP32-S3-CAM camera connector (same signals as the ESP32-S3-EYE header;
+// the board's own CameraWebServer example selects CAMERA_MODEL_ESP32S3_EYE).
+#define PWDN_GPIO_NUM -1
 #define RESET_GPIO_NUM -1
-#define XCLK_GPIO_NUM 0
-#define SIOD_GPIO_NUM 26
-#define SIOC_GPIO_NUM 27
-#define Y9_GPIO_NUM 35
-#define Y8_GPIO_NUM 34
-#define Y7_GPIO_NUM 39
-#define Y6_GPIO_NUM 36
-#define Y5_GPIO_NUM 21
-#define Y4_GPIO_NUM 19
-#define Y3_GPIO_NUM 18
-#define Y2_GPIO_NUM 5
-#define VSYNC_GPIO_NUM 25
-#define HREF_GPIO_NUM 23
-#define PCLK_GPIO_NUM 22
+#define XCLK_GPIO_NUM 15
+#define SIOD_GPIO_NUM 4
+#define SIOC_GPIO_NUM 5
+#define Y9_GPIO_NUM 16
+#define Y8_GPIO_NUM 17
+#define Y7_GPIO_NUM 18
+#define Y6_GPIO_NUM 12
+#define Y5_GPIO_NUM 10
+#define Y4_GPIO_NUM 8
+#define Y3_GPIO_NUM 9
+#define Y2_GPIO_NUM 11
+#define VSYNC_GPIO_NUM 6
+#define HREF_GPIO_NUM 7
+#define PCLK_GPIO_NUM 13
 
 // ---------- Globals ----------
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
@@ -328,8 +325,40 @@ void drawPreview(const uint8_t* img, int w, int h) {
 
 // (drawTemp removed: temp-monitor mode replaced by camera stream)
 
+// Photo index persistence. The next candidate is stored on the card itself, so
+// a reboot resumes at the last used slot instead of rescanning from 0000, while
+// a blank/new card has no file and starts fresh. The value is only a starting
+// point: nextPhotoPath() still skips every occupied name, so a corrupted or
+// hand-edited index can shift the numbering but can never overwrite a photo.
+#define PHOTO_INDEX_FILE "/last_idx.txt"
+
+static void loadPhotoIndex() {
+  lastPhotoIdx = 0;
+  File f = SD_MMC.open(PHOTO_INDEX_FILE, FILE_READ);
+  if (!f) return;
+  char buf[8];
+  const size_t n = f.read((uint8_t*)buf, sizeof(buf) - 1);
+  f.close();
+  if (n == 0) return;
+  buf[n] = '\0';
+  const long v = strtol(buf, nullptr, 10);
+  if (v >= 0 && v < 10000) lastPhotoIdx = (unsigned)v;
+}
+
+static void savePhotoIndex() {
+  File f = SD_MMC.open(PHOTO_INDEX_FILE, FILE_WRITE);
+  if (!f) return;
+  char buf[8];
+  const int n = snprintf(buf, sizeof(buf), "%u", lastPhotoIdx);
+  if (n > 0) f.write((const uint8_t*)buf, (size_t)n);
+  f.close();
+}
+
 bool initSD() {
-  // 1-bit mode keeps GPIO4 (flash LED) free; SD uses 14/15/2 internally.
+  // 1-bit mode: D1-D3 are not wired on this board. The generic S3 variant has
+  // no SDMMC pin defaults (BOARD_HAS_SDMMC is undefined), so begin() would
+  // fail with "some SD pins are not set" unless the pins are supplied here.
+  SD_MMC.setPins(39, 38, 40);  // CLK, CMD, D0
   if (!SD_MMC.begin("/sdcard", true)) {
     DBG("SD_MMC mount failed\n");
     return false;
@@ -340,7 +369,7 @@ bool initSD() {
     return false;
   }
   DBG("SD card: %llu MB\n", SD_MMC.cardSize() / (1024ULL * 1024ULL));
-  lastPhotoIdx = 0;
+  loadPhotoIndex();
   return true;
 }
 
@@ -434,21 +463,55 @@ enum PhotoResult {
   PHOTO_FILTER_FAIL,
 };
 
+#if CAPTURE_TIMING
+// TEMP diagnostic: one line per shot, read the card on a PC.
+static void logCaptureTiming(const char* path) {
+  DBG("timing %s fb=%lu dec=%lu stats=%lu look=%lu sharp=%lu enc=%lu close=%lu total=%lu\n",
+      path,
+      (unsigned long)gJpegCaptureTiming.fbMs,
+      (unsigned long)gJpegCaptureTiming.decodeMs,
+      (unsigned long)gJpegCaptureTiming.statsMs,
+      (unsigned long)gJpegCaptureTiming.lookMs,
+      (unsigned long)gJpegCaptureTiming.sharpenMs,
+      (unsigned long)gJpegCaptureTiming.encodeMs,
+      (unsigned long)gJpegCaptureTiming.closeMs,
+      (unsigned long)gJpegCaptureTiming.totalMs);
+  File t = SD_MMC.open("/timing.txt", FILE_APPEND);
+  if (!t) return;
+  t.printf("%s mhz=%lu fb=%lu dec=%lu stats=%lu look=%lu sharp=%lu enc=%lu close=%lu total=%lu\n",
+           path,
+           (unsigned long)getCpuFrequencyMhz(),
+           (unsigned long)gJpegCaptureTiming.fbMs,
+           (unsigned long)gJpegCaptureTiming.decodeMs,
+           (unsigned long)gJpegCaptureTiming.statsMs,
+           (unsigned long)gJpegCaptureTiming.lookMs,
+           (unsigned long)gJpegCaptureTiming.sharpenMs,
+           (unsigned long)gJpegCaptureTiming.encodeMs,
+           (unsigned long)gJpegCaptureTiming.closeMs,
+           (unsigned long)gJpegCaptureTiming.totalMs);
+  t.close();
+}
+#endif
+
 // Capture one JPEG and store it on the card. Fills `name` with the path used.
 // The viewfinder stream is already SXGA JPEG, so a still is just the next
 // frame: no re-init and no AWB/AEC settle.
 PhotoResult captureStill(char* name, size_t nameLen) {
   name[0] = '\0';
 
+  const uint32_t tCapture = millis();
+  memset(&gJpegCaptureTiming, 0, sizeof(gJpegCaptureTiming));
+
   PhotoResult result = PHOTO_CAM_FAIL;
   camera_fb_t* fb = esp_camera_fb_get();
+  gJpegCaptureTiming.fbMs = millis() - tCapture;
   if (!fb || fb->format != PIXFORMAT_JPEG || fb->len == 0) {
     DBG("Still capture failed (fmt=%d len=%u)\n",
         fb ? (int)fb->format : -1, fb ? (unsigned)fb->len : 0u);
     result = PHOTO_CAM_FAIL;
   } else {
     // The pipeline streams its output straight into the file, so the encoded
-    // JPEG is never held in RAM -- peak PSRAM stays low enough for a 4 MB
+    // JPEG is never held in RAM -- peak PSRAM stays well inside the 8 MB
     // module. With JPEG_FILTER_NONE this is a single write of the camera
     // buffer, with no decode or re-encode at all.
     char path[24];
@@ -474,7 +537,13 @@ PhotoResult captureStill(char* name, size_t nameLen) {
           uint16_t ow = 0, oh = 0;
           const bool okFilter = jpegFilterStream(fb, JPEG_REENCODE_QUALITY, fileSinkWrite,
                                                  &sink, &written, &ow, &oh);
+          const uint32_t tClose = millis();
           f.close();
+          gJpegCaptureTiming.closeMs = millis() - tClose;
+          gJpegCaptureTiming.totalMs = millis() - tCapture;
+#if CAPTURE_TIMING
+          logCaptureTiming(path);
+#endif
           if (!okFilter) {
             SD_MMC.remove(path);
             DBG("JPEG filter failed\n");
@@ -496,6 +565,7 @@ PhotoResult captureStill(char* name, size_t nameLen) {
     }
   }
   if (fb) esp_camera_fb_return(fb);
+  if (result == PHOTO_OK) savePhotoIndex();
   return result;
 }
 
@@ -624,9 +694,7 @@ void waitForCamera() {
 }
 
 void setup() {
-  // U0TXD (GPIO1) doubles as OLED SCL in this build, so the UART is only
-  // started when logging is actually enabled -- otherwise the UART would
-  // hold the same pad as the I2C clock.
+  // DBG() goes to the USB-C CDC port, so it owns no GPIO and always runs.
 #if DBG_ENABLED
   Serial.begin(115200);
   delay(200);
@@ -644,7 +712,7 @@ void setup() {
   char info[24];
   snprintf(info, sizeof(info), "PSRAM %u KB",
            (unsigned)(ESP.getPsramSize() / 1024));
-  showText("ESP32-CAM OLED", info, resetReasonStr());
+  showText("ESP32-S3 CAM", info, resetReasonStr());
   delay(1500);  // long enough to actually read the two diagnostic lines
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -653,6 +721,11 @@ void setup() {
   waitForSD();
 
   waitForCamera();
+
+  // Validate the PIE kernel once per boot while the timing build is on.
+#if CAPTURE_TIMING && USM_SIMD_ENABLED
+  DBG("SIMD selftest %s\n", usmSimdSelfTest() ? "OK" : "FAIL");
+#endif
 
   lastFrameT = millis();
   lastFpsT = millis();

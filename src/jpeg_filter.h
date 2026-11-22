@@ -31,6 +31,17 @@
 // inside a 4 MB module.
 typedef size_t (*JpegWriteFn)(void* arg, const uint8_t* data, size_t len);
 
+// TEMP diagnostic: -DCAPTURE_TIMING=1 records per-stage ms; main.cpp appends a
+// line per shot to /timing.txt. Remove with the flag when tuning is done.
+#ifndef CAPTURE_TIMING
+#define CAPTURE_TIMING 0
+#endif
+struct JpegCaptureTiming {
+  uint32_t fbMs, decodeMs, statsMs, lookMs, sharpenMs, encodeMs, closeMs,
+      totalMs;
+};
+static JpegCaptureTiming gJpegCaptureTiming;
+
 // Re-encode quality, fmt2jpg()/jpge scale (higher = better). NOT comparable
 // with the camera's config.jpeg_quality: that scale is inverted (10 = best),
 // and handing 10 to the encoder puts ~5.5x-scaled standard tables plus 4:2:0
@@ -187,6 +198,20 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
 
 #include "esp32-hal-psram.h"
 #include "img_converters.h"
+
+// ESP32-S3 PIE 8-lane 16-bit dot product (ee.vmulas.s16.accx). The .S file is
+// assembled only in the S3 build; the host test and other targets use the
+// scalar fallback.
+#ifndef SUPERIA_USM_SIMD
+#define SUPERIA_USM_SIMD 1
+#endif
+#if SUPERIA_USM_SIMD && defined(CONFIG_IDF_TARGET_ESP32S3)
+#define USM_SIMD_ENABLED 1
+extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
+                           const int16_t* coeffs, int n);
+#else
+#define USM_SIMD_ENABLED 0
+#endif
 
 // Fuji Superia 400 look + unsharp sharpening -- the tools/preview_lab chain
 // "Fuji Superia 400 -> Sharpen" ported with the lab's default parameters.
@@ -389,76 +414,229 @@ static USM_ALWAYS_INLINE float usmLut8(const float* lut, float x) {
 #define SUPERIA_HIST_LMAX 1.5f
 static uint32_t usmHist[SUPERIA_HIST_N];
 
-// Sharpen ring window, in internal DRAM: see the comment at the sharpen stage.
-// One byte per channel: the vertical pass rounds to 8 bits at the end anyway,
-// so holding the horizontal rows as Q6 would buy at most 0.5 LSB of accuracy
-// for twice the DRAM, and DRAM is the scarce resource here.
-static uint8_t usmRing[3u * SUPERIA_USM_RING_W * (2 * SUPERIA_USM_RAD + 1)];
+// Sharpen ring window, in internal DRAM. One 16-byte group per (channel, x)
+// holding 8 int16 slots in ring-slot order; one aligned 128-bit load feeds
+// the S3 dot-product kernel. At SXGA this is 61 KB (the old byte layout was
+// 27 KB), still comfortably inside the S3's 512 KB SRAM. Wider kernels use
+// 16/24-slot groups and the heap + scalar path.
+#define USM_SLOTS_PER_GROUP 8
+static int16_t usmRing[3u * SUPERIA_USM_RING_W * USM_SLOTS_PER_GROUP]
+    __attribute__((aligned(16)));
 static uint8_t usmRow8[3u * SUPERIA_USM_RING_W];
 
-// Sharpen with the kernel radius as a template parameter. At a constant R the
-// tap loops unroll, and the edge clamps run only on the border columns; the
-// arithmetic is the same as the runtime-radius version, so output is identical.
-template <int R>
-static void usmHblurRowT(const uint8_t* src8, uint8_t* dst, const int* k, int w) {
-  for (int x = 0; x < w; x++) {
-    const bool interior = x >= R && x < w - R;
-    for (int c = 0; c < 3; c++) {
-      int acc = 0;
-      for (int d = -R; d <= R; d++) {
-        int xi = x + d;
-        if (!interior) xi = xi < 0 ? 0 : (xi > w - 1 ? w - 1 : xi);
-        acc += k[d + R] * (int)src8[xi * 3 + c];
+// Slots per 16-byte group for a given radius: 8 for rad <= 3, 16/24 above.
+static inline int usmSlotsPerGroup(int rad) {
+  return ((2 * rad + 1 + 7) / 8) * 8;
+}
+
+// ---- look pass -------------------------------------------------------------
+// Per-pixel, no neighbour reads. Kept as a row-range function so a second core
+// could take a band later; currently run on one core (a second busy core drew
+// enough current to brown out the board).
+struct UsmLook {
+  uint16_t* px;
+  int w, h;
+  float gainR, gainG, gainB;
+  bool doBalance, doContrast, doGamma, doVign;
+  float cx, cy, invCxn, invCyn;
+};
+
+static void usmLookRows(const UsmLook& c, int y0, int y1) {
+  uint16_t* px = c.px;
+  const int w = c.w;
+  for (int y = y0; y < y1; y++) {
+    const float yy = ((float)y - c.cy) * c.invCyn;
+    for (int x = 0; x < w; x++) {
+      uint8_t rgb[3];
+      usmUnpack565(px[(size_t)y * w + x], rgb);
+      float f[3] = { rgb[0] * USM_INV255, rgb[1] * USM_INV255, rgb[2] * USM_INV255 };
+
+      if (c.doBalance) {
+        f[0] *= c.gainR; f[1] *= c.gainG; f[2] *= c.gainB;
       }
-      dst[x * 3 + c] = (uint8_t)((acc + 128) >> 8);  // Q8 -> 8-bit, rounded
+      float L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
+      if (c.doContrast) {
+        int li = (int)(L * 255.0f + 0.5f);
+        if (li < 0) li = 0;
+        if (li >= SUPERIA_CSCALE_N) li = SUPERIA_CSCALE_N - 1;
+        const float sc = usmLutContrast[li];
+        f[0] *= sc; f[1] *= sc; f[2] *= sc;
+      }
+      for (int ch = 0; ch < 3; ch++)
+        f[ch] = usmLutWb[ch][usmToU8(f[ch] * 255.0f)] * USM_INV255;
+      L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
+      if (c.doGamma) {
+        const float sc = usmLutGammaScale[usmToU8(L * 255.0f)];
+        f[0] *= sc; f[1] *= sc; f[2] *= sc;
+      }
+      {
+        const float Lc = usmClampF(L, 0.0f, 1.0f);
+        const float shw = (1.0f - Lc) * (1.0f - Lc);
+        const float hiw = Lc * Lc;
+        f[0] += SUPERIA_SHADOW_R * shw + SUPERIA_HIGHLIGHT_R * hiw;
+        f[1] += SUPERIA_SHADOW_G * shw + SUPERIA_HIGHLIGHT_G * hiw;
+        f[2] += SUPERIA_SHADOW_B * shw + SUPERIA_HIGHLIGHT_B * hiw;
+      }
+      if (c.doVign) {
+        const float xx = ((float)x - c.cx) * c.invCxn;
+        const float d = (xx * xx + yy * yy) * 0.5f;
+        const float vs = usmClampF(1.0f - SUPERIA_VIGNETTE * usmLut8(usmLutVign, d), 0.0f, 1.0f);
+        f[0] *= vs; f[1] *= vs; f[2] *= vs;
+      }
+      px[(size_t)y * w + x] = usmPack565(usmToU8(f[0] * 255.0f),
+                                        usmToU8(f[1] * 255.0f),
+                                        usmToU8(f[2] * 255.0f));
     }
   }
 }
 
+
+// Sharpen: planar rows, one channel at a time, and a ring of 16-byte column
+// groups so the vertical pass can use the S3's 8-lane 16-bit dot product.
+//
+// Horizontal pass: 2R+1 taps over one planar channel, fully unrolled. Doing
+// all three channels at once made GCC spill 21 live products, so each channel
+// gets its own accumulator; the taps and coefficients stay in registers.
+//
+// The ring stores, for every (channel, x), eight int16 values in ring-slot
+// order. One 16-byte group is one aligned 128-bit load, and the kernel is
+// rotated into the same slot order per output row, so usmVblurS3() does a
+// whole 7-tap column with one ee.vmulas.s16.accx instead of seven scalar
+// MACs. Wider kernels use 16/24 slots and the scalar path.
 template <int R>
-static void usmSharpenT(uint16_t* px, int w, int h, uint8_t* ring, uint8_t* row8,
-                        const int* k, int amountQ8) {
+static void usmHblurRowT(const uint8_t* __restrict src, int16_t* __restrict dst,
+                         const int* __restrict k, int w, int stride) {
+  for (int c = 0; c < 3; c++) {
+    const uint8_t* s = src + c * w;
+    int16_t* d = dst + (size_t)c * w * stride;
+
+    // Interior columns: no edge clamp, so the taps are one straight MAC chain.
+    int16_t* p = d + (size_t)R * stride;
+    for (int x = R; x < w - R; x++, p += stride) {
+      int acc = 0;
+#pragma GCC unroll 17
+      for (int t = -R; t <= R; t++) acc += k[t + R] * (int)s[x + t];
+      *p = (int16_t)((acc + 128) >> 8);  // Q8 -> 8-bit, rounded
+    }
+
+    // Left and right borders: replicate the edge pixel (2*R columns per row).
+    for (int x = 0; x < R; x++) {
+      int acc = 0;
+      for (int t = -R; t <= R; t++) {
+        int xi = x + t;
+        xi = xi < 0 ? 0 : (xi > w - 1 ? w - 1 : xi);
+        acc += k[t + R] * (int)s[xi];
+      }
+      d[(size_t)x * stride] = (int16_t)((acc + 128) >> 8);
+    }
+    for (int x = w - R; x < w; x++) {
+      int acc = 0;
+      for (int t = -R; t <= R; t++) {
+        int xi = x + t;
+        xi = xi < 0 ? 0 : (xi > w - 1 ? w - 1 : xi);
+        acc += k[t + R] * (int)s[xi];
+      }
+      d[(size_t)x * stride] = (int16_t)((acc + 128) >> 8);
+    }
+  }
+}
+
+// Scalar vertical blur (host test, rad > 3, heap ring). `coeff` is the kernel
+// rotated into ring-slot order, so the group is read in slot order regardless
+// of where the ring window wraps.
+template <int R>
+static void usmVblurRowT(const int16_t* __restrict ring,
+                         uint8_t* __restrict out,
+                         const int16_t* __restrict coeff, int w, int stride) {
+  for (int x = 0; x < w; x++) {
+    const int16_t* p = ring + (size_t)x * stride;
+    int acc = 0;
+#pragma GCC unroll 17
+    for (int d = 0; d <= 2 * R; d++) acc += (int)p[d] * (int)coeff[d];
+    out[x] = (uint8_t)((acc + 128) >> 8);  // Q8 -> 8-bit, rounded
+  }
+}
+
+#if CAPTURE_TIMING && USM_SIMD_ENABLED
+// One-shot boot check that the PIE dot product matches the scalar path.
+static bool usmSimdSelfTest() {
+  static int16_t ring[64 * 8] __attribute__((aligned(16)));
+  static int16_t coeff[8] __attribute__((aligned(16)));
+  uint8_t out[64];
+  const int16_t kk[8] = { 3, 21, 60, 88, 60, 21, 3, 0 };  // sum 256
+  for (int i = 0; i < 8; i++) coeff[i] = kk[i];
+  for (int i = 0; i < 64 * 8; i++)
+    ring[i] = (int16_t)((i * 37 + 11) & 0xFF);
+  usmVblurS3(ring, out, coeff, 64);
+  for (int x = 0; x < 64; x++) {
+    int acc = 0;
+    for (int s = 0; s < 8; s++) acc += (int)ring[x * 8 + s] * (int)coeff[s];
+    if (out[x] != (uint8_t)((acc + 128) >> 8)) return false;
+  }
+  return true;
+}
+#endif
+
+template <int R>
+static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
+                        uint8_t* row8, const int* k, int amountQ8,
+                        int stride, bool allowSimd) {
   const int ringRows = 2 * R + 1;
 
-  // Horizontal blur of canvas row ysrc into ring slot ysrc % ringRows
-  // (ysrc outside the frame replicates row 0/h-1).
+  // Horizontal blur of canvas row ysrc into its ring slot (ysrc outside the
+  // frame replicates row 0/h-1). `ring + slot` is the group's slot 0.
   auto hblurSlot = [&](int ysrc) {
     const int yc = ysrc < 0 ? 0 : (ysrc > h - 1 ? h - 1 : ysrc);
     const uint16_t* src = px + (size_t)yc * w;
     for (int x = 0; x < w; x++) {
       uint8_t rgb[3];
       usmUnpack565(src[x], rgb);
-      row8[x * 3 + 0] = rgb[0];
-      row8[x * 3 + 1] = rgb[1];
-      row8[x * 3 + 2] = rgb[2];
+      row8[x] = rgb[0];
+      row8[w + x] = rgb[1];
+      row8[2 * w + x] = rgb[2];
     }
-    uint8_t* dst = ring + (size_t)((ysrc % ringRows + ringRows) % ringRows) * w * 3;
-    usmHblurRowT<R>(row8, dst, k, w);
+    const int slot = (ysrc % ringRows + ringRows) % ringRows;
+    usmHblurRowT<R>(row8, ring + slot, k, w, stride);
   };
 
   for (int y = -R; y <= R; y++) hblurSlot(y);  // prime the ring window
 
+  static int16_t coeff[24] __attribute__((aligned(16)));
+
   for (int y = 0; y < h; y++) {
     uint16_t* prow = px + (size_t)y * w;
 
-    // Resolve the ring rows ONCE per output row, not per pixel or tap.
-    const uint8_t* rrow[2 * R + 1];
+    // Rotate the kernel into ring-slot order for this output row: slot s
+    // holds the row whose ring slot is s, so tap y+d lands in (y+d)%ringRows.
+    memset(coeff, 0, sizeof(coeff));
     for (int d = -R; d <= R; d++) {
-      const int slot = (y + d + ringRows * 2) % ringRows;
-      rrow[d + R] = ring + (size_t)slot * w * 3;
+      const int slot = (y + d + ringRows) % ringRows;
+      coeff[slot] = (int16_t)k[d + R];
     }
 
+    // Vertical blur, one channel at a time, into row8 (free again: the
+    // horizontal pass consumed the row before this output row started).
+#if !USM_SIMD_ENABLED
+    (void)allowSimd;
+#endif
+    for (int c = 0; c < 3; c++) {
+      int16_t* grp = ring + (size_t)c * w * stride;
+#if USM_SIMD_ENABLED
+      if (allowSimd && stride == USM_SLOTS_PER_GROUP)
+        usmVblurS3(grp, row8 + c * w, coeff, w);
+      else
+#endif
+        usmVblurRowT<R>(grp, row8 + c * w, coeff, w, stride);
+    }
+
+    // Unsharp mask against the blurred planes, then pack back to RGB565.
     for (int x = 0; x < w; x++) {
       uint8_t rgb[3];
       usmUnpack565(prow[x], rgb);
       uint8_t out[3];
       for (int c = 0; c < 3; c++) {
-        int acc = 0;
-        for (int d = -R; d <= R; d++)
-          acc += k[d + R] * (int)rrow[d + R][x * 3 + c];
-        const int blurred = (acc + 128) >> 8;  // Q8 -> 8-bit, rounded
-        int v = (int)rgb[c]
-              + ((((int)rgb[c] - blurred) * amountQ8 + 128) >> 8);
+        const int blurred = row8[c * w + x];
+        int v = (int)rgb[c] + ((((int)rgb[c] - blurred) * amountQ8 + 128) >> 8);
         out[c] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
       }
       prow[x] = usmPack565(out[0], out[1], out[2]);
@@ -500,6 +678,17 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
   const size_t n = (size_t)w * (size_t)h;
   if (n == 0) return false;
 
+#if CAPTURE_TIMING
+  uint32_t tStage = (uint32_t)micros();
+  auto mark = [&](uint32_t& field) {
+    const uint32_t now = (uint32_t)micros();
+    field = (now - tStage) / 1000u;
+    tStage = now;
+  };
+#else
+  auto mark = [](uint32_t&) {};
+#endif
+
   const size_t canvasBytes = n * sizeof(uint16_t);
   uint8_t* canvas = (uint8_t*)ps_malloc(canvasBytes);
   if (!canvas) return false;
@@ -512,6 +701,7 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
   }
 
   usmInitLuts();
+  mark(gJpegCaptureTiming.decodeMs);
 
   uint16_t* px = (uint16_t*)canvas;
   const float histPerL = (float)SUPERIA_HIST_N / SUPERIA_HIST_LMAX;
@@ -568,6 +758,8 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
     if (cum > kHi) { hi = ((float)b + 0.5f) / histPerL; break; }
   }
 
+  mark(gJpegCaptureTiming.statsMs);
+
   // Pass 3: the whole look in one per-pixel pass, in lab order. The white
   // balance is one byte lookup per channel (fused toLin/gain/toSrgb table).
   const bool doBalance  = (SUPERIA_AUTO_BALANCE > 0) && (maskedN >= 200);
@@ -588,58 +780,19 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
     }
   }
 
-  for (uint16_t y = 0; y < h; y++) {
-    const float yy = ((float)y - cy) * invCyn;
-    for (uint16_t x = 0; x < w; x++) {
-      uint8_t rgb[3];
-      usmUnpack565(px[(size_t)y * w + x], rgb);
-      float f[3] = { rgb[0] * USM_INV255, rgb[1] * USM_INV255, rgb[2] * USM_INV255 };
-
-      if (doBalance) {
-        f[0] *= gainR; f[1] *= gainG; f[2] *= gainB;
-      }
-      float L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
-      if (doContrast) {
-        int li = (int)(L * 255.0f + 0.5f);
-        if (li < 0) li = 0;
-        if (li >= SUPERIA_CSCALE_N) li = SUPERIA_CSCALE_N - 1;
-        const float sc = usmLutContrast[li];
-        f[0] *= sc; f[1] *= sc; f[2] *= sc;
-      }
-      for (int c = 0; c < 3; c++)
-        f[c] = usmLutWb[c][usmToU8(f[c] * 255.0f)] * USM_INV255;
-      L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
-      if (doGamma) {
-        const float sc = usmLutGammaScale[usmToU8(L * 255.0f)];
-        f[0] *= sc; f[1] *= sc; f[2] *= sc;
-      }
-      {
-        const float Lc = usmClampF(L, 0.0f, 1.0f);
-        const float shw = (1.0f - Lc) * (1.0f - Lc);
-        const float hiw = Lc * Lc;
-        f[0] += SUPERIA_SHADOW_R * shw + SUPERIA_HIGHLIGHT_R * hiw;
-        f[1] += SUPERIA_SHADOW_G * shw + SUPERIA_HIGHLIGHT_G * hiw;
-        f[2] += SUPERIA_SHADOW_B * shw + SUPERIA_HIGHLIGHT_B * hiw;
-      }
-      if (doVign) {
-        const float xx = ((float)x - cx) * invCxn;
-        const float d = (xx * xx + yy * yy) * 0.5f;
-        const float vs = usmClampF(1.0f - SUPERIA_VIGNETTE * usmLut8(usmLutVign, d), 0.0f, 1.0f);
-        f[0] *= vs; f[1] *= vs; f[2] *= vs;
-      }
-      px[(size_t)y * w + x] = usmPack565(usmToU8(f[0] * 255.0f),
-                                        usmToU8(f[1] * 255.0f),
-                                        usmToU8(f[2] * 255.0f));
-    }
-  }
+  const UsmLook look = { px, w, h, gainR, gainG, gainB,
+                         doBalance, doContrast, doGamma, doVign,
+                         cx, cy, invCxn, invCyn };
+  usmLookRows(look, 0, h);
+  mark(gJpegCaptureTiming.lookMs);
 
   // ---- sharpen: separable gaussian unsharp per channel ----------------------
   // A full-frame blur plane would cost another 2.6 MB of PSRAM, and the first
   // implementation kept a ~0.67 MB banded temp buffer instead -- which pushed
-  // peak allocation to ~3.6 MB, past what this board's PSRAM actually answers,
-  // and the captures came out as block-garbage colour chaos. So the blur now
-  // keeps only the vertical kernel window: 2*rad+1 horizontally-blurred rows
-  // (~27 KB at SXGA, rad = 3) in a ring. Row y is unsharpened against rows
+  // peak allocation to ~3.6 MB, past what the ESP32-CAM's PSRAM actually
+  // answers, and the captures came out as block-garbage colour chaos. So the
+  // blur now keeps only the vertical kernel window: 2*rad+1 horizontally-blurred
+  // rows (61 KB at SXGA, rad = 3) in a ring. Row y is unsharpened against rows
   // y-rad..y+rad of that ring -- identical math to the full-frame separable
   // gaussian with edge replication, without the second plane.
   //
@@ -677,37 +830,36 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
     kern[rad] += 256 - ksumQ8;
     const int amountQ8 = (int)(SUPERIA_USM_AMOUNT * 256.0f + 0.5f);
 
-    const int ringRows = 2 * rad + 1;
+    const int slots = usmSlotsPerGroup(rad);
     const bool heapRing =
-        (w > SUPERIA_USM_RING_W) || (ringRows > 2 * SUPERIA_USM_RAD + 1);
-    uint8_t* ring = heapRing
-        ? (uint8_t*)ps_malloc(3u * (size_t)w * (size_t)ringRows)
+        (w > SUPERIA_USM_RING_W) || (slots > USM_SLOTS_PER_GROUP);
+    const bool heapRow = (w > SUPERIA_USM_RING_W);
+    int16_t* ring = heapRing
+        ? (int16_t*)ps_malloc(3u * (size_t)w * (size_t)slots * sizeof(int16_t))
         : usmRing;
-    uint8_t* row8 = heapRing ? (uint8_t*)ps_malloc(3u * (size_t)w) : usmRow8;
+    uint8_t* row8 = heapRow ? (uint8_t*)ps_malloc(3u * (size_t)w) : usmRow8;
     if (!ring || !row8) {
-      if (heapRing) {
-        if (ring) free(ring);
-        if (row8) free(row8);
-      }
+      if (heapRing && ring) free(ring);
+      if (heapRow && row8) free(row8);
       free(canvas);
       return false;
     }
 
     switch (rad) {
-      case 1: usmSharpenT<1>(px, w, h, ring, row8, kern, amountQ8); break;
-      case 2: usmSharpenT<2>(px, w, h, ring, row8, kern, amountQ8); break;
-      case 3: usmSharpenT<3>(px, w, h, ring, row8, kern, amountQ8); break;
-      case 4: usmSharpenT<4>(px, w, h, ring, row8, kern, amountQ8); break;
-      case 5: usmSharpenT<5>(px, w, h, ring, row8, kern, amountQ8); break;
-      case 6: usmSharpenT<6>(px, w, h, ring, row8, kern, amountQ8); break;
-      case 7: usmSharpenT<7>(px, w, h, ring, row8, kern, amountQ8); break;
-      default: usmSharpenT<8>(px, w, h, ring, row8, kern, amountQ8); break;
+      case 1: usmSharpenT<1>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+      case 2: usmSharpenT<2>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+      case 3: usmSharpenT<3>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+      case 4: usmSharpenT<4>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+      case 5: usmSharpenT<5>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+      case 6: usmSharpenT<6>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+      case 7: usmSharpenT<7>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+      default: usmSharpenT<8>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
     }
-    if (heapRing) {
-      free(ring);
-      free(row8);
-    }
+    if (heapRing) free(ring);
+    if (heapRow) free(row8);
   }
+
+  mark(gJpegCaptureTiming.sharpenMs);
 
   // ---- encode ----------------------------------------------------------------
 
@@ -724,6 +876,7 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
   const bool encoded = fmt2jpg_cb(canvas, canvasBytes, w, h, PIXFORMAT_RGB565,
                                   quality, superiaJpgOutCb, &out);
   free(canvas);
+  mark(gJpegCaptureTiming.encodeMs);
 
   *written = out.written;
   *outW = w;

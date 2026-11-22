@@ -1,6 +1,6 @@
 # lofi-camera
 
-ESP32-CAM lo-fi viewfinder: live grayscale camera preview on a
+ESP32-S3-CAM lo-fi viewfinder: live grayscale camera preview on a
 128×64 SSD1306 OLED, with button-triggered full-resolution JPEG capture to
 microSD.
 
@@ -9,37 +9,45 @@ looks for those JPEGs before any of them are ported to C++.
 
 ## Hardware
 
-- ESP32-CAM + ESP32-CAM-MB adapter (CH340 USB serial)
+- ESP32-S3-CAM (ESP32-S3R8: 8 MB flash, 8 MB octal PSRAM, native USB-C)
 - SSD1306 128×64 OLED (I2C, address `0x3C` / `0x3D`)
-- Momentary push button (shutter)
+- Momentary push button (shutter) — the onboard BOOT button is used
 - FAT32-formatted microSD card
 
 ## Wiring
 
-Use the silkscreen labels on the ESP32-CAM header.
+Use the silkscreen labels on the ESP32-S3-CAM header.
 
-| Peripheral | ESP32-CAM pin | Notes |
+| Peripheral | ESP32-S3-CAM pin | Notes |
 |---|---|---|
-| OLED SDA | IO13 (GPIO13) | Software I2C via `Wire` |
-| OLED SCL | U0T (GPIO1) | Serial TX line — see caveats |
-| OLED VCC | 3V3 | |
+| OLED SDA | IO41 (GPIO41) | `Wire` on I2C port 0 |
+| OLED SCL | IO42 (GPIO42) | right-hand header |
+| OLED VCC | 3V3 | **not** 5V (left header) |
 | OLED GND | GND | |
-| Button | U0R (GPIO3) → GND | Internal pull-up, active LOW |
-| microSD | Onboard slot | SD_MMC 1-bit: CLK 14, CMD 15, DATA0 2 |
+| Button | BOOT (GPIO0) → GND | Onboard button, 10k pull-up, active LOW |
+| microSD | Onboard slot | SD_MMC 1-bit: CLK 39, CMD 38, DATA0 40 |
+
+`Wire` uses I2C port 0; the camera's SCCB is on I2C port 1 in the Arduino
+core's S3 build (`CONFIG_SCCB_HARDWARE_I2C_PORT1`), so the buses don't collide.
 
 ### Pin constraints (why these pins)
 
-- Camera uses GPIO 0, 5, 18, 19, 21, 22, 23, 25, 26, 27, 32, 34, 35, 36, 39 —
-  do not reuse.
-- SD 1-bit mode uses GPIO 14 (CLK), 15 (CMD), 2 (DATA0).
-- GPIO16 is PSRAM chip-select — using it as GPIO crashes after photos.
-- GPIO33 is the internal red LED only, not on the header.
-- GPIO12 is the MTDI flash-voltage strapping pin (must be LOW at boot) —
-  OLED pull-ups on it prevent boot entirely.
-- GPIO4 drives the white flash LED — avoided for clean OLED I2C.
-- GPIO1 (U0T) caveats: `Serial.print` debug output is unavailable while the
-  OLED is attached, and the OLED SCL wire must be disconnected for upload
-  via the MB adapter. Do not press the button during upload.
+- Camera uses GPIO 4–13 and 15–18 (SCCB 4/5, VSYNC/HREF 6/7, PCLK 13,
+  XCLK 15, data 8–12 and 16–18) — do not reuse. There is no PWDN or sensor
+  reset line: `CAM_RST` is only pulled up on the module.
+- SD 1-bit mode uses GPIO 39 (CLK), 38 (CMD), 40 (DATA0). D1–D3 are not
+  wired and there is no card-detect switch.
+- GPIO 26–37 are the in-package flash and octal PSRAM — never use them.
+- GPIO19/20 are USB D-/D+; GPIO43/44 are UART0; GPIO45/46 are strapping.
+- GPIO 2 and 3 are not free: GPIO2 drives the onboard green LED through 1k,
+  GPIO3 drives the two flash LEDs through a transistor (active HIGH).
+- GPIO0 is the BOOT strapping pin and the onboard shutter button. It is only
+  sampled at reset, so pressing it while the firmware runs cannot reset or
+  reboot the board; holding it through a reset enters ROM download mode.
+- GPIO41/42 are the JTAG MTDI/MTMS pins, so external JTAG is unavailable.
+  The built-in USB-Serial-JTAG port (GPIO19/20) still works.
+- No UART pin is shared with a peripheral: `DBG()` goes to the USB-C CDC
+  port, and nothing has to be disconnected to flash.
 
 ## Behavior
 
@@ -60,7 +68,7 @@ Use the silkscreen labels on the ESP32-CAM header.
 - Button press (debounced 50 ms): captures **SXGA (1280×1024) JPEG at
   `jpeg_quality = 10`**, saves as `/img_NNNN.jpg` (next free index, never
   overwritten). Expect roughly 90–120 KB per photo — measured at 0.57 bpp on
-  this sensor.
+  the OV2640 module; an OV3660 has a different bitrate and colour response.
   - Success → OLED shows `Saved to SD` + filename for ~0.9 s.
   - Failure → `Capture FAILED` (no frame from the sensor) or
     `Save FAILED` (SD write error / filter error).
@@ -105,9 +113,9 @@ frame arrives already aspect-fit, letterboxed and downscaled, so a renderer
 only has to map `PreviewFrame::px` onto the panel.
 
 Measured firmware RAM after replacing ordered dither with Floyd–Steinberg:
-≈ 60 KB (of 320 KB). The renderer uses two 128-float scanline error buffers;
-the unified stream also needs a 160×128 grayscale decode buffer plus tjgd's
-work area.
+≈ 60 KB (of 512 KB internal SRAM). The renderer uses two 128-float scanline
+error buffers; the unified stream also needs a 160×128 grayscale decode buffer
+plus tjgd's work area.
 
 ## JPEG filters (SD capture)
 
@@ -120,7 +128,7 @@ or re-encode, so it costs nothing.
 |---|---|---|
 | `JPEG_FILTER_NONE` (default) | Pass-through | SXGA 1280×1024 |
 | `JPEG_FILTER_WHITE_BORDER` | Paints a 20 px white band over all four frame edges; edge pixels are lost and the visible image area is 1240×984 | SXGA 1280×1024 (canvas unchanged) |
-| `JPEG_FILTER_SUPERIA_USM` | Fuji Superia 400 film look + gaussian unsharp sharpen, ported from the `tools/preview_lab` chain with the lab's default parameters. One decode, one fused colour pass, sharpen as a second pass, one re-encode — no intermediate JPEG round trips. The lab's grain stage is not ported (its default is 0 = off). Capture takes about 14–15 s per shot on the board (measured at 240 MHz, `-O2`). | SXGA 1280×1024 |
+| `JPEG_FILTER_SUPERIA_USM` | Fuji Superia 400 film look + gaussian unsharp sharpen, ported from the `tools/preview_lab` chain with the lab's default parameters. One decode, one fused colour pass, sharpen as a second pass, one re-encode — no intermediate JPEG round trips. The lab's grain stage is not ported (its default is 0 = off). Measured on the S3 at 240 MHz with `-O3`: about 6.6 s per SXGA shot (decode 0.95, stats 0.65, look 2.09, sharpen 1.24, encode 1.4 s); it was ~14–15 s on the ESP32-CAM. | SXGA 1280×1024 |
 
 Enable it in the existing `build_flags` block in `platformio.ini`:
 
@@ -145,7 +153,9 @@ macros (auto balance 0.55, auto contrast 0.56, white balance 0.98/1.01/1.00,
 midtone gamma 0.97, shadow/highlight tint, vignette 0.50, unsharp amount 0.90
 at sigma 1.00). Each is overridable with
 `-DSUPERIA_<NAME>=<value>`; see the tunables block at the top of the
-`JPEG_FILTER_SUPERIA_USM` branch in `src/jpeg_filter.h`.
+`JPEG_FILTER_SUPERIA_USM` branch in `src/jpeg_filter.h`. The S3 build uses the
+PIE sharpen kernel by default; `-DSUPERIA_USM_SIMD=0` forces the scalar path
+(the host test always uses scalar).
 
 **Memory.** The border does not grow the frame: it paints over the outer 20
 pixels on each edge (no scaling or resampling), so the canvas stays
@@ -158,7 +168,7 @@ to the SD file via `fmt2jpg_cb`, so the JPEG is never held in RAM either.
 |---|---|
 | RGB565 canvas, 1280×1024 | 2,621,440 |
 | Camera buffer (`fb_count = 1`, w×h/5) | 262,144 |
-| **Peak** | **~2.9 MB** (of 4 MB PSRAM) |
+| **Peak** | **~2.9 MB** (of 8 MB PSRAM) |
 
 Border width is free: it does not change the memory requirement, only the
 painted area. `jpegFilterWorstCaseBytes()` reports an upper bound (0.25
@@ -166,15 +176,17 @@ bytes/pixel at encoder quality 10) so the free-space check can run before the
 file is opened; with the default `JPEG_REENCODE_QUALITY` of 60 the budget
 doubles to 0.5 bytes/pixel.
 
-The Superia filter shares the canvas and bound above. Its sharpen row-ring
-(2·radius+1 blurred rows, 8-bit, ~27 KB at SXGA) and its LUTs (~4 KB) live in
-internal DRAM, not PSRAM, so peak PSRAM stays at the border filter's ~2.9 MB
-envelope. Keep it there: an earlier version used a ~0.67 MB band buffer in
-PSRAM, pushed the peak to ~3.6 MB, and this board's PSRAM delivered
-block-garbage into the canvas at that pressure (psychedelic capture output).
-The ring also sped the sharpen pass up: PSRAM access, not arithmetic, was the
-hot path there. Internal DRAM is tight (the ring alone is near its limit), so
-check the link size after any change to these buffers.
+The Superia filter shares the canvas and bound above. Its sharpen ring (one
+16-byte group per channel/pixel, holding the 2·radius+1 blurred rows as int16
+slots, ~61 KB at SXGA) and its LUTs (~4 KB) live in internal DRAM, not PSRAM,
+so peak PSRAM stays at the border filter's ~2.9 MB envelope. Keep it there: an
+earlier version used a ~0.67 MB band buffer in PSRAM, pushed the peak to
+~3.6 MB, and the old ESP32-CAM's PSRAM delivered block-garbage into the canvas
+at that pressure (psychedelic capture output). The 16-byte groups are also what
+let the vertical pass use the S3's 8-lane 16-bit dot product
+(`ee.vmulas.s16.accx` in `src/usm_simd.S`); the scalar fallback runs on the
+host, on wider kernels, and when the ring comes from the PSRAM heap. Check the
+link size after any change to these buffers.
 
 Adding a filter: extend the `#if` chain in `src/jpeg_filter.h` with a new
 `JPEG_FILTER_*` id and a `jpegFilterStream()` that pushes bytes to the
@@ -183,8 +195,8 @@ unknown id fails the build via `#error`.
 
 ## Robustness
 
-- The UART is only started when debug logging is compiled in — otherwise it
-  would hold GPIO1, which doubles as OLED SCL.
+- Debug logging goes to the USB-C CDC port (`DBG()`), so it owns no GPIO and
+  needs no cable changes.
 - Camera init failure never halts the unit: it retries forever with an
   attempt counter, so a brownout or slow sensor power-up recovers by itself.
 - Capture outcomes are distinct: `Saved to SD`, `SD card full`,
@@ -192,7 +204,10 @@ unknown id fails the build via `#error`.
 - Free space is checked before a write starts, and a short write deletes the
   partial file so a truncated JPEG never consumes a name slot.
 - `nextPhotoPath()` writes into a stack buffer (no `String` heap churn) and
-  resumes from the last used index instead of rescanning from `0000`.
+  starts from the last used index, persisted in `/last_idx.txt` on the card.
+  A reboot resumes at the last slot; a blank/new card has no index file and
+  starts at `0000`. The scan still skips every occupied name, so a stale or
+  hand-edited index can only shift the numbering, never overwrite a photo.
 - Pressing the shutter with a just-removed card short-circuits to the
   `NO SD CARD` wait instead of failing part-way through a write.
 - Streaming retries are paced, so a slow frame after a still cannot be
@@ -200,9 +215,10 @@ unknown id fails the build via `#error`.
 
 Known limitations (by design, not bugs):
 
-- GPIO1 is shared between UART TX and I2C SCL, so no serial logs in this
-  build and the OLED SCL wire must be detached to upload.
-- Capture blocks the loop for ~0.2–0.4 s, so the preview pauses briefly
+- The shutter is the onboard BOOT button (GPIO0), so holding it through a
+  reset puts the ROM in download mode instead of booting the firmware.
+- Capture blocks the loop: about 0.2–0.4 s with `JPEG_FILTER_NONE`, and the
+  whole ~6.6 s Superia pass with the default filter, so the preview pauses
   while the file is written.
 - SXGA stills need PSRAM: the single JPEG frame buffer reserves ~256 KB. If
   that allocation fails, the boot ladder (`CAM_MODES` in `src/main.cpp`) steps
@@ -216,22 +232,20 @@ Requires [PlatformIO](https://platformio.org/) (`pio` on PATH).
 
 ```powershell
 pio run                                  # build
-pio device list                          # find MB adapter (e.g. COM6, CH340)
+pio device list                          # find the USB-Serial-JTAG port
 pio run --target upload                  # upload (auto-detect port)
 pio run --target upload --upload-port COM6   # upload to explicit port
-pio device monitor -b 115200 -p COM6     # serial monitor
+pio device monitor -b 115200 -p COM6     # USB CDC serial monitor
 ```
 
-Build output (typical, `JPEG_FILTER_NONE`): RAM ~21 %, Flash ~14.5 %.
+Build output with the checked-in flags (SUPERIA filter, USB CDC, `-O3`):
+RAM 44.4 % (145,564 / 327,680 B), Flash 14.1 % (470,153 / 3,342,336 B).
 
 ### Upload checklist
 
-1. Disconnect OLED SCL (U0T) and the button before flashing — they hold
-   strapping/serial lines and cause `Wrong boot mode detected (0x2b)`.
-2. Seat the ESP32-CAM firmly on the MB adapter, use a USB data cable.
-3. Install the CH340 driver if no COM port appears.
-4. If upload stalls, press RST on the MB adapter and retry.
-5. Reconnect peripherals after a successful flash.
+1. Connect the USB-C data cable. No peripheral needs to be disconnected.
+2. Run the upload; the board enumerates as a USB-Serial-JTAG device.
+3. If no port appears, hold BOOT, tap RST, release BOOT, then retry.
 
 ## Libraries
 
@@ -258,7 +272,8 @@ packages in `tools/film_lab/requirements.txt`; see its
 - `src/preview_types.h` — `PreviewFrame` shared by all renderers
 - `src/preview_floyd_steinberg.h` — serpentine Floyd–Steinberg renderer
 - `src/jpeg_filter.h` — compile-time JPEG filter pipeline for SD capture
-- `platformio.ini` — `esp32cam` board, Arduino framework, 115200 monitor,
-  460800 upload
+- `src/usm_simd.S` — ESP32-S3 PIE dot-product kernel for the Superia sharpen
+- `platformio.ini` — `esp32-s3-devkitc-1` (8 MB flash, 8 MB OPI PSRAM),
+  Arduino framework, 115200 monitor, 460800 upload
 - `tools/film_lab/` — host-side film look lab (Python + `uv`)
 - `test-images/` — sample captures used by the lab (git-ignored, local only)
