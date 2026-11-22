@@ -2,13 +2,12 @@
 """
 Firmware capture-filter test bench.
 
-Builds the REAL src/jpeg_filter.h (JPEG_FILTER_SUPERIA_USM,
-JPEG_FILTER_KODACHROME_USM and JPEG_FILTER_TMAX_USM branches) as host
-binaries under WSL and runs them over the sample JPEGs, producing the
-shipped Superia 400 + USM combination, the Superia look alone, the USM
-alone, the Kodachrome 64 + Vibrance + USM chain, and the T-Max 400 B&W +
-USM chain, plus an HTML gallery and contact sheets for side-by-side
-inspection.
+Builds the REAL src/jpeg_filter.h as host binaries under WSL and runs it
+over the sample JPEGs, producing the runtime matrix: None (pass-through),
+None + border (WITH_BORDER), the Superia/Kodachrome/T-Max looks, the
+Superia look alone, the USM alone, and the three looks with the image
+inset into a 24 px white border, plus an HTML gallery and contact sheets
+for side-by-side inspection.
 
 What this reproduces vs. hardware:
   reproduced  all filter math from src/jpeg_filter.h as compiled (LUTs,
@@ -45,11 +44,16 @@ from run_film_lab import build_contact_sheet, find_images  # noqa: E402
 
 # mode -> (filter mode, filter kind, sheet label)
 MODES = {
-    "superia": (1, 0, "Superia 400 (firmware look only)"),
-    "usm": (2, 0, "USM (firmware sharpen only)"),
-    "full": (0, 0, "Superia 400 + USM (shipped firmware)"),
-    "kodachrome": (0, 1, "Kodachrome 64 + Vibrance + USM (firmware)"),
-    "tmax": (0, 2, "T-Max 400 + USM (firmware)"),
+    "none": (0, 0, "None (pass-through)"),
+    "with_border": (0, 1, "None + 24 px border (WITH_BORDER)"),
+    "superia": (1, 2, "Superia 400 (firmware look only)"),
+    "usm": (2, 2, "USM (firmware sharpen only)"),
+    "full": (0, 2, "Superia 400 + USM (firmware)"),
+    "kodachrome": (0, 3, "Kodachrome 64 + Vibrance + USM (firmware)"),
+    "tmax": (0, 4, "T-Max 400 + USM (firmware)"),
+    "superia_border": (0, 5, "Superia 400 + USM + 24 px border"),
+    "kodachrome_border": (0, 6, "Kodachrome 64 + Vibrance + USM + 24 px border"),
+    "tmax_border": (0, 7, "T-Max 400 + USM + 24 px border"),
 }
 
 
@@ -70,7 +74,6 @@ def build(wsl_repo: str) -> None:
     for exe, (mode, kind, _) in MODES.items():
         cmd = (f'cd {wsl_repo}/tools/jpeg_filter_test && '
                f"g++ -O2 -Wall -DFILTER_MODE={mode} -DFILTER_KIND={kind} "
-               f"-DJPEG_FILTER_SWAP565=0 "
                f"-I {wsl_repo}/src -I stubs host_test.cpp -o out/{exe}")
         r = subprocess.run(["wsl", "-e", "bash", "-c", cmd], text=True,
                            capture_output=True)
@@ -96,7 +99,7 @@ def write_gallery(out_dir: Path, groups) -> Path:
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>firmware JPEG filter test -- Superia 400 / Kodachrome 64 / T-Max 400 / USM</title>
+<title>firmware JPEG filter test -- runtime looks and borders</title>
 <style>
   :root {{ color-scheme: dark; }}
   body {{ margin: 0; padding: 24px 28px 64px; background: #141518;
@@ -113,12 +116,13 @@ def write_gallery(out_dir: Path, groups) -> Path:
 </style>
 </head>
 <body>
-<h1>firmware JPEG filter test &mdash; Superia 400 / Kodachrome 64 / T-Max 400 / USM</h1>
+<h1>firmware JPEG filter test &mdash; runtime looks and borders</h1>
 <p class="hint">Output of the real src/jpeg_filter.h compiled for the host
-(WSL), over the test captures. left to right: firmware Superia 400 look
-alone, firmware USM alone, shipped Superia 400 + USM, the Kodachrome 64
-+ Vibrance + USM chain, and the T-Max 400 B&amp;W + USM chain. Click any
-card for full size; contact sheet links in each filename.</p>
+(WSL), over the test captures: None (pass-through), None + 24 px border
+(WITH_BORDER), the Superia 400 look alone, the USM alone, Superia 400 +
+USM, Kodachrome 64 + Vibrance + USM, T-Max 400 B&amp;W + USM, and the
+same three looks with the image inset into a 24 px white border. Click
+any card for full size; contact sheet links in each filename.</p>
 {"".join(rows)}
 </body>
 </html>""", encoding="utf-8")
@@ -161,7 +165,7 @@ def main(argv=None) -> int:
         for exe, (mode, _kind, label) in MODES.items():
             out_name = f"{stem}__{exe}.jpg"
             cmd = (f"cd {as_wsl(TOOL)} && ./out/{exe} {as_wsl(image_path)} "
-                   f"out/files/{out_name} {args.quality}")
+                   f"{as_wsl(files / out_name)} {args.quality}")
             r = subprocess.run(["wsl", "-e", "bash", "-c", cmd], text=True,
                                capture_output=True)
             print(r.stdout.strip())
@@ -181,7 +185,7 @@ def main(argv=None) -> int:
         sheet_links[stem] = f"sheets/{sheet_name}"
 
         groups.append((image_path,
-                       [(label, f"files/{p.name}") for _, label, p in rendered]))
+                       [(label, f"../files/{p.name}") for _, label, p in rendered]))
         print()
 
     index = write_gallery(out_dir, groups)

@@ -1,13 +1,18 @@
 // Host test driver for the firmware capture filter.
 //
-// Compiles the REAL src/jpeg_filter.h branch with thin host stubs (stubs/), so
-// what runs here is the device's filter math, its LUTs, its RGB565 canvas and
-// its byte order -- not a reimplementation.
+// Compiles the REAL src/jpeg_filter.h with thin host stubs (stubs/), so what
+// runs here is the device's filter math, its LUTs, its RGB565 canvas and its
+// byte order -- not a reimplementation.
 //
-// FILTER_KIND selects the look:
-//   0  Superia 400   (JPEG_FILTER_SUPERIA_USM)
-//   1  Kodachrome 64 (JPEG_FILTER_KODACHROME_USM)
-//   2  T-Max 400     (JPEG_FILTER_TMAX_USM)
+// FILTER_KIND selects the runtime look/border pair:
+//   0  None                      (pass-through)
+//   1  None + border             (WITH_BORDER)
+//   2  Superia 400
+//   3  Kodachrome 64
+//   4  T-Max 400
+//   5  Superia 400 + border
+//   6  Kodachrome 64 + border
+//   7  T-Max 400 + border
 // FILTER_MODE selects which part of the chain is active, by the same -D
 // macros the firmware exposes (see platformio.ini):
 //   0  as shipped            look + USM sharpen
@@ -20,6 +25,7 @@
 // firmware's JPEG_QUALITY. Output JPEG codec is stb, the device's is jpge;
 // see run_filter_test.py for the honest checklist of what this does and
 // does not reproduce.
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,13 +35,6 @@
 #endif
 #ifndef FILTER_KIND
 #define FILTER_KIND 0
-#endif
-#if FILTER_KIND == 1
-#define JPEG_FILTER JPEG_FILTER_KODACHROME_USM
-#elif FILTER_KIND == 2
-#define JPEG_FILTER JPEG_FILTER_TMAX_USM
-#else
-#define JPEG_FILTER JPEG_FILTER_SUPERIA_USM
 #endif
 #if FILTER_MODE == 1
 #define SUPERIA_USM_AMOUNT 0.0f
@@ -56,6 +55,38 @@
 #endif
 #include "jpeg_filter.h"
 
+// FILTER_KIND is the test matrix's fixed numbering; the firmware itself uses
+// the runtime look + border pair.
+static void selectFilter(int kind) {
+  FilterLook look = FILTER_LOOK_NONE;
+  bool border = false;
+  switch (kind) {
+    case 0: look = FILTER_LOOK_NONE;       border = false; break;
+    case 1: look = FILTER_LOOK_NONE;       border = true;  break;
+    case 2: look = FILTER_LOOK_SUPERIA;    border = false; break;
+    case 3: look = FILTER_LOOK_KODACHROME; border = false; break;
+    case 4: look = FILTER_LOOK_TMAX;       border = false; break;
+    case 5: look = FILTER_LOOK_SUPERIA;    border = true;  break;
+    case 6: look = FILTER_LOOK_KODACHROME; border = true;  break;
+    case 7: look = FILTER_LOOK_TMAX;       border = true;  break;
+    default: break;
+  }
+  jpegFilterSetLook(look);
+  jpegFilterSetBorder(border);
+}
+
+// The button-driven part of the runtime API: cycle order and border toggle.
+static void selfCheck() {
+  jpegFilterSetLook(FILTER_LOOK_NONE);
+  jpegFilterSetBorder(false);
+  assert(jpegFilterNextLook() == FILTER_LOOK_SUPERIA);
+  assert(jpegFilterNextLook() == FILTER_LOOK_KODACHROME);
+  assert(jpegFilterNextLook() == FILTER_LOOK_TMAX);
+  assert(jpegFilterNextLook() == FILTER_LOOK_NONE);
+  assert(jpegFilterToggleBorder() == true);
+  assert(jpegFilterToggleBorder() == false);
+}
+
 // The firmware's SD file sink: stdout-equivalent on host.
 struct FileSink {
   FILE *f;
@@ -75,6 +106,8 @@ int main(int argc, char **argv) {
     return 2;
   }
   const uint8_t quality = argc > 3 ? (uint8_t)atoi(argv[3]) : 10;
+  selfCheck();
+  selectFilter(FILTER_KIND);
 
   FILE *fin = fopen(argv[1], "rb");
   if (!fin) {
@@ -116,9 +149,35 @@ int main(int argc, char **argv) {
   const bool ok = jpegFilterStream(&fb, quality, fileSinkWrite, &sink,
                                    &written, &ow, &oh);
   fclose(fout);
+
+  // The harness exits 0 only if the output shape and the pass-through contract
+  // are right; otherwise a corrupted border or pass-through would go unnoticed.
+  const int border = (FILTER_KIND == 1 || FILTER_KIND >= 5)
+                         ? JPEG_FILTER_INSET_PX
+                         : 0;
+  const uint16_t wantW = (uint16_t)(fb.width + 2 * border);
+  const uint16_t wantH = (uint16_t)(fb.height + 2 * border);
+  bool pass = ok && written == sink.n && sink.n > 0 && ow == wantW &&
+              oh == wantH;
+  if (pass && FILTER_KIND == 0) {
+    FILE *fc = fopen(argv[2], "rb");
+    if (!fc) {
+      pass = false;
+    } else {
+      uint8_t *buf = (uint8_t *)malloc(fb.len);
+      pass = buf && fread(buf, 1, fb.len, fc) == fb.len &&
+             fgetc(fc) == EOF && memcmp(buf, fb.buf, fb.len) == 0;
+      free(buf);
+      fclose(fc);
+    }
+  }
   free(fb.buf);
 
-  printf("%s %s -> %s %ux%u %zu bytes\n", ok ? "OK " : "FAIL", argv[1],
+  if (!pass) {
+    fprintf(stderr, "FAIL: expected %ux%u, got %ux%u (%zu bytes)\n", wantW,
+            wantH, ow, oh, sink.n);
+  }
+  printf("%s %s -> %s %ux%u %zu bytes\n", pass ? "OK " : "FAIL", argv[1],
          argv[2], ow, oh, sink.n);
-  return ok ? 0 : 1;
+  return pass ? 0 : 1;
 }

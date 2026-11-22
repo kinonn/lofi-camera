@@ -5,39 +5,95 @@
 
 // ---------------------------------------------------------------------------
 // Post-processing pipeline applied to a captured JPEG before it is written to
-// the SD card. Selected at compile time; NO_FILTER is the default and is a
-// pure pass-through -- the camera's JPEG is written verbatim, no decode.
+// the SD card. The look and the border are selected at runtime:
 //
-//   JPEG_FILTER_NONE          write the camera frame unchanged (zero cost)
-//   JPEG_FILTER_WHITE_BORDER  paint a white border over the frame edges; the
-//                             outer 20 px are lost, with no resampling
-//   JPEG_FILTER_SUPERIA_USM   Fuji Superia 400 film look + unsharp sharpen,
-//                             ported from the tools/preview_lab chain with
-//                             the lab's default parameters
-//   JPEG_FILTER_KODACHROME_USM Kodak Kodachrome 64 film look + vibrance +
-//                             unsharp sharpen, ported from the preview_lab
-//                             chain "Kodachrome 64 -> Vibrance -> Sharpen"
-//   JPEG_FILTER_TMAX_USM      Kodak T-Max 400 panchromatic B&W + unsharp
-//                             sharpen, ported from the preview_lab chain
-//                             "T-Max 400 -> Sharpen"
+//   NONE             write the camera frame unchanged (zero cost)
+//   WITH_BORDER      image unchanged, inset into a larger canvas with a white
+//                    frame around it (no crop, no resampling)
+//   SUPERIA_USM      Fuji Superia 400 look + unsharp sharpen
+//   KODACHROME_USM   Kodak Kodachrome 64 look + vibrance + unsharp sharpen
+//   TMAX_USM         Kodak T-Max 400 panchromatic B&W + unsharp sharpen
 //
-// Switch in platformio.ini:
-//   build_flags = -DJPEG_FILTER=JPEG_FILTER_WHITE_BORDER
+// The three looks can also be combined with the same white frame. The runtime
+// state is {look, border}; the long-press border toggle in main.cpp turns any
+// look (including NONE) into its bordered variant. NONE + border is the filter
+// formerly called WHITE_BORDER, now WITH_BORDER.
+//
+// There is no compile-time filter switch: jpegFilterSetLook() /
+// jpegFilterSetBorder() select the active state, and jpegFilterStream() reads
+// it per capture. The old selection flags fail loudly instead of being
+// silently ignored.
 // ---------------------------------------------------------------------------
-#define JPEG_FILTER_NONE           0
-#define JPEG_FILTER_WHITE_BORDER   1
-#define JPEG_FILTER_SUPERIA_USM    2
-#define JPEG_FILTER_KODACHROME_USM 3
-#define JPEG_FILTER_TMAX_USM       4
-
-#ifndef JPEG_FILTER
-#define JPEG_FILTER JPEG_FILTER_NONE
+#ifdef JPEG_FILTER
+#error "JPEG_FILTER is no longer a compile-time switch; use FILTER_DEFAULT_LOOK / FILTER_DEFAULT_BORDER"
 #endif
+#ifdef JPEG_FILTER_BORDER_PX
+#error "JPEG_FILTER_BORDER_PX was removed; use JPEG_FILTER_INSET_PX"
+#endif
+#ifdef JPEG_FILTER_SWAP565
+#error "JPEG_FILTER_SWAP565 was removed; the pipeline always swaps before encode"
+#endif
+
+enum FilterLook : uint8_t {
+  FILTER_LOOK_NONE = 0,
+  FILTER_LOOK_SUPERIA,
+  FILTER_LOOK_KODACHROME,
+  FILTER_LOOK_TMAX,
+  FILTER_LOOK_COUNT
+};
+
+#ifndef FILTER_DEFAULT_LOOK
+#define FILTER_DEFAULT_LOOK FILTER_LOOK_TMAX
+#endif
+#ifndef FILTER_DEFAULT_BORDER
+#define FILTER_DEFAULT_BORDER 0
+#endif
+
+static_assert(FILTER_DEFAULT_LOOK >= 0 &&
+                  FILTER_DEFAULT_LOOK < FILTER_LOOK_COUNT,
+              "FILTER_DEFAULT_LOOK must be one of FILTER_LOOK_*");
+
+// Border width, in output pixels, on every side. The canvas grows by 2x this;
+// the image itself is never cropped. One knob for every bordered variant,
+// including WITH_BORDER.
+#ifndef JPEG_FILTER_INSET_PX
+#define JPEG_FILTER_INSET_PX 24
+#endif
+static_assert(JPEG_FILTER_INSET_PX >= 0,
+              "JPEG_FILTER_INSET_PX must be non-negative");
+static_assert(2 * JPEG_FILTER_INSET_PX + 1600 < 65535,
+              "JPEG_FILTER_INSET_PX is too large for uint16_t output dimensions");
+
+// Runtime selection. The setters validate / wrap so the rest of the firmware
+// never has to clamp a look index. jpegFilterSetLook()/NextLook() are defined
+// below FILM_LOOKS because they also refresh the active parameter pointer.
+static FilterLook gFilterLook = FILTER_DEFAULT_LOOK;
+static bool gFilterBorder = FILTER_DEFAULT_BORDER;
+
+static inline FilterLook jpegFilterGetLook(void) { return gFilterLook; }
+static inline void jpegFilterSetBorder(bool on) { gFilterBorder = on; }
+static inline bool jpegFilterGetBorder(void) { return gFilterBorder; }
+static inline bool jpegFilterToggleBorder(void) {
+  gFilterBorder = !gFilterBorder;
+  return gFilterBorder;
+}
+static inline const char* jpegFilterLookName(FilterLook look) {
+  switch (look) {
+    case FILTER_LOOK_NONE:       return "None";
+    case FILTER_LOOK_SUPERIA:    return "Superia 400";
+    case FILTER_LOOK_KODACHROME: return "Kodachrome 64";
+    case FILTER_LOOK_TMAX:       return "T-Max 400";
+    default:                     return "?";
+  }
+}
 
 // The pipeline streams its output instead of buffering the encoded JPEG, so a
 // filter never has to hold the file in RAM. That is what keeps peak PSRAM
 // inside the 8 MB module.
 typedef size_t (*JpegWriteFn)(void* arg, const uint8_t* data, size_t len);
+
+#include "esp32-hal-psram.h"
+#include "img_converters.h"
 
 // TEMP diagnostic: -DCAPTURE_TIMING=1 records per-stage ms; main.cpp appends a
 // line per shot to /timing.txt. Remove with the flag when tuning is done.
@@ -60,154 +116,34 @@ static JpegCaptureTiming gJpegCaptureTiming;
 #endif
 
 // Output-size bound for the free-space check before a file is opened. NONE
-// is exact (pass-through). The re-encoding branches measured ~0.125
-// bytes/pixel worst case at encoder quality 10; the old 0.25 B/px budget
-// carried a 2x margin, but finer tables grow the files ~2.5x, so above
-// encoder-quality 10 the budget doubles.
+// without a border is exact (pass-through). The re-encoding paths measured
+// ~0.125 bytes/pixel worst case at encoder quality 10; the old 0.25 B/px
+// budget carried a 2x margin, but finer tables grow the files ~2.5x, so above
+// encoder-quality 10 the budget doubles. A border grows the canvas, so its
+// bound uses the expanded dimensions.
 #if JPEG_REENCODE_QUALITY > 10
 #define JPEG_FILTER_WC_SHIFT 1  // re-encode budget: 0.5 bytes/pixel
 #else
 #define JPEG_FILTER_WC_SHIFT 2  // re-encode budget: 0.25 bytes/pixel
 #endif
 static inline size_t jpegFilterWorstCaseBytes(const camera_fb_t* fb) {
-#if JPEG_FILTER == JPEG_FILTER_NONE
-  return fb->len;  // exact: nothing is re-encoded
-#else
-  return ((size_t)fb->width * (size_t)fb->height) >> JPEG_FILTER_WC_SHIFT;
-#endif
-}
-
-// Border thickness, in output pixels, on every side.
-#ifndef JPEG_FILTER_BORDER_PX
-#define JPEG_FILTER_BORDER_PX 20
-#endif
-
-// The canvas keeps the capture's dimensions (SXGA stays 1280x1024); the
-// border is carved out of the image area instead of growing the frame. That
-// needs only ONE large buffer -- the RGB565 canvas -- because the JPEG is
-// decoded directly into it. At SXGA that canvas is 2,621,440 bytes (2.5 MiB).
-// With two SXGA camera buffers, the calculated peak is about 3.2 MB including
-// decoder/encoder work space, well within 8 MB PSRAM.
-
-// The decoder emits RGB565 in a byte order intended for LCD panels. If the
-// re-encoded photo comes out with red and blue swapped, set this to 1.
-#ifndef JPEG_FILTER_SWAP565
-#define JPEG_FILTER_SWAP565 0
-#endif
-
-// The pipeline streams its output instead of buffering the encoded JPEG, so a
-// filter never has to hold the file in RAM. That is what keeps peak PSRAM
-// inside the 8 MB module.
-typedef size_t (*JpegWriteFn)(void* arg, const uint8_t* data, size_t len);
-
-// ---------------------------------------------------------------------------
-#if (JPEG_FILTER == JPEG_FILTER_NONE)
-
-// Pass-through: one write of the camera buffer, untouched.
-static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
-                                    JpegWriteFn write, void* arg,
-                                    size_t* written, uint16_t* outW,
-                                    uint16_t* outH) {
-  (void)quality;
-  *outW = fb->width;
-  *outH = fb->height;
-  const size_t n = write(arg, fb->buf, fb->len);
-  *written = n;
-  return n == fb->len;
-}
-
-// ---------------------------------------------------------------------------
-#elif (JPEG_FILTER == JPEG_FILTER_WHITE_BORDER)
-
-#include "esp32-hal-psram.h"
-#include "img_converters.h"
-#include "esp_jpg_decode.h"
-
-// Decoding goes through jpg2rgb565() below: the reader/writer callback form of
-// esp_jpg_decode() proved unstable on this target and panicked.
-
-// Adapter from fmt2jpg_cb's callback into the caller's sink.
-struct JpgOutCtx {
-  JpegWriteFn write;
-  void* arg;
-  size_t written;
-  bool failed;
-};
-
-static size_t jpgOutCb(void* arg, size_t index, const void* data, size_t len) {
-  JpgOutCtx* c = (JpgOutCtx*)arg;
-  (void)index;
-  const size_t n = c->write(c->arg, (const uint8_t*)data, len);
-  c->written += n;
-  if (n != len) c->failed = true;
-  return n;
-}
-
-// Decode the frame into one RGB565 canvas the size of the capture, then paint
-// a white band around the outside. The canvas keeps the capture's dimensions;
-// the photo is inset by cropping `b` pixels on each edge, which needs no extra
-// memory and does no resampling (a 1.6 % crop at SXGA).
-static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
-                                    JpegWriteFn write, void* arg,
-                                    size_t* written, uint16_t* outW,
-                                    uint16_t* outH) {
-  *written = 0;
-  *outW = 0;
-  *outH = 0;
-
-  const uint16_t w = fb->width;
-  const uint16_t h = fb->height;
-  const uint16_t b = JPEG_FILTER_BORDER_PX;
-  if (w <= (uint16_t)(2 * b) || h <= (uint16_t)(2 * b)) return false;
-
-  const size_t canvasBytes = (size_t)w * h * sizeof(uint16_t);
-  uint8_t* canvas = (uint8_t*)ps_malloc(canvasBytes);
-  if (!canvas) return false;
-
-  if (!jpg2rgb565(fb->buf, fb->len, canvas, JPG_SCALE_NONE)) {
-    free(canvas);
-    return false;
+  if (gFilterLook == FILTER_LOOK_NONE && !gFilterBorder) return fb->len;
+  const size_t w = fb->width;
+  const size_t h = fb->height;
+  if (gFilterBorder) {
+    return ((size_t)(w + 2 * JPEG_FILTER_INSET_PX) *
+            (size_t)(h + 2 * JPEG_FILTER_INSET_PX)) >>
+           JPEG_FILTER_WC_SHIFT;
   }
-
-  // White border; 0xFFFF is white in either RGB565 byte order.
-  uint16_t* px = (uint16_t*)canvas;
-  for (uint16_t y = 0; y < h; y++) {
-    uint16_t* row = px + (size_t)y * w;
-    if (y < b || y >= (uint16_t)(h - b)) {
-      memset(row, 0xFF, (size_t)w * sizeof(uint16_t));
-    } else {
-      memset(row, 0xFF, (size_t)b * sizeof(uint16_t));
-      memset(row + (w - b), 0xFF, (size_t)b * sizeof(uint16_t));
-    }
-  }
-
-#if JPEG_FILTER_SWAP565
-  // fmt2jpg_cb() reads RGB565 input big-endian (high byte first) while
-  // jpg2rgb565() wrote this canvas little-endian; the swap converts the canvas
-  // to the encoder's byte order so the channels encode true.
-  for (size_t i = 0; i < (size_t)w * h; i++) {
-    px[i] = (uint16_t)((px[i] >> 8) | (px[i] << 8));
-  }
-#endif
-
-  JpgOutCtx out = { write, arg, 0, false };
-  const bool encoded = fmt2jpg_cb(canvas, canvasBytes, w, h, PIXFORMAT_RGB565,
-                                  quality, jpgOutCb, &out);
-  free(canvas);
-
-  *written = out.written;
-  *outW = w;
-  *outH = h;
-  return encoded && !out.failed && out.written > 0;
+  return (w * h) >> JPEG_FILTER_WC_SHIFT;
 }
 
-// ---------------------------------------------------------------------------
-#elif (JPEG_FILTER == JPEG_FILTER_SUPERIA_USM) || \
-      (JPEG_FILTER == JPEG_FILTER_KODACHROME_USM) || \
-      (JPEG_FILTER == JPEG_FILTER_TMAX_USM)
-
-#include "esp32-hal-psram.h"
-#include "img_converters.h"
+// The pass-through and unbordered paths keep the capture's dimensions. Every
+// bordered variant needs the larger canvas: at SXGA with a 24 px frame that is
+// 1328x1072 (2,847,232 bytes). The decoder writes the image into the leading
+// 1280x1024 pixels, the look/sharpen passes run there, and only at the end are
+// the rows shifted into the inset and the border filled. Peak PSRAM stays
+// about 3.4 MB including two camera buffers.
 
 // ESP32-S3 PIE 8-lane 16-bit dot product (ee.vmulas.s16.accx). The .S file is
 // assembled only in the S3 build; the host test and other targets use the
@@ -300,10 +236,8 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 #if SUPERIA_USM_MAX_RADIUS > 8
 #error "SUPERIA_USM_MAX_RADIUS > 8: extend the radius switch in jpegFilterStream"
 #endif
-// ceil(3*sigma) as an integer constant, so the DRAM ring can be a static array.
-#ifndef SUPERIA_USM_RAD
-#define SUPERIA_USM_RAD ((int)(3.0f * SUPERIA_USM_SIGMA + 0.999f))
-#endif
+// The radius is derived per capture from the active look's usmSigma and
+// clamped to SUPERIA_USM_MAX_RADIUS; sigma is the tuning knob.
 // Ring width in pixels; SXGA is 1280. Frames wider than this (UXGA = 1600)
 // fall back to a PSRAM ring at capture time.
 #ifndef SUPERIA_USM_RING_W
@@ -311,10 +245,9 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 #endif
 
 // ---- per-filter look parameters -------------------------------------------
-// The shared pipeline reads FILM_*; each filter maps those to its own
-// -D-overridable names. Kodachrome values are the preview_lab node defaults
-// for the chain "Kodachrome 64 -> Vibrance (0.5) -> Sharpen (0.4, sigma 1)".
-#if JPEG_FILTER == JPEG_FILTER_KODACHROME_USM
+// The shared pipeline reads the active FilmLookParams. Kodachrome values are
+// the preview_lab node defaults for the chain
+// "Kodachrome 64 -> Vibrance (0.5) -> Sharpen (0.4, sigma 1)".
 #ifndef KODACHROME_AUTO_BALANCE
 #define KODACHROME_AUTO_BALANCE 0.62f
 #endif
@@ -390,11 +323,9 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 #ifndef KODACHROME_USM_SIGMA
 #define KODACHROME_USM_SIGMA 1.00f
 #endif
-#endif  // JPEG_FILTER_KODACHROME_USM
 
 // T-Max 400 values are the preview_lab node defaults for
 // "T-Max 400 -> Sharpen (0.4, sigma 1)".
-#if JPEG_FILTER == JPEG_FILTER_TMAX_USM
 #ifndef TMAX_AUTO_BALANCE
 #define TMAX_AUTO_BALANCE 0.70f
 #endif
@@ -428,84 +359,122 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 #ifndef TMAX_USM_SIGMA
 #define TMAX_USM_SIGMA 1.00f
 #endif
-#endif  // JPEG_FILTER_TMAX_USM
 
-#if JPEG_FILTER == JPEG_FILTER_KODACHROME_USM
-#define FILM_AUTO_BALANCE KODACHROME_AUTO_BALANCE
-#define FILM_AUTO_CONTRAST KODACHROME_AUTO_CONTRAST
-#define FILM_MIDTONE_GAMMA KODACHROME_MIDTONE_GAMMA
-#define FILM_TONE_CONTRAST KODACHROME_TONE_CONTRAST
-#define FILM_SATURATION KODACHROME_SATURATION
-#define FILM_SHADOW_R KODACHROME_SHADOW_R
-#define FILM_SHADOW_G KODACHROME_SHADOW_G
-#define FILM_SHADOW_B KODACHROME_SHADOW_B
-#define FILM_HIGHLIGHT_R KODACHROME_HIGHLIGHT_R
-#define FILM_HIGHLIGHT_G KODACHROME_HIGHLIGHT_G
-#define FILM_HIGHLIGHT_B KODACHROME_HIGHLIGHT_B
-#define FILM_VIGNETTE KODACHROME_VIGNETTE
-#define FILM_GRAIN KODACHROME_GRAIN
-#define FILM_VIBRANCE KODACHROME_VIBRANCE
-#define FILM_USM_AMOUNT KODACHROME_USM_AMOUNT
-#define FILM_USM_SIGMA KODACHROME_USM_SIGMA
-#define FILM_USM_RAD ((int)(3.0f * KODACHROME_USM_SIGMA + 0.999f))
-#define FILM_WB_R 1.0f
-#define FILM_WB_G 1.0f
-#define FILM_WB_B 1.0f
-#define FILM_HAS_MATRIX 1
-#define FILM_TINTS_GRADED 1
-#define FILM_MONO 0
-#elif JPEG_FILTER == JPEG_FILTER_TMAX_USM
-#define FILM_AUTO_BALANCE TMAX_AUTO_BALANCE
-#define FILM_AUTO_CONTRAST TMAX_AUTO_CONTRAST
-#define FILM_MIDTONE_GAMMA TMAX_MIDTONE_GAMMA
-#define FILM_TONE_CONTRAST TMAX_TONE_CONTRAST
-#define FILM_SATURATION 1.0f
-#define FILM_SHADOW_R 0.0f
-#define FILM_SHADOW_G 0.0f
-#define FILM_SHADOW_B 0.0f
-#define FILM_HIGHLIGHT_R 0.0f
-#define FILM_HIGHLIGHT_G 0.0f
-#define FILM_HIGHLIGHT_B 0.0f
-#define FILM_VIGNETTE TMAX_VIGNETTE
-#define FILM_GRAIN TMAX_GRAIN
-#define FILM_VIBRANCE 0.0f
-#define FILM_USM_AMOUNT TMAX_USM_AMOUNT
-#define FILM_USM_SIGMA TMAX_USM_SIGMA
-#define FILM_USM_RAD ((int)(3.0f * TMAX_USM_SIGMA + 0.999f))
-#define FILM_WB_R 1.0f
-#define FILM_WB_G 1.0f
-#define FILM_WB_B 1.0f
-#define FILM_HAS_MATRIX 0
-#define FILM_TINTS_GRADED 0
-#define FILM_MONO 1
-#define FILM_MONO_R TMAX_MONO_R
-#define FILM_MONO_G TMAX_MONO_G
-#define FILM_MONO_B TMAX_MONO_B
-#else
-#define FILM_AUTO_BALANCE SUPERIA_AUTO_BALANCE
-#define FILM_AUTO_CONTRAST SUPERIA_AUTO_CONTRAST
-#define FILM_MIDTONE_GAMMA SUPERIA_MIDTONE_GAMMA
-#define FILM_TONE_CONTRAST 0.0f
-#define FILM_SATURATION 1.0f
-#define FILM_SHADOW_R SUPERIA_SHADOW_R
-#define FILM_SHADOW_G SUPERIA_SHADOW_G
-#define FILM_SHADOW_B SUPERIA_SHADOW_B
-#define FILM_HIGHLIGHT_R SUPERIA_HIGHLIGHT_R
-#define FILM_HIGHLIGHT_G SUPERIA_HIGHLIGHT_G
-#define FILM_HIGHLIGHT_B SUPERIA_HIGHLIGHT_B
-#define FILM_VIGNETTE SUPERIA_VIGNETTE
-#define FILM_GRAIN 0.0f
-#define FILM_VIBRANCE 0.0f
-#define FILM_USM_AMOUNT SUPERIA_USM_AMOUNT
-#define FILM_USM_SIGMA SUPERIA_USM_SIGMA
-#define FILM_USM_RAD SUPERIA_USM_RAD
-#define FILM_WB_R SUPERIA_WB_R
-#define FILM_WB_G SUPERIA_WB_G
-#define FILM_WB_B SUPERIA_WB_B
-#define FILM_HAS_MATRIX 0
-#define FILM_TINTS_GRADED 0
-#define FILM_MONO 0
-#endif
+// Per-look runtime parameters. The three looks share one pipeline; selecting a
+// look changes only this table entry. Every value stays -D-overridable through
+// the SUPERIA_*, KODACHROME_* and TMAX_* macros above.
+struct FilmLookParams {
+  float autoBalance, autoContrast;
+  float wbR, wbG, wbB;
+  float midtoneGamma, toneContrast;
+  float saturation;
+  float shadowR, shadowG, shadowB;
+  float highlightR, highlightG, highlightB;
+  float vignette, grain, vibrance;
+  float usmAmount, usmSigma;
+  bool hasMatrix, gradedTints, mono;
+  float matRR, matRG, matRB;
+  float matGR, matGG, matGB;
+  float matBR, matBG, matBB;
+  float monoR, monoG, monoB;
+};
+
+static const FilmLookParams FILM_LOOKS[FILTER_LOOK_COUNT] = {
+  // NONE: the look pass is skipped, so these values are inert.
+  { 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, false, false, false,
+    1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+    1.0f, 1.0f, 1.0f },
+  // Superia 400: no matrix, no saturation/vibrance/grain.
+  { SUPERIA_AUTO_BALANCE, SUPERIA_AUTO_CONTRAST,
+    SUPERIA_WB_R, SUPERIA_WB_G, SUPERIA_WB_B,
+    SUPERIA_MIDTONE_GAMMA, 0.0f, 1.0f,
+    SUPERIA_SHADOW_R, SUPERIA_SHADOW_G, SUPERIA_SHADOW_B,
+    SUPERIA_HIGHLIGHT_R, SUPERIA_HIGHLIGHT_G, SUPERIA_HIGHLIGHT_B,
+    SUPERIA_VIGNETTE, 0.0f, 0.0f,
+    SUPERIA_USM_AMOUNT, SUPERIA_USM_SIGMA,
+    false, false, false,
+    1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+    1.0f, 1.0f, 1.0f },
+  // Kodachrome 64: warm matrix, vibrance, grain, graded tints.
+  { KODACHROME_AUTO_BALANCE, KODACHROME_AUTO_CONTRAST,
+    1.0f, 1.0f, 1.0f,
+    KODACHROME_MIDTONE_GAMMA, KODACHROME_TONE_CONTRAST,
+    KODACHROME_SATURATION,
+    KODACHROME_SHADOW_R, KODACHROME_SHADOW_G, KODACHROME_SHADOW_B,
+    KODACHROME_HIGHLIGHT_R, KODACHROME_HIGHLIGHT_G, KODACHROME_HIGHLIGHT_B,
+    KODACHROME_VIGNETTE, KODACHROME_GRAIN, KODACHROME_VIBRANCE,
+    KODACHROME_USM_AMOUNT, KODACHROME_USM_SIGMA,
+    true, true, false,
+    KODACHROME_MAT_RR, KODACHROME_MAT_RG, KODACHROME_MAT_RB,
+    KODACHROME_MAT_GR, KODACHROME_MAT_GG, KODACHROME_MAT_GB,
+    KODACHROME_MAT_BR, KODACHROME_MAT_BG, KODACHROME_MAT_BB,
+    1.0f, 1.0f, 1.0f },
+  // T-Max 400: panchromatic monochrome, grain, no matrix/saturation/vibrance.
+  { TMAX_AUTO_BALANCE, TMAX_AUTO_CONTRAST,
+    1.0f, 1.0f, 1.0f,
+    TMAX_MIDTONE_GAMMA, TMAX_TONE_CONTRAST, 1.0f,
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    TMAX_VIGNETTE, TMAX_GRAIN, 0.0f,
+    TMAX_USM_AMOUNT, TMAX_USM_SIGMA,
+    false, false, true,
+    1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+    TMAX_MONO_R, TMAX_MONO_G, TMAX_MONO_B },
+};
+
+// The macros below are the hot-loop names the existing pipeline already uses;
+// they now resolve to the active look, so selecting a look costs one pointer
+// assignment rather than a second copy of the pipeline.
+static const FilmLookParams* gFilm = &FILM_LOOKS[FILTER_DEFAULT_LOOK];
+#define FILM_AUTO_BALANCE   (gFilm->autoBalance)
+#define FILM_AUTO_CONTRAST  (gFilm->autoContrast)
+#define FILM_WB_R           (gFilm->wbR)
+#define FILM_WB_G           (gFilm->wbG)
+#define FILM_WB_B           (gFilm->wbB)
+#define FILM_MIDTONE_GAMMA  (gFilm->midtoneGamma)
+#define FILM_TONE_CONTRAST  (gFilm->toneContrast)
+#define FILM_SATURATION     (gFilm->saturation)
+#define FILM_SHADOW_R       (gFilm->shadowR)
+#define FILM_SHADOW_G       (gFilm->shadowG)
+#define FILM_SHADOW_B       (gFilm->shadowB)
+#define FILM_HIGHLIGHT_R    (gFilm->highlightR)
+#define FILM_HIGHLIGHT_G    (gFilm->highlightG)
+#define FILM_HIGHLIGHT_B    (gFilm->highlightB)
+#define FILM_VIGNETTE       (gFilm->vignette)
+#define FILM_GRAIN          (gFilm->grain)
+#define FILM_VIBRANCE       (gFilm->vibrance)
+#define FILM_USM_AMOUNT     (gFilm->usmAmount)
+#define FILM_USM_SIGMA      (gFilm->usmSigma)
+#define FILM_USM_RAD        ((int)(3.0f * gFilm->usmSigma + 0.999f))
+#define FILM_MONO_R         (gFilm->monoR)
+#define FILM_MONO_G         (gFilm->monoG)
+#define FILM_MONO_B         (gFilm->monoB)
+#define FILM_MAT_RR         (gFilm->matRR)
+#define FILM_MAT_RG         (gFilm->matRG)
+#define FILM_MAT_RB         (gFilm->matRB)
+#define FILM_MAT_GR         (gFilm->matGR)
+#define FILM_MAT_GG         (gFilm->matGG)
+#define FILM_MAT_GB         (gFilm->matGB)
+#define FILM_MAT_BR         (gFilm->matBR)
+#define FILM_MAT_BG         (gFilm->matBG)
+#define FILM_MAT_BB         (gFilm->matBB)
+#define FILM_BORDER         (gFilterBorder)
+
+// Look selection has to keep gFilm in step with gFilterLook. These live after
+// the table so the pointer can be refreshed; the rest of the runtime API is at
+// the top of the file.
+static inline void jpegFilterSetLook(FilterLook look) {
+  if ((unsigned)look < (unsigned)FILTER_LOOK_COUNT) {
+    gFilterLook = look;
+    gFilm = &FILM_LOOKS[look];
+  }
+}
+static inline FilterLook jpegFilterNextLook(void) {
+  gFilterLook = (FilterLook)(((unsigned)gFilterLook + 1u) % FILTER_LOOK_COUNT);
+  gFilm = &FILM_LOOKS[gFilterLook];
+  return gFilterLook;
+}
 
 // ---- lab math helpers ------------------------------------------------------
 
@@ -574,8 +543,7 @@ static float   usmLutContrast[SUPERIA_CSCALE_N];
 // Vibrance needs 1/max(r,g,b); 256 divisions once instead of one per pixel.
 static float   usmLutInvMax[SUPERIA_LUT_N];
 
-static const float filmWbGain[3] = { FILM_WB_R, FILM_WB_G, FILM_WB_B };
-static bool usmLutsReady = false;
+static float filmWbGain[3];
 
 static inline float usmLinearToSrgb(float t) {
   return t <= 0.0031308f ? t * 12.92f
@@ -593,14 +561,21 @@ static void usmBuildWbLut(void) {
 }
 
 static void usmInitLuts(void) {
-  if (usmLutsReady) return;
+  // Rebuilt per capture because the active look can change between shots.
+  // 4x256 table entries is milliseconds against a ~7 s capture, and it keeps
+  // the LUTs from ever describing a look that is no longer selected.
+  filmWbGain[0] = FILM_WB_R;
+  filmWbGain[1] = FILM_WB_G;
+  filmWbGain[2] = FILM_WB_B;
   for (int i = 0; i < SUPERIA_LUT_N; i++) {
     const float t = i / (float)(SUPERIA_LUT_N - 1);
     usmLutToLin[i] = t <= 0.04045f ? t / 12.92f
                                    : powf((t + 0.055f) / 1.055f, 2.4f);
+    usmLutVign[i] = powf(t, 1.2f);
+    usmLutInvMax[i] = i > 0 ? 255.0f / (float)i : 0.0f;
   }
   usmBuildWbLut();
-  // Compile-time conditions: an identity/unwanted curve is never built.
+  // An identity/unwanted curve is skipped, but the decision is now runtime.
   if (FILM_MIDTONE_GAMMA != 1.0f || FILM_TONE_CONTRAST != 0.0f)
     for (int i = 0; i < SUPERIA_LUT_N; i++) {
       const float t = i / (float)(SUPERIA_LUT_N - 1);
@@ -611,15 +586,6 @@ static void usmInitLuts(void) {
       usmLutGamma[i] = v;
       usmLutGammaScale[i] = t > 1e-4f ? v / t : 0.0f;
     }
-  // Vignette needs r^2.4 where r = sqrt(d), so powf(d, 1.2) -- one lookup, no
-  // per-pixel sqrt.
-  if (FILM_VIGNETTE > 0)
-    for (int i = 0; i < SUPERIA_LUT_N; i++)
-      usmLutVign[i] = powf(i / (float)(SUPERIA_LUT_N - 1), 1.2f);
-  if (FILM_VIBRANCE > 0)
-    for (int i = 0; i < SUPERIA_LUT_N; i++)
-      usmLutInvMax[i] = i > 0 ? 255.0f / (float)i : 0.0f;
-  usmLutsReady = true;
 }
 
 // 8-bit indexed lookup; inputs/outputs are quantised far below the 5-bit
@@ -663,6 +629,7 @@ struct UsmLook {
   float gainR, gainG, gainB;
   bool doBalance, doContrast, doWb, doTone, doVign;
   bool doMatrix, doSat, doVibrance, doGrain;
+  bool doGradedTints, doMono;
   float cx, cy, invCxn, invCyn;
 };
 
@@ -704,14 +671,12 @@ static void usmLookRows(const UsmLook& c, int y0, int y1) {
       }
       L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
 
-#if FILM_HAS_MATRIX
       if (c.doMatrix) {
         const float r = f[0], g = f[1], b = f[2];
-        f[0] = KODACHROME_MAT_RR * r + KODACHROME_MAT_RG * g + KODACHROME_MAT_RB * b;
-        f[1] = KODACHROME_MAT_GR * r + KODACHROME_MAT_GG * g + KODACHROME_MAT_GB * b;
-        f[2] = KODACHROME_MAT_BR * r + KODACHROME_MAT_BG * g + KODACHROME_MAT_BB * b;
+        f[0] = FILM_MAT_RR * r + FILM_MAT_RG * g + FILM_MAT_RB * b;
+        f[1] = FILM_MAT_GR * r + FILM_MAT_GG * g + FILM_MAT_GB * b;
+        f[2] = FILM_MAT_BR * r + FILM_MAT_BG * g + FILM_MAT_BB * b;
       }
-#endif
       if (c.doSat) {
         L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
         for (int ch = 0; ch < 3; ch++) f[ch] = L + (f[ch] - L) * FILM_SATURATION;
@@ -722,10 +687,10 @@ static void usmLookRows(const UsmLook& c, int y0, int y1) {
         const float sc = usmLutGammaScale[usmToU8(L * 255.0f)];
         f[0] *= sc; f[1] *= sc; f[2] *= sc;
       }
-#if FILM_TINTS_GRADED
-      // The lab tints read the luma of the graded image, after gamma/contrast.
-      L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
-#endif
+      if (c.doGradedTints) {
+        // The lab tints read the luma of the graded image, after gamma/contrast.
+        L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
+      }
       {
         const float Lc = usmClampF(L, 0.0f, 1.0f);
         const float shw = (1.0f - Lc) * (1.0f - Lc);
@@ -734,14 +699,12 @@ static void usmLookRows(const UsmLook& c, int y0, int y1) {
         f[1] += FILM_SHADOW_G * shw + FILM_HIGHLIGHT_G * hiw;
         f[2] += FILM_SHADOW_B * shw + FILM_HIGHLIGHT_B * hiw;
       }
-#if FILM_MONO
-      // Panchromatic B&W mix; the lab applies it after the tints and before
-      // the optical stages. T-Max's node tint is neutral, so no tint term.
-      {
+      if (c.doMono) {
+        // Panchromatic B&W mix; the lab applies it after the tints and before
+        // the optical stages. T-Max's node tint is neutral, so no tint term.
         const float g = FILM_MONO_R * f[0] + FILM_MONO_G * f[1] + FILM_MONO_B * f[2];
         f[0] = g; f[1] = g; f[2] = g;
       }
-#endif
       if (c.doVign) {
         const float xx = ((float)x - c.cx) * c.invCxn;
         const float d = (xx * xx + yy * yy) * 0.5f;
@@ -956,10 +919,28 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
   *outW = 0;
   *outH = 0;
 
+  // NONE without a border is the only zero-cost path: the camera's JPEG is
+  // written verbatim, with no decode or re-encode.
+  if (gFilterLook == FILTER_LOOK_NONE && !gFilterBorder) {
+    *outW = fb->width;
+    *outH = fb->height;
+    const size_t n = write(arg, fb->buf, fb->len);
+    *written = n;
+    return n == fb->len;
+  }
+
   const uint16_t w = fb->width;
   const uint16_t h = fb->height;
   const size_t n = (size_t)w * (size_t)h;
   if (n == 0) return false;
+
+  // Bordered variants keep the image at native size and grow the frame by this
+  // much on every side. The image is decoded/processed in the leading w*h
+  // pixels, then shifted into the inset just before encoding.
+  const int border = gFilterBorder ? JPEG_FILTER_INSET_PX : 0;
+  const uint16_t fw = (uint16_t)(w + 2 * border);
+  const uint16_t fh = (uint16_t)(h + 2 * border);
+  const size_t canvasBytes = (size_t)fw * (size_t)fh * sizeof(uint16_t);
 
 #if CAPTURE_TIMING
   uint32_t tStage = (uint32_t)micros();
@@ -972,7 +953,6 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
   auto mark = [](uint32_t&) {};
 #endif
 
-  const size_t canvasBytes = n * sizeof(uint16_t);
   uint8_t* canvas = (uint8_t*)ps_malloc(canvasBytes);
   if (!canvas) return false;
 
@@ -983,172 +963,178 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
     return false;
   }
 
-  usmInitLuts();
+  const bool doLook = gFilterLook != FILTER_LOOK_NONE;
+  if (doLook) usmInitLuts();
   mark(gJpegCaptureTiming.decodeMs);
 
   uint16_t* px = (uint16_t*)canvas;
-  const float histPerL = (float)SUPERIA_HIST_N / SUPERIA_HIST_LMAX;
+  if (doLook) {
+    const float histPerL = (float)SUPERIA_HIST_N / SUPERIA_HIST_LMAX;
 
-  // Pass 1: masked colour sums for the auto balance. The lab restricts the
-  // mean to midtone pixels (0.10 < L < 0.90) so shadows/highlights do not
-  // skew the channel gains.
-  uint32_t sumR = 0, sumG = 0, sumB = 0, maskedN = 0;
-  for (size_t i = 0; i < n; i++) {
-    uint8_t rgb[3];
-    usmUnpack565(px[i], rgb);
-    const float L = ((0.2126f * rgb[0]) + (0.7152f * rgb[1]) + (0.0722f * rgb[2])) * USM_INV255;
-    if (L > 0.10f && L < 0.90f) {
-      sumR += rgb[0]; sumG += rgb[1]; sumB += rgb[2];
-      maskedN++;
-    }
-  }
-
-  float gainR = 1.0f, gainG = 1.0f, gainB = 1.0f;
-  if (FILM_AUTO_BALANCE > 0 && maskedN >= 200) {
-    const float mr = sumR / (float)maskedN / 255.0f;
-    const float mg = sumG / (float)maskedN / 255.0f;
-    const float mb = sumB / (float)maskedN / 255.0f;
-    const float target = (mr + mg + mb) / 3.0f;
-    gainR = 1.0f + (target / (mr > 1e-4f ? mr : 1e-4f) - 1.0f) * FILM_AUTO_BALANCE;
-    gainG = 1.0f + (target / (mg > 1e-4f ? mg : 1e-4f) - 1.0f) * FILM_AUTO_BALANCE;
-    gainB = 1.0f + (target / (mb > 1e-4f ? mb : 1e-4f) - 1.0f) * FILM_AUTO_BALANCE;
-  }
-
-  // Pass 2: histogram of the post-balance, pre-WB luma (the lab computes its
-  // contrast percentiles at exactly this stage of its chain).
-  memset(usmHist, 0, sizeof(usmHist));
-  for (size_t i = 0; i < n; i++) {
-    uint8_t rgb[3];
-    usmUnpack565(px[i], rgb);
-    const float L = ((0.2126f * rgb[0] * gainR) + (0.7152f * rgb[1] * gainG)
-                   + (0.0722f * rgb[2] * gainB)) * USM_INV255;
-    int bin = (int)(L * histPerL);
-    if (bin < 0) bin = 0;
-    if (bin > SUPERIA_HIST_N - 1) bin = SUPERIA_HIST_N - 1;
-    usmHist[bin]++;
-  }
-  const uint32_t kLo = (uint32_t)(0.01f * (float)(n - 1));
-  const uint32_t kHi = (uint32_t)(0.99f * (float)(n - 1));
-  float lo = SUPERIA_HIST_LMAX, hi = SUPERIA_HIST_LMAX;
-  uint32_t cum = 0;
-  for (int b = 0; b < SUPERIA_HIST_N; b++) {
-    cum += usmHist[b];
-    if (cum > kLo) { lo = ((float)b + 0.5f) / histPerL; break; }
-  }
-  cum = 0;
-  for (int b = 0; b < SUPERIA_HIST_N; b++) {
-    cum += usmHist[b];
-    if (cum > kHi) { hi = ((float)b + 0.5f) / histPerL; break; }
-  }
-
-  mark(gJpegCaptureTiming.statsMs);
-
-  // Pass 3: the whole look in one per-pixel pass, in lab order. The white
-  // balance is one byte lookup per channel (fused toLin/gain/toSrgb table).
-  const bool doBalance  = (FILM_AUTO_BALANCE > 0) && (maskedN >= 200);
-  const bool doContrast = (FILM_AUTO_CONTRAST > 0) && ((hi - lo) >= 0.02f);
-  const bool doWb       = (FILM_WB_R != 1.0f || FILM_WB_G != 1.0f || FILM_WB_B != 1.0f);
-  const bool doTone     = (FILM_MIDTONE_GAMMA != 1.0f || FILM_TONE_CONTRAST != 0.0f);
-  const bool doVign     = (FILM_VIGNETTE > 0);
-  const bool doMatrix   = FILM_HAS_MATRIX != 0;
-  const bool doSat      = FILM_SATURATION != 1.0f;
-  const bool doVibrance = FILM_VIBRANCE > 0;
-  const bool doGrain    = FILM_GRAIN > 0;
-  const float ac = FILM_AUTO_CONTRAST;
-  const float cx = (float)(w - 1) * 0.5f, cy = (float)(h - 1) * 0.5f;
-  const float cxn = cx > 1.0f ? cx : 1.0f, cyn = cy > 1.0f ? cy : 1.0f;
-  const float invCxn = 1.0f / cxn, invCyn = 1.0f / cyn;
-
-  if (doContrast) {
-    for (int i = 0; i < SUPERIA_CSCALE_N; i++) {
-      const float L = (float)i * USM_INV255;
-      const float t = usmClampF((L - lo) / (hi - lo), 0.0f, 1.0f);
-      const float s = 0.015f + t * (0.960f - 0.015f);
-      usmLutContrast[i] = L > 1e-4f ? (L + (s - L) * ac) / L : 1.0f;
-    }
-  }
-
-  const UsmLook look = { px, w, h, gainR, gainG, gainB,
-                         doBalance, doContrast, doWb, doTone, doVign,
-                         doMatrix, doSat, doVibrance, doGrain,
-                         cx, cy, invCxn, invCyn };
-  usmLookRows(look, 0, h);
-  mark(gJpegCaptureTiming.lookMs);
-
-  // ---- sharpen: separable gaussian unsharp per channel ----------------------
-  // A full-frame blur plane would cost another 2.6 MB of PSRAM, and the first
-  // implementation kept a ~0.67 MB banded temp buffer instead -- which pushed
-  // peak allocation to ~3.6 MB, past what the ESP32-CAM's PSRAM actually
-  // answers, and the captures came out as block-garbage colour chaos. So the
-  // blur now keeps only the vertical kernel window: 2*rad+1 horizontally-blurred
-  // rows (61 KB at SXGA, rad = 3) in a ring. Row y is unsharpened against rows
-  // y-rad..y+rad of that ring -- identical math to the full-frame separable
-  // gaussian with edge replication, without the second plane.
-  //
-  // The ring lives in internal DRAM, not PSRAM: the vertical pass streams
-  // 2*rad+1 rows per output row, and in PSRAM that was ~110 MB of bus traffic
-  // per shot -- 13 s of the capture. Internal SRAM answers it without touching
-  // the SPI bus. The ring is statically sized for the default sigma; a wider
-  // frame or kernel falls back to the heap.
-  //
-  // The taps are integer Q8, not float. On this core a float MAC is a
-  // dependent `madd.s` chain with ~10 cycle latency and `/ 64.0f` costs a
-  // __divsf3 call, while `mull` + add pipelines; the rows are already
-  // quantised to 8 bits, so nothing is lost beyond 1 LSB of blur rounding.
-
-  if (FILM_USM_AMOUNT > 0 && FILM_USM_SIGMA > 0) {
-    int rad = FILM_USM_RAD;
-    if (rad < 1) rad = 1;
-    if (rad > 8) rad = 8;  // the switch below instantiates radii 1..8
-
-    // Q8 weights normalised to sum exactly 256, so the blur is mean-preserving
-    // and the tails survive rounding (Q6 zeroed them: 0.011 * 64 < 0.5).
-    float kernF[SUPERIA_USM_MAX_RADIUS * 2 + 1];
-    float ksum = 0.0f;
-    for (int d = -rad; d <= rad; d++) {
-      const float v = expf(-0.5f * (float)(d * d) * (1.0f / (FILM_USM_SIGMA * FILM_USM_SIGMA)));
-      kernF[d + rad] = v;
-      ksum += v;
-    }
-    int kern[SUPERIA_USM_MAX_RADIUS * 2 + 1];
-    int ksumQ8 = 0;
-    for (int d = 0; d < 2 * rad + 1; d++) {
-      kern[d] = (int)(kernF[d] * (256.0f / ksum) + 0.5f);
-      ksumQ8 += kern[d];
-    }
-    kern[rad] += 256 - ksumQ8;
-    const int amountQ8 = (int)(FILM_USM_AMOUNT * 256.0f + 0.5f);
-
-    const int slots = usmSlotsPerGroup(rad);
-    const bool heapRing =
-        (w > SUPERIA_USM_RING_W) || (slots > USM_SLOTS_PER_GROUP);
-    const bool heapRow = (w > SUPERIA_USM_RING_W);
-    int16_t* ring = heapRing
-        ? (int16_t*)ps_malloc(3u * (size_t)w * (size_t)slots * sizeof(int16_t))
-        : usmRing;
-    uint8_t* row8 = heapRow ? (uint8_t*)ps_malloc(3u * (size_t)w) : usmRow8;
-    if (!ring || !row8) {
-      if (heapRing && ring) free(ring);
-      if (heapRow && row8) free(row8);
-      free(canvas);
-      return false;
+    // Pass 1: masked colour sums for the auto balance. The lab restricts the
+    // mean to midtone pixels (0.10 < L < 0.90) so shadows/highlights do not
+    // skew the channel gains.
+    uint32_t sumR = 0, sumG = 0, sumB = 0, maskedN = 0;
+    for (size_t i = 0; i < n; i++) {
+      uint8_t rgb[3];
+      usmUnpack565(px[i], rgb);
+      const float L = ((0.2126f * rgb[0]) + (0.7152f * rgb[1]) + (0.0722f * rgb[2])) * USM_INV255;
+      if (L > 0.10f && L < 0.90f) {
+        sumR += rgb[0]; sumG += rgb[1]; sumB += rgb[2];
+        maskedN++;
+      }
     }
 
-    switch (rad) {
-      case 1: usmSharpenT<1>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
-      case 2: usmSharpenT<2>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
-      case 3: usmSharpenT<3>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
-      case 4: usmSharpenT<4>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
-      case 5: usmSharpenT<5>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
-      case 6: usmSharpenT<6>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
-      case 7: usmSharpenT<7>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
-      default: usmSharpenT<8>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+    float gainR = 1.0f, gainG = 1.0f, gainB = 1.0f;
+    if (FILM_AUTO_BALANCE > 0 && maskedN >= 200) {
+      const float mr = sumR / (float)maskedN / 255.0f;
+      const float mg = sumG / (float)maskedN / 255.0f;
+      const float mb = sumB / (float)maskedN / 255.0f;
+      const float target = (mr + mg + mb) / 3.0f;
+      gainR = 1.0f + (target / (mr > 1e-4f ? mr : 1e-4f) - 1.0f) * FILM_AUTO_BALANCE;
+      gainG = 1.0f + (target / (mg > 1e-4f ? mg : 1e-4f) - 1.0f) * FILM_AUTO_BALANCE;
+      gainB = 1.0f + (target / (mb > 1e-4f ? mb : 1e-4f) - 1.0f) * FILM_AUTO_BALANCE;
     }
-    if (heapRing) free(ring);
-    if (heapRow) free(row8);
-  }
 
-  mark(gJpegCaptureTiming.sharpenMs);
+    // Pass 2: histogram of the post-balance, pre-WB luma (the lab computes its
+    // contrast percentiles at exactly this stage of its chain).
+    memset(usmHist, 0, sizeof(usmHist));
+    for (size_t i = 0; i < n; i++) {
+      uint8_t rgb[3];
+      usmUnpack565(px[i], rgb);
+      const float L = ((0.2126f * rgb[0] * gainR) + (0.7152f * rgb[1] * gainG)
+                     + (0.0722f * rgb[2] * gainB)) * USM_INV255;
+      int bin = (int)(L * histPerL);
+      if (bin < 0) bin = 0;
+      if (bin > SUPERIA_HIST_N - 1) bin = SUPERIA_HIST_N - 1;
+      usmHist[bin]++;
+    }
+    const uint32_t kLo = (uint32_t)(0.01f * (float)(n - 1));
+    const uint32_t kHi = (uint32_t)(0.99f * (float)(n - 1));
+    float lo = SUPERIA_HIST_LMAX, hi = SUPERIA_HIST_LMAX;
+    uint32_t cum = 0;
+    for (int b = 0; b < SUPERIA_HIST_N; b++) {
+      cum += usmHist[b];
+      if (cum > kLo) { lo = ((float)b + 0.5f) / histPerL; break; }
+    }
+    cum = 0;
+    for (int b = 0; b < SUPERIA_HIST_N; b++) {
+      cum += usmHist[b];
+      if (cum > kHi) { hi = ((float)b + 0.5f) / histPerL; break; }
+    }
+
+    mark(gJpegCaptureTiming.statsMs);
+
+    // Pass 3: the whole look in one per-pixel pass, in lab order. The white
+    // balance is one byte lookup per channel (fused toLin/gain/toSrgb table).
+    const bool doBalance  = (FILM_AUTO_BALANCE > 0) && (maskedN >= 200);
+    const bool doContrast = (FILM_AUTO_CONTRAST > 0) && ((hi - lo) >= 0.02f);
+    const bool doWb       = (FILM_WB_R != 1.0f || FILM_WB_G != 1.0f || FILM_WB_B != 1.0f);
+    const bool doTone     = (FILM_MIDTONE_GAMMA != 1.0f || FILM_TONE_CONTRAST != 0.0f);
+    const bool doVign     = (FILM_VIGNETTE > 0);
+    const bool doMatrix   = gFilm->hasMatrix;
+    const bool doSat      = (FILM_SATURATION != 1.0f);
+    const bool doVibrance = FILM_VIBRANCE > 0;
+    const bool doGrain    = FILM_GRAIN > 0;
+    const bool doGradedTints = gFilm->gradedTints;
+    const bool doMono     = gFilm->mono;
+    const float ac = FILM_AUTO_CONTRAST;
+    const float cx = (float)(w - 1) * 0.5f, cy = (float)(h - 1) * 0.5f;
+    const float cxn = cx > 1.0f ? cx : 1.0f, cyn = cy > 1.0f ? cy : 1.0f;
+    const float invCxn = 1.0f / cxn, invCyn = 1.0f / cyn;
+
+    if (doContrast) {
+      for (int i = 0; i < SUPERIA_CSCALE_N; i++) {
+        const float L = (float)i * USM_INV255;
+        const float t = usmClampF((L - lo) / (hi - lo), 0.0f, 1.0f);
+        const float s = 0.015f + t * (0.960f - 0.015f);
+        usmLutContrast[i] = L > 1e-4f ? (L + (s - L) * ac) / L : 1.0f;
+      }
+    }
+
+    const UsmLook look = { px, w, h, gainR, gainG, gainB,
+                           doBalance, doContrast, doWb, doTone, doVign,
+                           doMatrix, doSat, doVibrance, doGrain,
+                           doGradedTints, doMono,
+                           cx, cy, invCxn, invCyn };
+    usmLookRows(look, 0, h);
+    mark(gJpegCaptureTiming.lookMs);
+
+    // ---- sharpen: separable gaussian unsharp per channel ----------------------
+    // A full-frame blur plane would cost another 2.6 MB of PSRAM, and the first
+    // implementation kept a ~0.67 MB banded temp buffer instead -- which pushed
+    // peak allocation to ~3.6 MB, past what the ESP32-CAM's PSRAM actually
+    // answers, and the captures came out as block-garbage colour chaos. So the
+    // blur now keeps only the vertical kernel window: 2*rad+1 horizontally-blurred
+    // rows (61 KB at SXGA, rad = 3) in a ring. Row y is unsharpened against rows
+    // y-rad..y+rad of that ring -- identical math to the full-frame separable
+    // gaussian with edge replication, without the second plane.
+    //
+    // The ring lives in internal DRAM, not PSRAM: the vertical pass streams
+    // 2*rad+1 rows per output row, and in PSRAM that was ~110 MB of bus traffic
+    // per shot -- 13 s of the capture. Internal SRAM answers it without touching
+    // the SPI bus. The ring is statically sized for the default sigma; a wider
+    // frame or kernel falls back to the heap.
+    //
+    // The taps are integer Q8, not float. On this core a float MAC is a
+    // dependent `madd.s` chain with ~10 cycle latency and `/ 64.0f` costs a
+    // __divsf3 call, while `mull` + add pipelines; the rows are already
+    // quantised to 8 bits, so nothing is lost beyond 1 LSB of blur rounding.
+
+    if (FILM_USM_AMOUNT > 0 && FILM_USM_SIGMA > 0) {
+      int rad = FILM_USM_RAD;
+      if (rad < 1) rad = 1;
+      if (rad > 8) rad = 8;  // the switch below instantiates radii 1..8
+
+      // Q8 weights normalised to sum exactly 256, so the blur is mean-preserving
+      // and the tails survive rounding (Q6 zeroed them: 0.011 * 64 < 0.5).
+      float kernF[SUPERIA_USM_MAX_RADIUS * 2 + 1];
+      float ksum = 0.0f;
+      for (int d = -rad; d <= rad; d++) {
+        const float v = expf(-0.5f * (float)(d * d) * (1.0f / (FILM_USM_SIGMA * FILM_USM_SIGMA)));
+        kernF[d + rad] = v;
+        ksum += v;
+      }
+      int kern[SUPERIA_USM_MAX_RADIUS * 2 + 1];
+      int ksumQ8 = 0;
+      for (int d = 0; d < 2 * rad + 1; d++) {
+        kern[d] = (int)(kernF[d] * (256.0f / ksum) + 0.5f);
+        ksumQ8 += kern[d];
+      }
+      kern[rad] += 256 - ksumQ8;
+      const int amountQ8 = (int)(FILM_USM_AMOUNT * 256.0f + 0.5f);
+
+      const int slots = usmSlotsPerGroup(rad);
+      const bool heapRing =
+          (w > SUPERIA_USM_RING_W) || (slots > USM_SLOTS_PER_GROUP);
+      const bool heapRow = (w > SUPERIA_USM_RING_W);
+      int16_t* ring = heapRing
+          ? (int16_t*)ps_malloc(3u * (size_t)w * (size_t)slots * sizeof(int16_t))
+          : usmRing;
+      uint8_t* row8 = heapRow ? (uint8_t*)ps_malloc(3u * (size_t)w) : usmRow8;
+      if (!ring || !row8) {
+        if (heapRing && ring) free(ring);
+        if (heapRow && row8) free(row8);
+        free(canvas);
+        return false;
+      }
+
+      switch (rad) {
+        case 1: usmSharpenT<1>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+        case 2: usmSharpenT<2>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+        case 3: usmSharpenT<3>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+        case 4: usmSharpenT<4>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+        case 5: usmSharpenT<5>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+        case 6: usmSharpenT<6>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+        case 7: usmSharpenT<7>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+        default: usmSharpenT<8>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+      }
+      if (heapRing) free(ring);
+      if (heapRow) free(row8);
+    }
+
+    mark(gJpegCaptureTiming.sharpenMs);
+  }  // doLook
 
   // ---- encode ----------------------------------------------------------------
 
@@ -1161,18 +1147,37 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
     px[i] = (uint16_t)((px[i] >> 8) | (px[i] << 8));
   }
 
+  // Final node: preserve the image and add the white frame around it. Rows
+  // move bottom-up (destination is always below the source) so no unread image
+  // row is overwritten. 0xFFFF is white in either byte order.
+  if (border > 0) {
+    for (int y = (int)h - 1; y >= 0; y--) {
+      memmove(px + (size_t)(y + border) * fw + border,
+              px + (size_t)y * w,
+              (size_t)w * sizeof(uint16_t));
+    }
+    const size_t rowBytes = (size_t)fw * sizeof(uint16_t);
+    for (int y = 0; y < border; y++) {
+      memset(px + (size_t)y * fw, 0xFF, rowBytes);
+      memset(px + (size_t)(fh - 1 - y) * fw, 0xFF, rowBytes);
+    }
+    for (int y = border; y < (int)fh - border; y++) {
+      uint16_t* row = px + (size_t)y * fw;
+      for (int x = 0; x < border; x++) {
+        row[x] = 0xFFFF;
+        row[fw - 1 - x] = 0xFFFF;
+      }
+    }
+  }
+
   FilmJpgOutCtx out = { write, arg, 0, false };
-  const bool encoded = fmt2jpg_cb(canvas, canvasBytes, w, h, PIXFORMAT_RGB565,
+  const bool encoded = fmt2jpg_cb(canvas, canvasBytes, fw, fh, PIXFORMAT_RGB565,
                                   quality, filmJpgOutCb, &out);
   free(canvas);
   mark(gJpegCaptureTiming.encodeMs);
 
   *written = out.written;
-  *outW = w;
-  *outH = h;
+  *outW = fw;
+  *outH = fh;
   return encoded && !out.failed && out.written > 0;
 }
-
-#else
-#error "JPEG_FILTER must be JPEG_FILTER_NONE, JPEG_FILTER_WHITE_BORDER, JPEG_FILTER_SUPERIA_USM, JPEG_FILTER_KODACHROME_USM or JPEG_FILTER_TMAX_USM"
-#endif

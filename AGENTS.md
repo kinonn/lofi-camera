@@ -40,7 +40,8 @@ changing firmware.
   re-init the sensor to take a photo: AWB/AEC settle is what produced the
   washed-out shots, and it costs ~1.1 s per capture.
 - Keep preview and capture independent: `PREVIEW_MODE` only affects the OLED,
-  `JPEG_FILTER` only affects the SD file. Neither may change the other's output.
+  the runtime look/border selection only affects the SD file. Neither may
+  change the other's output.
 - SD writes stream through `JpegWriteFn`; keep the encoded JPEG out of RAM
   (peak PSRAM is ~3.2 MB of 8 MB and depends on it).
 - No per-frame or per-shot heap allocation. Use `static`/file-scope buffers
@@ -68,9 +69,10 @@ New preview mode: add `src/preview_<name>.h` exposing
 only maps `PreviewFrame::px` (already aspect-fit, letterboxed and grayscale) onto
 the panel — it must not clear the display or call `display()`.
 
-New JPEG filter: add a `JPEG_FILTER_*` id and an `#elif` branch in
-`src/jpeg_filter.h` implementing `jpegFilterStream()` (push bytes to the sink,
-never buffer the JPEG) plus an honest `jpegFilterWorstCaseBytes()` bound, which
+New JPEG look: add a `FilterLook` value, a `FilmLookParams` entry in
+`FILM_LOOKS`, and a name in `jpegFilterLookName()` in `src/jpeg_filter.h`. The
+shared pipeline and border stage apply automatically; keep the output streaming
+(never buffer the JPEG) and keep `jpegFilterWorstCaseBytes()` honest, because it
 backs the pre-write free-space check.
 
 ## Porting film looks

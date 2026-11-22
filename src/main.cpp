@@ -1,7 +1,10 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <Preferences.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include "driver/gpio.h"
+#include "esp_timer.h"
 #include "esp_camera.h"
 #include "SD_MMC.h"
 #include "FS.h"
@@ -23,7 +26,8 @@
 //     HIGH), GPIO4-13/15-18 (camera), GPIO19/20 (USB D-/D+),
 //     GPIO26-37 (in-package flash + octal PSRAM), GPIO38/39/40 (SD),
 //     GPIO43/44 (UART0), GPIO45/46 (strapping; 45 is not on the header).
-//   Free header pins: 1, 14, 47, 48 (left header).
+//   Free header pins: 1, 14, 47, 48 (left header). GPIO14 is the filter
+//   button; 1, 47 and 48 remain unused.
 //   Wiring (use silkscreen labels on the header):
 //   OLED SDA -> IO41, OLED SCL -> IO42, VCC -> 3V3, GND -> GND.
 //     Both sit on the right-hand header; 41/42 are the JTAG MTDI/MTMS pins,
@@ -31,10 +35,25 @@
 //   Button: the onboard BOOT button (GPIO0, 10k pull-up) is the shutter.
 //     GPIO0 is sampled only at reset; pressing it at runtime is just a GPIO
 //     read. Holding it through a reset enters ROM download mode.
+//   Filter button: GPIO14 -> GND, internal pull-up. Short press cycles the
+//     look; long press toggles the preserving white border. GPIO14 is not a
+//     strapping pin, so a held button cannot affect boot.
 //   SD card: FAT32 microSD in the onboard slot.
 #define OLED_SDA 41
 #define OLED_SCL 42
 #define BUTTON_PIN 0
+#ifndef FILTER_BUTTON_PIN
+#define FILTER_BUTTON_PIN 14
+#endif
+#ifndef FILTER_LONG_PRESS_MS
+#define FILTER_LONG_PRESS_MS 700
+#endif
+#ifndef FILTER_DEBOUNCE_MS
+#define FILTER_DEBOUNCE_MS 30
+#endif
+#ifndef FILTER_TOAST_MS
+#define FILTER_TOAST_MS 1500
+#endif
 #define OLED_ADDR 0x3C
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -96,6 +115,27 @@ unsigned long lastFpsT = 0;
 bool sdReady = false;
 bool oledReady = false;
 bool btnPrev = true;  // pull-up idle HIGH
+
+// Runtime filter selection lives in NVS so the last look/border survives a
+// reboot. The defaults match the checked-in build (T-Max, no border).
+#define PREFS_NAMESPACE "lofi"
+#define PREFS_KEY_LOOK "look"
+#define PREFS_KEY_BORDER "border"
+static Preferences prefs;
+static bool prefsReady = false;
+
+// Filter button edge capture. The main loop blocks on camera frames (~5 fps),
+// so polling GPIO14 there would miss a normal tap; the ISR records the press
+// duration and the loop drains the resulting counters. Counters (not a single
+// event slot) keep presses that arrive during a capture or an SD wait.
+static volatile bool filterBtnLevel = true;
+static volatile bool filterBtnPressed = false;
+static volatile uint32_t filterBtnEdgeMs = 0;
+static volatile uint32_t filterBtnPressMs = 0;
+static volatile uint8_t filterBtnShortCount = 0;
+static volatile uint8_t filterBtnLongCount = 0;
+static unsigned long filterToastUntil = 0;
+
 static unsigned int lastPhotoIdx = 0;
 unsigned long lastBtnT = 0;
 int sdFailStreak = 0;
@@ -113,6 +153,82 @@ void showText(const char* l1, const char* l2 = nullptr, const char* l3 = nullptr
   if (l2) display.println(l2);
   if (l3) display.println(l3);
   display.display();
+}
+
+// Load the persisted look/border once, then save only when the button changes
+// them. NVS is independent of the SD card, so a missing card cannot lose the
+// selection.
+static void loadFilterSelection(void) {
+  prefsReady = prefs.begin(PREFS_NAMESPACE, false);
+  if (!prefsReady) {
+    DBG("NVS unavailable -- filter defaults stay active\n");
+    return;
+  }
+  uint8_t look = prefs.getUChar(PREFS_KEY_LOOK, (uint8_t)FILTER_DEFAULT_LOOK);
+  if (look >= FILTER_LOOK_COUNT) look = FILTER_DEFAULT_LOOK;
+  jpegFilterSetLook((FilterLook)look);
+  jpegFilterSetBorder(prefs.getBool(PREFS_KEY_BORDER, FILTER_DEFAULT_BORDER));
+  DBG("Filter restored: %s, border %s\n", jpegFilterLookName(jpegFilterGetLook()),
+      jpegFilterGetBorder() ? "on" : "off");
+}
+
+static void saveFilterSelection(void) {
+  if (!prefsReady) return;
+  prefs.putUChar(PREFS_KEY_LOOK, (uint8_t)jpegFilterGetLook());
+  prefs.putBool(PREFS_KEY_BORDER, jpegFilterGetBorder());
+}
+
+static void applyFilterEvents(uint8_t shortCount, uint8_t longCount) {
+  if (!shortCount && !longCount) return;
+
+  const uint8_t steps = (uint8_t)(shortCount % FILTER_LOOK_COUNT);
+  for (uint8_t i = 0; i < steps; i++) jpegFilterNextLook();
+  if (longCount & 1u) jpegFilterToggleBorder();
+  saveFilterSelection();
+
+  char line[32];
+  if (jpegFilterGetLook() == FILTER_LOOK_NONE && jpegFilterGetBorder()) {
+    snprintf(line, sizeof(line), "Filter: With border");
+  } else {
+    snprintf(line, sizeof(line), "Filter: %s",
+             jpegFilterLookName(jpegFilterGetLook()));
+  }
+  showText(line, jpegFilterGetBorder() ? "Border: on" : "Border: off");
+  // Do not block here: the shutter and SD probe must keep running. The loop
+  // suppresses preview frames until this deadline so the toast stays visible.
+  filterToastUntil = millis() + FILTER_TOAST_MS;
+}
+
+// GPIO14 is active-low with the internal pull-up. Capture both edges and
+// classify the press on release: a long hold toggles the border, a tap moves
+// to the next look. gpio_get_level/esp_timer_get_time are ISR-safe in this
+// build. Presses are counted so a capture or SD wait cannot drop them.
+static void IRAM_ATTR filterButtonIsr(void) {
+  const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+  const bool level = gpio_get_level((gpio_num_t)FILTER_BUTTON_PIN) != 0;
+
+  if (now - filterBtnEdgeMs < FILTER_DEBOUNCE_MS) {
+    // Still latch the raw level: a release inside the debounce window must not
+    // leave the state machine stuck "pressed" for the next real press.
+    filterBtnLevel = level;
+    return;
+  }
+  filterBtnEdgeMs = now;
+
+  if (!level && filterBtnLevel) {
+    filterBtnPressMs = now;
+    filterBtnPressed = true;
+  } else if (level && !filterBtnLevel) {
+    if (filterBtnPressed) {
+      if (now - filterBtnPressMs >= FILTER_LONG_PRESS_MS) {
+        if (filterBtnLongCount != 255) filterBtnLongCount++;
+      } else {
+        if (filterBtnShortCount != 255) filterBtnShortCount++;
+      }
+      filterBtnPressed = false;
+    }
+  }
+  filterBtnLevel = level;
 }
 
 // Short name for why the chip last restarted. A repeated panic and a brownout
@@ -514,8 +630,8 @@ PhotoResult captureStill(char* name, size_t nameLen) {
   } else {
     // The pipeline streams its output straight into the file, so the encoded
     // JPEG is never held in RAM -- peak PSRAM stays well inside the 8 MB
-    // module. With JPEG_FILTER_NONE this is a single write of the camera
-    // buffer, with no decode or re-encode at all.
+    // module. With look NONE and no border this is a single write of the
+    // camera buffer, with no decode or re-encode at all.
     char path[24];
     if (!nextPhotoPath(path, sizeof(path))) {
       DBG("Photo index exhausted\n");
@@ -721,6 +837,20 @@ void setup() {
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
+  // Filter button: active-low momentary to GND on GPIO14. Attach the ISR
+  // before the SD wait so a press during that wait is queued and applied once
+  // the main loop resumes.
+  pinMode(FILTER_BUTTON_PIN, INPUT_PULLUP);
+  filterBtnLevel = gpio_get_level((gpio_num_t)FILTER_BUTTON_PIN) != 0;
+  if (!filterBtnLevel) {
+    // Button already held at boot: measure its release from now, not from 0.
+    filterBtnPressed = true;
+    filterBtnPressMs = (uint32_t)(esp_timer_get_time() / 1000);
+  }
+  attachInterrupt(digitalPinToInterrupt(FILTER_BUTTON_PIN), filterButtonIsr,
+                  CHANGE);
+  loadFilterSelection();
+
   // ---- SD card is required: block here until one is inserted ----
   waitForSD();
 
@@ -736,6 +866,17 @@ void setup() {
 }
 
 void loop() {
+  // Drain all filter-button events before reading the shutter. Applying the
+  // net effect (short presses mod the look count, long presses toggle parity)
+  // keeps two taps during a capture from being collapsed into one.
+  noInterrupts();
+  const uint8_t shortCount = filterBtnShortCount;
+  const uint8_t longCount = filterBtnLongCount;
+  filterBtnShortCount = 0;
+  filterBtnLongCount = 0;
+  interrupts();
+  if (shortCount || longCount) applyFilterEvents(shortCount, longCount);
+
   bool btn = digitalRead(BUTTON_PIN);
   unsigned long now = millis();
 
@@ -769,5 +910,12 @@ void loop() {
     btn = digitalRead(BUTTON_PIN);
   }
   btnPrev = btn;
+
+  // Hold the toast on screen without blocking: the shutter and SD probe above
+  // still run, so a quick shutter tap during the toast is not lost.
+  if ((long)(millis() - filterToastUntil) < 0) {
+    delay(10);
+    return;
+  }
   streamFrame();
 }

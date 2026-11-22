@@ -3,20 +3,15 @@
 // src/jpeg_filter.h calls, implemented with stb so the REAL firmware filter
 // code runs unmodified on a Linux host.
 //
-// Byte order: the look filters' usmUnpack565() expects the decoder canvas in
-// native little-endian standard R5G6B5, then swaps once before encoding so
+// Byte order: the firmware pipeline expects the decoder canvas in native
+// little-endian standard R5G6B5, then swaps once before encoding so
 // fmt2jpg_cb() (which reads RGB565 big-endian) sees the right channels. This
 // stub mirrors that: decode writes the little-endian value unswapped, the
 // caller's final swap produces big-endian bytes, and fmt2jpg_cb() reads them
-// back big-endian. Building with JPEG_FILTER_SWAP565=1 here would swap the
-// decode side twice and scramble every channel, so the test builds with 0
-// (the flag only matters to the WHITE_BORDER filter, which does not unpack).
+// back big-endian. Do not enable the legacy SWAP565 stub switch; the firmware
+// now performs that swap unconditionally (including WITH_BORDER).
 #include "esp_camera.h"
 #include "esp_jpg_decode.h"
-
-#ifndef JPEG_FILTER_SWAP565
-#define JPEG_FILTER_SWAP565 0
-#endif
 
 #define STBI_ONLY_JPEG
 #define STB_IMAGE_IMPLEMENTATION
@@ -27,17 +22,12 @@
 typedef size_t (*jpg_out_cb)(void *arg, size_t index, const void *data, size_t len);
 
 // Decode JPEG -> u16 canvas, packed + stored bytes exactly like the device:
-// truncate to 5/6/5 (no bit replication), then byte-swap if the firmware is
-// built with SWAP565 so the canvas matches the device's big-endian layout.
+// truncate to 5/6/5 (no bit replication); the firmware does its own final
+// swap before fmt2jpg_cb().
 static inline uint16_t stub565Pack(const uint8_t *rgb) {
-  const uint16_t v = (uint16_t)(((unsigned)(rgb[0] >> 3) << 11)
-                              | ((unsigned)(rgb[1] >> 2) << 5)
-                              | (unsigned)(rgb[2] >> 3));
-#if JPEG_FILTER_SWAP565
-  return (uint16_t)((v << 8) | (v >> 8));
-#else
-  return v;
-#endif
+  return (uint16_t)(((unsigned)(rgb[0] >> 3) << 11)
+                  | ((unsigned)(rgb[1] >> 2) << 5)
+                  | (unsigned)(rgb[2] >> 3));
 }
 
 static inline bool jpg2rgb565(const uint8_t *src, size_t src_len, uint8_t *out,
