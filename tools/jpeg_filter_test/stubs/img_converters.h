@@ -3,13 +3,14 @@
 // src/jpeg_filter.h calls, implemented with stb so the REAL firmware filter
 // code runs unmodified on a Linux host.
 //
-// Byte order: mirrors the device story -- the on-device JPEG decoder
-// (esp_new_jpeg) writes RGB565 big-endian into the canvas
-// (to_bmp.c: esp_jpeg_decode with swap_color_bytes=0), and the re-encoder
-// reads it back the same way (to_jpg.cpp: rgb565_big_endian=true). That is
-// why the firmware runs with JPEG_FILTER_SWAP565=1 and why the stub applies
-// the same conditional byte swap the firmware's usmPack/usmUnpack apply:
-// with SWAP=1 the whole chain is coherent again.
+// Byte order: the look filters' usmUnpack565() expects the decoder canvas in
+// native little-endian standard R5G6B5, then swaps once before encoding so
+// fmt2jpg_cb() (which reads RGB565 big-endian) sees the right channels. This
+// stub mirrors that: decode writes the little-endian value unswapped, the
+// caller's final swap produces big-endian bytes, and fmt2jpg_cb() reads them
+// back big-endian. Building with JPEG_FILTER_SWAP565=1 here would swap the
+// decode side twice and scramble every channel, so the test builds with 0
+// (the flag only matters to the WHITE_BORDER filter, which does not unpack).
 #include "esp_camera.h"
 #include "esp_jpg_decode.h"
 

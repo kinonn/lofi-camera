@@ -36,7 +36,7 @@ uv pip install --python .venv\Scripts\python.exe -r tools\film_lab\requirements.
 .venv\Scripts\python.exe tools\film_lab\run_film_lab.py --family CF
 
 # a single image, smaller contact sheets for quick browsing
-.venv\Scripts\python.exe tools\film_lab\run_film_lab.py --input test-images/img_0027.jpg --thumb-width 190
+.venv\Scripts\python.exe tools\film_lab\run_film_lab.py --input test-images/img_0134.jpg --thumb-width 190
 ```
 
 Then open `tools/film_lab/out/index.html` — it shows the original next to all
@@ -47,7 +47,7 @@ results per sample photo. Note the **numbers** you like.
 ```
 tools/film_lab/out/
   <filter_slug>/<image>__<filter_slug>.jpg     full-size result, e.g.
-                                               kodak_gold_200/img_0027__kodak_gold_200.jpg
+                                               kodak_gold_200/img_0134__kodak_gold_200.jpg
   contact_sheets/<image>__contact_sheet.jpg    original + all looks, labelled
   index.html                                   gallery
 ```

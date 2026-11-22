@@ -1,15 +1,19 @@
 // Host test driver for the firmware capture filter.
 //
-// Compiles the REAL src/jpeg_filter.h JPEG_FILTER_SUPERIA_USM branch with
-// thin host stubs (stubs/), so what runs here is the device's filter math,
-// its LUTs, its RGB565 canvas and its byte order -- not a reimplementation.
+// Compiles the REAL src/jpeg_filter.h branch with thin host stubs (stubs/), so
+// what runs here is the device's filter math, its LUTs, its RGB565 canvas and
+// its byte order -- not a reimplementation.
 //
+// FILTER_KIND selects the look:
+//   0  Superia 400   (JPEG_FILTER_SUPERIA_USM)
+//   1  Kodachrome 64 (JPEG_FILTER_KODACHROME_USM)
+//   2  T-Max 400     (JPEG_FILTER_TMAX_USM)
 // FILTER_MODE selects which part of the chain is active, by the same -D
 // macros the firmware exposes (see platformio.ini):
-//   0  as shipped            Superia 400 look + USM sharpen
-//   1  Superia look only     -DSUPERIA_USM_AMOUNT=0
+//   0  as shipped            look + USM sharpen
+//   1  look only             -D..._USM_AMOUNT=0 (Superia)
 //   2  USM only              balance/contrast/WB/gamma/tint/vignette switched
-//                            off by zeroing their macros
+//                            off by zeroing their macros (Superia)
 //
 // Usage: host_test <in.jpg> <out.jpg> [quality]
 // quality applies to the re-encode like on device -- default 10, the
@@ -23,7 +27,16 @@
 #ifndef FILTER_MODE
 #define FILTER_MODE 0
 #endif
+#ifndef FILTER_KIND
+#define FILTER_KIND 0
+#endif
+#if FILTER_KIND == 1
+#define JPEG_FILTER JPEG_FILTER_KODACHROME_USM
+#elif FILTER_KIND == 2
+#define JPEG_FILTER JPEG_FILTER_TMAX_USM
+#else
 #define JPEG_FILTER JPEG_FILTER_SUPERIA_USM
+#endif
 #if FILTER_MODE == 1
 #define SUPERIA_USM_AMOUNT 0.0f
 #elif FILTER_MODE == 2

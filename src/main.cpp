@@ -138,9 +138,11 @@ static const char* resetReasonStr() {
 // is simply written to the card. That removes ~1.1 s of latency per shot.
 // The trade-off is that the viewfinder must decode each frame (below).
 #define CAM_FRAMESIZE FRAMESIZE_SXGA
-// One frame buffer: halves the PSRAM the stream reserves at SXGA and avoids the
-// double-buffered JPEG path while we are chasing this crash.
-#define CAM_FB_COUNT 1
+// Two frame buffers let the camera fill the next frame while the viewfinder
+// decodes and draws the current one; with one buffer the loop loses a whole
+// sensor frame per iteration. The old ESP32-CAM used one to halve PSRAM use
+// while chasing its crash; the S3 has 8 MB and plenty of headroom.
+#define CAM_FB_COUNT 2
 
 // Fallback ladder. A large JPEG frame needs two PSRAM buffers and not every
 // module -- or supply -- copes with the biggest one. Each entry is tried in
@@ -700,7 +702,9 @@ void setup() {
   delay(200);
 #endif
 
-  Wire.begin(OLED_SDA, OLED_SCL);
+  // 400 kHz is the SSD1306's rated maximum. The full 1 KB frame push costs
+  // ~92 ms at the 100 kHz default, so this is the cheapest preview win by far.
+  Wire.begin(OLED_SDA, OLED_SCL, 400000);
 
   if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR) ||
       display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {

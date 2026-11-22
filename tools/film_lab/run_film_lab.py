@@ -11,7 +11,7 @@ Examples:
     python tools/film_lab/run_film_lab.py                # everything
     python tools/film_lab/run_film_lab.py --list         # show every look
     python tools/film_lab/run_film_lab.py --filters 3 12 kodak_gold_200
-    python tools/film_lab/run_film_lab.py --input test-images/img_0027.jpg
+    python tools/film_lab/run_film_lab.py --input test-images/img_0134.jpg
 """
 
 from __future__ import annotations

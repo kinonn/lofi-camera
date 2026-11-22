@@ -13,7 +13,7 @@ Examples:
     python tools/preview_lab/run_preview_lab.py
     python tools/preview_lab/run_preview_lab.py --list
     python tools/preview_lab/run_preview_lab.py --modes dither
-    python tools/preview_lab/run_preview_lab.py --input test-images/img_0027.jpg
+    python tools/preview_lab/run_preview_lab.py --input test-images/img_0134.jpg
     python tools/preview_lab/run_preview_lab.py --input clip.mp4 --modes photo --photo-alpha 0.8
     python tools/preview_lab/run_preview_lab.py --dither-contrast 130 --blur-passes 2 --low 80 --high 160
 """

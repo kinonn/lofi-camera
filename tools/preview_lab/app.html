@@ -72,6 +72,12 @@
   .output-actions { display:flex; align-items:center; gap:7px; margin:7px 0 4px; }
   .output-actions button { padding:4px 7px; font-size:10px; }
   .copy-status { color:var(--dim); font-size:10px; }
+  .node .body label.output-zoom { display:flex; align-items:center; gap:6px;
+    margin:5px 0; color:var(--dim); font-size:10px; }
+  .node .body label.output-zoom input[type=range] { flex:1; width:auto; min-width:0;
+    margin:0; padding:0; border:none; background:transparent; accent-color:var(--acc); }
+  .node .body label.output-zoom output { min-width:34px; text-align:right;
+    color:var(--txt); font-variant-numeric:tabular-nums; }
   .output-content { padding:0 9px 9px; overflow:auto; }
   .output-content label { display:block; font-size:10px; color:var(--dim); margin:6px 0 3px; }
   .output-content canvas { display:block; image-rendering:pixelated; background:#000;
@@ -131,6 +137,8 @@
    Small image utilities (all Float/Uint8, no dependencies)
    ============================================================ */
 const PANEL_W = 128, PANEL_H = 64;
+// Default on-screen size of an Output result: longest side 640 px, aspect kept.
+const OUTPUT_MAX_DIM = 640;
 
 function clamp255(v){ return v < 0 ? 0 : v > 255 ? 255 : v; }
 
@@ -240,7 +248,8 @@ function vibranceRGB(rgb, amount){
   return out;
 }
 
-// ---- Fuji Superia 400 look: port of the tools/film_lab fuji_superia_400 recipe ----
+// ---- Film-look chain: port of the tools/film_lab shared pipeline ----
+// Each film node passes its own recipe values; inactive stages are skipped.
 const srgbToLin = x => x<=0.04045 ? x/12.92 : Math.pow((x+0.055)/1.055,2.4);
 const linToSrgb = x => { x=Math.max(x,0); return x<=0.0031308 ? x*12.92 : 1.055*Math.pow(x,1/2.4)-0.055; };
 function percentileSorted(sorted,q){
@@ -272,7 +281,7 @@ function stdDev(a){
   let s=0; for(const v of a) s+=(v-m)*(v-m);
   return Math.sqrt(s/a.length);
 }
-function superiaLook(rgb,W,H,p){
+function filmLook(rgb,W,H,p,opts={}){
   const n=W*H, f=new Float32Array(n*3);
   for(let i=0;i<n*3;i++) f[i]=rgb[i]/255;
   const lum=i=>f[i*3]*0.2126+f[i*3+1]*0.7152+f[i*3+2]*0.0722;
@@ -305,23 +314,55 @@ function superiaLook(rgb,W,H,p){
     }
   }
 
-  const wb=[p.wbR,p.wbG,p.wbB];
+  const wb=[p.wbR??1,p.wbG??1,p.wbB??1];
   if(wb.some(g=>g!==1)){
     for(let i=0;i<n*3;i++) f[i]=linToSrgb(srgbToLin(f[i])*wb[i%3]);
   }
 
-  for(let i=0;i<n;i++){
-    const L=lum(i);
-    let v=L;
-    if(p.midtoneGamma!==1) v=Math.pow(Math.min(1,Math.max(0,L)),p.midtoneGamma);
-    scale(i,Math.min(1,Math.max(0,v))/Math.max(L,1e-4));
+  if(opts.matrix){
+    const m=opts.matrix;
+    for(let i=0;i<n;i++){
+      const r=f[i*3], g=f[i*3+1], b=f[i*3+2];
+      f[i*3]  =m[0][0]*r+m[0][1]*g+m[0][2]*b;
+      f[i*3+1]=m[1][0]*r+m[1][1]*g+m[1][2]*b;
+      f[i*3+2]=m[2][0]*r+m[2][1]*g+m[2][2]*b;
+    }
   }
 
-  const sh=[p.shadowR,p.shadowG,p.shadowB], hi=[p.highlightR,p.highlightG,p.highlightB];
+  const saturation=p.saturation??1;
+  if(saturation!==1){
+    for(let i=0;i<n;i++){
+      const L=lum(i);
+      for(let c=0;c<3;c++) f[i*3+c]=L+(f[i*3+c]-L)*saturation;
+    }
+  }
+
+  const gamma=p.midtoneGamma??1, contrast=p.contrast??0;
+  if(gamma!==1 || contrast!==0){
+    for(let i=0;i<n;i++){
+      const L=lum(i);
+      let v=L;
+      if(gamma!==1) v=Math.pow(Math.min(1,Math.max(0,v)),gamma);
+      if(contrast!==0) v=v+contrast*(v*v*(3-2*v)-v);
+      v=Math.min(1,Math.max(0,v));
+      scale(i,v/Math.max(L,1e-4));
+    }
+  }
+
+  const sh=[p.shadowR??0,p.shadowG??0,p.shadowB??0];
+  const hi=[p.highlightR??0,p.highlightG??0,p.highlightB??0];
   if(sh.some(Boolean) || hi.some(Boolean)){
     for(let i=0;i<n;i++){
       const L=Math.min(1,Math.max(0,lum(i)));
       for(let c=0;c<3;c++) f[i*3+c]+=sh[c]*(1-L)*(1-L)+hi[c]*L*L;
+    }
+  }
+
+  if(opts.mono){
+    const {mix,tint}=opts.mono;
+    for(let i=0;i<n;i++){
+      const g=f[i*3]*mix[0]+f[i*3+1]*mix[1]+f[i*3+2]*mix[2];
+      f[i*3]=g+tint[0]; f[i*3+1]=g+tint[1]; f[i*3+2]=g+tint[2];
     }
   }
 
@@ -342,7 +383,7 @@ function superiaLook(rgb,W,H,p){
     const rnd=()=>{ seed=(seed+0x6D2B79F5)|0; let t=Math.imul(seed^(seed>>>15),1|seed); t=(t+Math.imul(t^(t>>>7),61|t))^t; return ((t^(t>>>14))>>>0)/4294967296; };
     const gauss=()=>{ let u=0; while(u===0) u=rnd(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*rnd()); };
     const norm=a=>{ const sd=Math.max(stdDev(a),1e-4); for(let i=0;i<a.length;i++) a[i]/=sd; };
-    const size=Math.max(p.grainSize,0);
+    const size=Math.max(p.grainSize??1,0);
 
     let noise=new Float32Array(n);
     for(let i=0;i<n;i++) noise[i]=gauss();
@@ -546,12 +587,12 @@ function canny(gray,w,h,blurPasses,low,high){
    ============================================================ */
 const DEFS = {
   input:   {title:"Image input", operation:"image_input", group:"source", desc:"upload or sample",
-      params:[{k:"source",label:"source",type:"select",opts:["upload","img_0027","img_0037","img_0038","img_0045","gradient"],def:"img_0027"}],
+      params:[{k:"source",label:"source",type:"select",opts:["upload","img_0134","img_0135","img_0136","img_0141","gradient"],def:"img_0134"}],
             contract:{input:"Decode the selected image to row-major RGB8 triplets at its native size; uploaded files are external artifacts, not embedded in this JSON.",
-              sampleFiles:{img_0027:"test-images/img_0027.jpg",img_0037:"test-images/img_0037.jpg",
-                img_0038:"test-images/img_0038.jpg",img_0045:"test-images/img_0045.jpg"},
+              sampleFiles:{img_0134:"test-images/img_0134.jpg",img_0135:"test-images/img_0135.jpg",
+                img_0136:"test-images/img_0136.jpg",img_0141:"test-images/img_0141.jpg"},
               gradient:"256x160 horizontal 8-bit grayscale ramp expanded to RGB; v = round(x / width * 255)",
-              missingUploadFallback:"try test-images/img_0027.jpg, then use gradient if unavailable",
+              missingUploadFallback:"try test-images/img_0134.jpg, then use gradient if unavailable",
               unavailableSampleFallback:"gradient"},
       hasIn:false, hasOut:true},
   vibrance:{title:"Vibrance", operation:"vibrance", group:"pre", desc:"boosts muted colours",
@@ -577,6 +618,42 @@ const DEFS = {
       contract:{recipe:"tools/film_lab fuji_superia_400",
         stages:["auto_balance", "auto_contrast", "linear white balance", "midtone gamma", "shadow/highlight tint", "vignette", "grain"],
         grainRandomness:"fixed-seed PRNG; values differ from the numpy stream used by the lab"},
+      hasIn:true, hasOut:true},
+  kodachrome:{title:"Kodak Kodachrome 64", operation:"film_look_kodak_kodachrome_64", group:"pre", desc:"warm reds · golden highlights",
+      matrix:[[1.10,-0.04,-0.02],[-0.03,1.00,0.02],[-0.02,0.02,0.99]],
+      params:[{k:"autoBalance",label:"auto balance",type:"number",def:0.62,step:"0.05"},
+        {k:"autoContrast",label:"auto contrast",type:"number",def:0.62,step:"0.05"},
+        {k:"saturation",label:"saturation",type:"number",def:1.24,step:"0.01"},
+        {k:"midtoneGamma",label:"midtone gamma",type:"number",def:0.94,step:"0.01"},
+        {k:"contrast",label:"contrast",type:"number",def:0.60,step:"0.01"},
+        {k:"shadowR",label:"shadow tint R",type:"number",def:-0.004,step:"0.002"},
+        {k:"shadowG",label:"shadow tint G",type:"number",def:0.002,step:"0.002"},
+        {k:"shadowB",label:"shadow tint B",type:"number",def:0.012,step:"0.002"},
+        {k:"highlightR",label:"highlight tint R",type:"number",def:0.046,step:"0.002"},
+        {k:"highlightG",label:"highlight tint G",type:"number",def:0.004,step:"0.002"},
+        {k:"highlightB",label:"highlight tint B",type:"number",def:-0.024,step:"0.002"},
+        {k:"vignette",label:"vignette",type:"number",def:0.10,step:"0.01"},
+        {k:"grain",label:"grain",type:"number",def:0.010,step:"0.001"},
+        {k:"grainSize",label:"grain size",type:"number",def:1.2,step:"0.1"}],
+      contract:{recipe:"tools/film_lab kodak_kodachrome_64",
+        stages:["auto_balance", "auto_contrast", "3x3 colour matrix", "saturation", "midtone gamma", "smoothstep contrast", "shadow/highlight tint", "vignette", "grain"],
+        matrix:[[1.10,-0.04,-0.02],[-0.03,1.00,0.02],[-0.02,0.02,0.99]],
+        grainRandomness:"fixed-seed PRNG; values differ from the numpy stream used by the lab"},
+      hasIn:true, hasOut:true},
+  tmax:    {title:"Kodak T-Max 400", operation:"film_look_kodak_tmax_400", group:"pre", desc:"fine-grain B&W",
+      mono:{mix:[0.30,0.59,0.11],tint:[0,0,0]},
+      params:[{k:"autoBalance",label:"auto balance",type:"number",def:0.70,step:"0.05"},
+        {k:"autoContrast",label:"auto contrast",type:"number",def:0.55,step:"0.05"},
+        {k:"midtoneGamma",label:"midtone gamma",type:"number",def:0.98,step:"0.01"},
+        {k:"contrast",label:"contrast",type:"number",def:0.80,step:"0.01"},
+        {k:"vignette",label:"vignette",type:"number",def:0.3,step:"0.01"},
+        {k:"grain",label:"grain",type:"number",def:0.03,step:"0.001"},
+        {k:"grainSize",label:"grain size",type:"number",def:1.2,step:"0.1"}],
+      contract:{recipe:"Kodak T-Max 400 panchromatic B&W, run through the tools/film_lab shared chain (no film_lab preset yet)",
+        stages:["auto_balance", "auto_contrast", "monochrome mix", "midtone gamma", "smoothstep contrast", "vignette", "grain"],
+        monochromeMix:[0.30,0.59,0.11],
+        contrastControl:"the contrast parameter is the smoothstep blend amount applied after gamma",
+        grainRandomness:"fixed-seed PRNG"},
       hasIn:true, hasOut:true},
   grayscale:{title:"Grayscale", operation:"grayscale", group:"pre", desc:"decodePreviewGray math",
       params:[], contract:{algorithm:"Quantize RGB8 to RGB565, expand channels, then calculate integer Rec.709 luma.",
@@ -667,9 +744,10 @@ const DEFS = {
               thresholds:"strong if magnitude >= high; otherwise weak if magnitude >= low; others suppressed",
               hysteresis:"promote weak pixels connected to a strong pixel by 8-connectivity"},
       hasIn:true, hasOut:true},
-  output:  {title:"Output", operation:"display_output", group:"source", desc:"shows input at its size",
+  output:  {title:"Output", operation:"display_output", group:"source", desc:"zoomable result view",
             params:[], contract:{panel:{width:128,height:64},
         fit:"native size, centred; pixels outside the panel are cropped; unused panel pixels are black",
+              preview:{maxDimension:OUTPUT_MAX_DIM,fit:"results larger than 640 px are shown at 640 px on the longest side; smaller results keep their native size",zoom:"display scale relative to the native result, defaulting to the 640 px fit scale; the canvas and the node resize with it"},
               acceptedData:["image/rgb8-interleaved","image/gray8","image/binary-gray8"]}, hasIn:true, hasOut:false},
 };
 const GROUPS = {source:"pal-source", pre:"pal-pre", dither:"pal-dither", analysis:"pal-analysis"};
@@ -801,7 +879,9 @@ function addNodeRaw(type, x, y, id, params){
   if(type==="output") body += `<div class="output-content">
     <div class="output-actions"><button type="button" data-output="copy-config" disabled>Copy last-run config</button>
       <span class="copy-status" data-output="copy-status" aria-live="polite"></span></div>
-    <label>Result</label><canvas class="output-panel" data-output="panel" hidden></canvas>
+    <label>Result</label>
+    <label class="output-zoom">zoom<input data-k="zoom" type="range" min="0.1" max="4" step="any" value="1"><output data-output="zoom-label">100%</output></label>
+    <canvas class="output-panel" data-output="panel" hidden></canvas>
     <label>Pipeline</label><div class="output-chain" data-output="chain">—</div>
     <div class="output-meta" data-output="meta">Not run</div>
     <div class="output-log" data-output="log" aria-live="polite">Run the pipeline to see a result.</div>
@@ -814,6 +894,7 @@ function addNodeRaw(type, x, y, id, params){
   if(type==="output") el.classList.add("output-node");
   const node = {id, type, def, el, params:{}, bypassed:false};
   for(const p of def.params) node.params[p.k]=(params && p.k in params)?params[p.k]:p.def;
+  if(type==="output") node.params.zoom=(params && "zoom" in params)?params.zoom:1;
   if(params && params._bypassed) { node.bypassed = true; el.classList.add("bypassed"); }
   el.querySelector(".dot").addEventListener("click", e=>{
     e.stopPropagation();
@@ -857,6 +938,7 @@ function addNodeRaw(type, x, y, id, params){
         inp.dataset.historyStarted="true";
       }
       node.params[k]=value;
+      if(node.type==="output" && k==="zoom") updateOutputZoom(node);
     });
   });
   // drag (position changes are history-tracked on release)
@@ -903,6 +985,7 @@ function addNodeRaw(type, x, y, id, params){
       }
     });
   });
+  if(type==="output") updateOutputZoom(node);
   nodes.push(node);
   drawWires();
   return node;
@@ -1037,7 +1120,7 @@ async function loadNodeImage(node){
     return {...image,sourceInfo:{kind:"uploaded_file",fileName:node.file.name,mimeType:node.file.type||null}};
   }
   if(src==="gradient") return {...makeGradient(),sourceInfo:{kind:"generated_gradient"}};
-  const name = {img_0027:"img_0027.jpg",img_0037:"img_0037.jpg",img_0038:"img_0038.jpg",img_0045:"img_0045.jpg"}[src] || "img_0027.jpg";
+  const name = {img_0134:"img_0134.jpg",img_0135:"img_0135.jpg",img_0136:"img_0136.jpg",img_0141:"img_0141.jpg"}[src] || "img_0134.jpg";
   // try repo-relative test-images first, then lab out/ as fallback
   const urls = [`../../test-images/${name}`, `../test-images/${name}`, `test-images/${name}`];
   for(let i=0;i<urls.length;i++){
@@ -1069,6 +1152,8 @@ function buildPipelineConfig(outputNode){
     input:{inputs:[],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
     vibrance:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
     superia:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
+    kodachrome:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
+    tmax:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
     grayscale:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/gray8"}]},
     resize:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/gray8"}]},
     tone:{inputs:[{id:"input",acceptedDataTypes:["image/gray8","image/rgb8-interleaved"]}],outputs:[{id:"output",acceptedDataTypes:["image/gray8","image/rgb8-interleaved"]}]},
@@ -1096,6 +1181,8 @@ function buildPipelineConfig(outputNode){
     atkinson:{threshold:"threshold"},
     photo:{contrast:"contrastGain",threshold:"threshold",strength:"errorDiffusionStrength"},
     canny:{blur:"gaussianBlurPasses",low:"lowThreshold",high:"highThreshold"},
+    kodachrome:{contrast:"smoothstepContrast"},
+    tmax:{contrast:"smoothstepContrast"},
   };
   let effectiveDataType=null;
   const configNodes=chain.map((node,index)=>{
@@ -1103,6 +1190,8 @@ function buildPipelineConfig(outputNode){
     const parameters=Object.fromEntries(Object.entries(node.params).map(([key,value])=>[
       parameterNames[node.type]?.[key]||key,value,
     ]));
+    // zoom is a host-only inspection control, not part of the image pipeline
+    if(node.type==="output") delete parameters.zoom;
     if(node.type==="input" && node.file){
       parameters.source="uploaded_file";
       parameters.sourceAsset={fileName:node.file.name, mimeType:node.file.type||null,
@@ -1110,7 +1199,7 @@ function buildPipelineConfig(outputNode){
     }else if(node.type==="input"){
       const samplePath=definition.contract.sampleFiles?.[parameters.source];
       if(samplePath) parameters.sourceAsset={path:samplePath};
-      if(parameters.source==="upload") parameters.uploadFallbacks=["test-images/img_0027.jpg","gradient"];
+      if(parameters.source==="upload") parameters.uploadFallbacks=["test-images/img_0134.jpg","gradient"];
     }
     const inputDataType=effectiveDataType;
     if(!node.bypassed){
@@ -1312,7 +1401,15 @@ async function execChain(chain){
       }
       case "superia": {
         if(!rgb || gray) throw new Error("Fuji Superia 400 must come after Input and before Grayscale");
-        rgb = superiaLook(rgb,W,H,p); break;
+        rgb = filmLook(rgb,W,H,p); break;
+      }
+      case "kodachrome": {
+        if(!rgb || gray) throw new Error("Kodak Kodachrome 64 must come after Input and before Grayscale");
+        rgb = filmLook(rgb,W,H,p,{matrix:node.def.matrix}); break;
+      }
+      case "tmax": {
+        if(!rgb || gray) throw new Error("Kodak T-Max 400 must come after Input and before Grayscale");
+        rgb = filmLook(rgb,W,H,p,{mono:node.def.mono}); break;
       }
       case "grayscale": {
         if(!rgb) throw new Error("Grayscale needs an image upstream");
@@ -1378,7 +1475,7 @@ async function execChain(chain){
 
 function paintResult(outputNode,res){
   const panel=outputNode.el.querySelector('[data-output="panel"]');
-  // Canvas takes the input's size so the image is never scaled or cropped.
+  // Backing store keeps the input's pixels; CSS size is the zoomed display size.
   panel.width=res.w; panel.height=res.h; panel.hidden=false;
   const src = res.data;
   const ctx = panel.getContext("2d");
@@ -1392,6 +1489,26 @@ function paintResult(outputNode,res){
     }
   }
   ctx.putImageData(img,0,0);
+  outputNode.resultSize={w:res.w,h:res.h};
+  // Start at the default fit so the slider position shows the actual display scale.
+  outputNode.params.zoom=Math.max(0.1,Math.min(1,OUTPUT_MAX_DIM/Math.max(res.w,res.h)));
+  const slider=outputNode.el.querySelector('[data-k="zoom"]');
+  if(slider) slider.value=outputNode.params.zoom;
+  updateOutputZoom(outputNode);
+}
+
+// Zoom is the on-screen scale relative to the native result; 100% = original pixels.
+function updateOutputZoom(node){
+  const zoom=node.params.zoom??1;
+  const label=node.el.querySelector('[data-output="zoom-label"]');
+  if(label) label.textContent=Math.round(zoom*100)+"%";
+  const panel=node.el.querySelector('[data-output="panel"]');
+  if(!panel || panel.hidden || !node.resultSize) return;
+  const w=Math.max(1,Math.round(node.resultSize.w*zoom));
+  const h=Math.max(1,Math.round(node.resultSize.h*zoom));
+  panel.style.width=w+"px";
+  panel.style.height=h+"px";
+  node.el.style.width=Math.max(300,w+20)+"px"; // 18 px content padding + 2 px border; 300 px keeps the controls usable
 }
 
 document.getElementById("btn-run").onclick = runPipeline;

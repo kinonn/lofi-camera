@@ -20,7 +20,7 @@ Use the silkscreen labels on the ESP32-S3-CAM header.
 
 | Peripheral | ESP32-S3-CAM pin | Notes |
 |---|---|---|
-| OLED SDA | IO41 (GPIO41) | `Wire` on I2C port 0 |
+| OLED SDA | IO41 (GPIO41) | `Wire` at 400 kHz (I2C port 0) |
 | OLED SCL | IO42 (GPIO42) | right-hand header |
 | OLED VCC | 3V3 | **not** 5V (left header) |
 | OLED GND | GND | |
@@ -64,7 +64,10 @@ core's S3 build (`CONFIG_SCCB_HARDWARE_I2C_PORT1`), so the buses don't collide.
   automatically — no power cycle.
 - Loop: live preview — the **same SXGA JPEG stream** the stills come from is
   decoded at 1/8 scale (160×128), luma-converted, aspect-fit to 80×64 and
-  centred on the 128×64 OLED, then rendered by the selected preview mode.
+  centred on the 128×64 OLED, then rendered by the selected preview mode. The
+  panel runs at 400 kHz I2C and the camera at two frame buffers, so the
+  viewfinder settles at ~5 fps at SXGA; the sensor frame period, not the
+  renderer, is the limit.
 - Button press (debounced 50 ms): captures **SXGA (1280×1024) JPEG at
   `jpeg_quality = 10`**, saves as `/img_NNNN.jpg` (next free index, never
   overwritten). Expect roughly 90–120 KB per photo — measured at 0.57 bpp on
@@ -129,6 +132,8 @@ or re-encode, so it costs nothing.
 | `JPEG_FILTER_NONE` (default) | Pass-through | SXGA 1280×1024 |
 | `JPEG_FILTER_WHITE_BORDER` | Paints a 20 px white band over all four frame edges; edge pixels are lost and the visible image area is 1240×984 | SXGA 1280×1024 (canvas unchanged) |
 | `JPEG_FILTER_SUPERIA_USM` | Fuji Superia 400 film look + gaussian unsharp sharpen, ported from the `tools/preview_lab` chain with the lab's default parameters. One decode, one fused colour pass, sharpen as a second pass, one re-encode — no intermediate JPEG round trips. The lab's grain stage is not ported (its default is 0 = off). Measured on the S3 at 240 MHz with `-O3`: about 6.6 s per SXGA shot (decode 0.95, stats 0.65, look 2.09, sharpen 1.24, encode 1.4 s); it was ~14–15 s on the ESP32-CAM. | SXGA 1280×1024 |
+| `JPEG_FILTER_KODACHROME_USM` | Kodak Kodachrome 64 film look + vibrance + gaussian unsharp, ported from the `tools/preview_lab` chain “Kodachrome 64 → Vibrance (0.5) → Sharpen (0.4, sigma 1)”. Same one-decode, one fused colour pass, one sharpen, one re-encode design. The lab's grain is reproduced as per-pixel monochrome noise (the default grain size 1.2 is below the lab's own blur threshold). Measured on the S3 at 240 MHz with `-O3`: about 7.3 s per SXGA shot (decode 0.87, stats 0.66, look 2.71, sharpen 1.28, encode 1.35 s). | SXGA 1280×1024 |
+| `JPEG_FILTER_TMAX_USM` | Kodak T-Max 400 panchromatic B&W + gaussian unsharp, ported from the `tools/preview_lab` chain “T-Max 400 → Sharpen (0.4, sigma 1)”. Same fused design; the panchromatic mix is 0.30/0.59/0.11, with the node's contrast 0.80, vignette 0.30 and grain 0.030. Measured on the S3 at 240 MHz with `-O3`: about 6.5 s per SXGA shot (decode 0.92, stats 0.65, look 1.71, sharpen 1.28, encode 1.54 s). | SXGA 1280×1024 |
 
 Enable it in the existing `build_flags` block in `platformio.ini`:
 
@@ -157,6 +162,20 @@ at sigma 1.00). Each is overridable with
 PIE sharpen kernel by default; `-DSUPERIA_USM_SIMD=0` forces the scalar path
 (the host test always uses scalar).
 
+The Kodachrome filter inlines its node defaults as `KODACHROME_*` macros
+(auto balance 0.62, auto contrast 0.62, saturation 1.24, midtone gamma 0.94,
+smoothstep contrast 0.60, warm 3×3 matrix, shadow/highlight tint, vignette
+0.10, grain 0.010, vibrance 0.50, unsharp amount 0.40 at sigma 1.00),
+overridable with `-DKODACHROME_<NAME>=<value>`. The 3×3 matrix entries are
+`KODACHROME_MAT_RR` … `KODACHROME_MAT_BB`. The white balance is identity, so
+the linear-light LUT is skipped for this look.
+
+The T-Max filter inlines its node defaults as `TMAX_*` macros (auto balance
+0.70, auto contrast 0.55, midtone gamma 0.98, smoothstep contrast 0.80,
+panchromatic mix 0.30/0.59/0.11, vignette 0.30, grain 0.030, unsharp amount
+0.40 at sigma 1.00). It has no colour matrix, saturation or vibrance stage;
+`TMAX_MONO_R/G/B` adjust the B&W channel mix.
+
 **Memory.** The border does not grow the frame: it paints over the outer 20
 pixels on each edge (no scaling or resampling), so the canvas stays
 1280×1024. Because `esp_jpg_decode`
@@ -167,8 +186,8 @@ to the SD file via `fmt2jpg_cb`, so the JPEG is never held in RAM either.
 | Item | Bytes |
 |---|---|
 | RGB565 canvas, 1280×1024 | 2,621,440 |
-| Camera buffer (`fb_count = 1`, w×h/5) | 262,144 |
-| **Peak** | **~2.9 MB** (of 8 MB PSRAM) |
+| Camera buffers (`fb_count = 2`, w×h/5 each) | 524,288 |
+| **Peak** | **~3.2 MB** (of 8 MB PSRAM) |
 
 Border width is free: it does not change the memory requirement, only the
 painted area. `jpegFilterWorstCaseBytes()` reports an upper bound (0.25
@@ -176,10 +195,10 @@ bytes/pixel at encoder quality 10) so the free-space check can run before the
 file is opened; with the default `JPEG_REENCODE_QUALITY` of 60 the budget
 doubles to 0.5 bytes/pixel.
 
-The Superia filter shares the canvas and bound above. Its sharpen ring (one
+All three look filters share the canvas and bound above. Their sharpen ring (one
 16-byte group per channel/pixel, holding the 2·radius+1 blurred rows as int16
-slots, ~61 KB at SXGA) and its LUTs (~4 KB) live in internal DRAM, not PSRAM,
-so peak PSRAM stays at the border filter's ~2.9 MB envelope. Keep it there: an
+slots, ~61 KB at SXGA) and LUTs (~5 KB) live in internal DRAM, not PSRAM, so
+peak PSRAM stays at the border filter's ~3.2 MB envelope. Keep it there: an
 earlier version used a ~0.67 MB band buffer in PSRAM, pushed the peak to
 ~3.6 MB, and the old ESP32-CAM's PSRAM delivered block-garbage into the canvas
 at that pressure (psychedelic capture output). The 16-byte groups are also what
@@ -217,10 +236,10 @@ Known limitations (by design, not bugs):
 
 - The shutter is the onboard BOOT button (GPIO0), so holding it through a
   reset puts the ROM in download mode instead of booting the firmware.
-- Capture blocks the loop: about 0.2–0.4 s with `JPEG_FILTER_NONE`, and the
-  whole ~6.6 s Superia pass with the default filter, so the preview pauses
+- Capture blocks the loop: about 0.2-0.4 s with `JPEG_FILTER_NONE`, and the
+  whole ~6.5 s T-Max pass with the default build, so the preview pauses
   while the file is written.
-- SXGA stills need PSRAM: the single JPEG frame buffer reserves ~256 KB. If
+- SXGA stills need PSRAM: the stream reserves two ~256 KB frame buffers. If
   that allocation fails, the boot ladder (`CAM_MODES` in `src/main.cpp`) steps
   down to XGA, SVGA and finally VGA on its own, and the OLED reports which
   mode stuck.
@@ -238,8 +257,8 @@ pio run --target upload --upload-port COM6   # upload to explicit port
 pio device monitor -b 115200 -p COM6     # USB CDC serial monitor
 ```
 
-Build output with the checked-in flags (SUPERIA filter, USB CDC, `-O3`):
-RAM 44.4 % (145,564 / 327,680 B), Flash 14.1 % (470,153 / 3,342,336 B).
+Build output with the checked-in flags (T-Max filter, USB CDC, `-O3`):
+RAM 44.4 % (145,564 / 327,680 B), Flash 14.1 % (470,873 / 3,342,336 B).
 
 ### Upload checklist
 

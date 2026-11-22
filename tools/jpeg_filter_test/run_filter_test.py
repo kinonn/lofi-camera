@@ -2,16 +2,19 @@
 """
 Firmware capture-filter test bench.
 
-Builds the REAL src/jpeg_filter.h (JPEG_FILTER_SUPERIA_USM) as a host binary
-under WSL and runs it over the sample JPEGs, producing three filtered
-outputs per image -- the shipped Superia 400 + USM combination, the Superia
-look alone, and the USM alone -- plus an HTML gallery and contact sheets
-for side-by-side inspection.
+Builds the REAL src/jpeg_filter.h (JPEG_FILTER_SUPERIA_USM,
+JPEG_FILTER_KODACHROME_USM and JPEG_FILTER_TMAX_USM branches) as host
+binaries under WSL and runs them over the sample JPEGs, producing the
+shipped Superia 400 + USM combination, the Superia look alone, the USM
+alone, the Kodachrome 64 + Vibrance + USM chain, and the T-Max 400 B&W +
+USM chain, plus an HTML gallery and contact sheets for side-by-side
+inspection.
 
 What this reproduces vs. hardware:
   reproduced  all filter math from src/jpeg_filter.h as compiled (LUTs,
-              RGB565 canvas, 5/6/5-bit truncation/replication, the big-endian
-              canvas byte order of decoder + encoder, tone chain order,
+              RGB565 canvas, 5/6/5-bit truncation/replication, the native
+              little-endian decoder canvas and the pre-encode swap that the
+              encoder's big-endian read expects, tone chain order,
               row-ring USM, JPEG_QUALITY=10 handling)
   different   JPEG decoder/encoder codec: the device uses esp_new_jpeg +
               jpge; the host byte-exact stubs use stb. Expect comparable but
@@ -21,7 +24,7 @@ What this reproduces vs. hardware:
 
 Usage:
   .venv/Scripts/python.exe tools/jpeg_filter_test/run_filter_test.py
-  ...  --input test-images/img_0037.jpg  --quality 10
+  ...  --input test-images/img_0134.jpg  --quality 10
 Output: tools/jpeg_filter_test/out/gallery/index.html (git-ignored).
 """
 
@@ -40,11 +43,13 @@ TOOL = Path(__file__).resolve().parent
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "film_lab"))
 from run_film_lab import build_contact_sheet, find_images  # noqa: E402
 
-# mode -> (binary base name, sheet label)
+# mode -> (filter mode, filter kind, sheet label)
 MODES = {
-    "superia": (1, "Superia 400 (firmware look only)"),
-    "usm": (2, "USM (firmware sharpen only)"),
-    "full": (0, "Superia 400 + USM (shipped firmware)"),
+    "superia": (1, 0, "Superia 400 (firmware look only)"),
+    "usm": (2, 0, "USM (firmware sharpen only)"),
+    "full": (0, 0, "Superia 400 + USM (shipped firmware)"),
+    "kodachrome": (0, 1, "Kodachrome 64 + Vibrance + USM (firmware)"),
+    "tmax": (0, 2, "T-Max 400 + USM (firmware)"),
 }
 
 
@@ -62,16 +67,17 @@ def build(wsl_repo: str) -> None:
         print("error: g++ not found in WSL. Install with: sudo apt install g++",
               file=sys.stderr)
         raise SystemExit(2)
-    for exe, (mode, _) in MODES.items():
+    for exe, (mode, kind, _) in MODES.items():
         cmd = (f'cd {wsl_repo}/tools/jpeg_filter_test && '
-               f"g++ -O2 -Wall -DFILTER_MODE={mode} -DJPEG_FILTER_SWAP565=1 "
+               f"g++ -O2 -Wall -DFILTER_MODE={mode} -DFILTER_KIND={kind} "
+               f"-DJPEG_FILTER_SWAP565=0 "
                f"-I {wsl_repo}/src -I stubs host_test.cpp -o out/{exe}")
         r = subprocess.run(["wsl", "-e", "bash", "-c", cmd], text=True,
                            capture_output=True)
         if r.returncode != 0:
             print(f"compile {exe} failed:\n{r.stdout}{r.stderr}", file=sys.stderr)
             raise SystemExit(2)
-        print(f"built out/{exe} (mode {mode})")
+        print(f"built out/{exe} (kind {kind}, mode {mode})")
 
 
 def write_gallery(out_dir: Path, groups) -> Path:
@@ -90,7 +96,7 @@ def write_gallery(out_dir: Path, groups) -> Path:
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>firmware JPEG filter test -- Superia 400 / USM</title>
+<title>firmware JPEG filter test -- Superia 400 / Kodachrome 64 / T-Max 400 / USM</title>
 <style>
   :root {{ color-scheme: dark; }}
   body {{ margin: 0; padding: 24px 28px 64px; background: #141518;
@@ -107,11 +113,12 @@ def write_gallery(out_dir: Path, groups) -> Path:
 </style>
 </head>
 <body>
-<h1>firmware JPEG filter test &mdash; Superia 400 / USM</h1>
+<h1>firmware JPEG filter test &mdash; Superia 400 / Kodachrome 64 / T-Max 400 / USM</h1>
 <p class="hint">Output of the real src/jpeg_filter.h compiled for the host
 (WSL), over the test captures. left to right: firmware Superia 400 look
-alone, firmware USM alone, shipped Superia 400 + USM. Click any card for
-full size; contact sheet links in each filename.</p>
+alone, firmware USM alone, shipped Superia 400 + USM, the Kodachrome 64
++ Vibrance + USM chain, and the T-Max 400 B&amp;W + USM chain. Click any
+card for full size; contact sheet links in each filename.</p>
 {"".join(rows)}
 </body>
 </html>""", encoding="utf-8")
@@ -151,7 +158,7 @@ def main(argv=None) -> int:
 
         stem = image_path.stem
         rendered = []
-        for exe, (mode, label) in MODES.items():
+        for exe, (mode, _kind, label) in MODES.items():
             out_name = f"{stem}__{exe}.jpg"
             cmd = (f"cd {as_wsl(TOOL)} && ./out/{exe} {as_wsl(image_path)} "
                    f"out/files/{out_name} {args.quality}")
@@ -162,7 +169,7 @@ def main(argv=None) -> int:
                 print(f"  filter failed for {label}:\n{r.stdout}{r.stderr}",
                       file=sys.stderr)
                 continue
-            rendered.append((f"{mode:02d}", label, files / out_name))
+            rendered.append((f"{len(rendered):02d}", label, files / out_name))
 
         sheet = build_contact_sheet(
             original,

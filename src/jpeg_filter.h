@@ -14,13 +14,21 @@
 //   JPEG_FILTER_SUPERIA_USM   Fuji Superia 400 film look + unsharp sharpen,
 //                             ported from the tools/preview_lab chain with
 //                             the lab's default parameters
+//   JPEG_FILTER_KODACHROME_USM Kodak Kodachrome 64 film look + vibrance +
+//                             unsharp sharpen, ported from the preview_lab
+//                             chain "Kodachrome 64 -> Vibrance -> Sharpen"
+//   JPEG_FILTER_TMAX_USM      Kodak T-Max 400 panchromatic B&W + unsharp
+//                             sharpen, ported from the preview_lab chain
+//                             "T-Max 400 -> Sharpen"
 //
 // Switch in platformio.ini:
 //   build_flags = -DJPEG_FILTER=JPEG_FILTER_WHITE_BORDER
 // ---------------------------------------------------------------------------
-#define JPEG_FILTER_NONE          0
-#define JPEG_FILTER_WHITE_BORDER  1
-#define JPEG_FILTER_SUPERIA_USM   2
+#define JPEG_FILTER_NONE           0
+#define JPEG_FILTER_WHITE_BORDER   1
+#define JPEG_FILTER_SUPERIA_USM    2
+#define JPEG_FILTER_KODACHROME_USM 3
+#define JPEG_FILTER_TMAX_USM       4
 
 #ifndef JPEG_FILTER
 #define JPEG_FILTER JPEG_FILTER_NONE
@@ -28,7 +36,7 @@
 
 // The pipeline streams its output instead of buffering the encoded JPEG, so a
 // filter never has to hold the file in RAM. That is what keeps peak PSRAM
-// inside a 4 MB module.
+// inside the 8 MB module.
 typedef size_t (*JpegWriteFn)(void* arg, const uint8_t* data, size_t len);
 
 // TEMP diagnostic: -DCAPTURE_TIMING=1 records per-stage ms; main.cpp appends a
@@ -78,8 +86,8 @@ static inline size_t jpegFilterWorstCaseBytes(const camera_fb_t* fb) {
 // border is carved out of the image area instead of growing the frame. That
 // needs only ONE large buffer -- the RGB565 canvas -- because the JPEG is
 // decoded directly into it. At SXGA that canvas is 2,621,440 bytes (2.5 MiB).
-// With one SXGA camera buffer, the calculated peak is about 2.9 MB including
-// decoder/encoder work space, within 4 MB PSRAM.
+// With two SXGA camera buffers, the calculated peak is about 3.2 MB including
+// decoder/encoder work space, well within 8 MB PSRAM.
 
 // The decoder emits RGB565 in a byte order intended for LCD panels. If the
 // re-encoded photo comes out with red and blue swapped, set this to 1.
@@ -89,7 +97,7 @@ static inline size_t jpegFilterWorstCaseBytes(const camera_fb_t* fb) {
 
 // The pipeline streams its output instead of buffering the encoded JPEG, so a
 // filter never has to hold the file in RAM. That is what keeps peak PSRAM
-// inside a 4 MB module.
+// inside the 8 MB module.
 typedef size_t (*JpegWriteFn)(void* arg, const uint8_t* data, size_t len);
 
 // ---------------------------------------------------------------------------
@@ -194,7 +202,9 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
 }
 
 // ---------------------------------------------------------------------------
-#elif (JPEG_FILTER == JPEG_FILTER_SUPERIA_USM)
+#elif (JPEG_FILTER == JPEG_FILTER_SUPERIA_USM) || \
+      (JPEG_FILTER == JPEG_FILTER_KODACHROME_USM) || \
+      (JPEG_FILTER == JPEG_FILTER_TMAX_USM)
 
 #include "esp32-hal-psram.h"
 #include "img_converters.h"
@@ -213,23 +223,30 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 #define USM_SIMD_ENABLED 0
 #endif
 
-// Fuji Superia 400 look + unsharp sharpening -- the tools/preview_lab chain
-// "Fuji Superia 400 -> Sharpen" ported with the lab's default parameters.
-// Design: one decode, a single fused colour pass, one neighbourhood pass,
-// one encode. Every look stage is elementwise, so running them as separate
-// JPEG filters would only add decode/encode round trips: extra CPU per pass
-// and one generation of JPEG quantisation loss each.
+// Film-look + unsharp sharpening, shared scaffolding for the look filters:
+//   Superia    "Fuji Superia 400 -> Sharpen"
+//   Kodachrome "Kodak Kodachrome 64 -> Vibrance -> Sharpen"
+//   T-Max      "Kodak T-Max 400 -> Sharpen" (panchromatic B&W)
+// All are ported from tools/preview_lab/app.html. Design: one decode, a single
+// fused colour pass, one neighbourhood pass, one encode. Every look stage is
+// elementwise, so running them as separate JPEG filters would only add
+// decode/encode round trips: extra CPU per pass and one generation of JPEG
+// quantisation loss each.
 //
-// Stage order and formulas mirror superiaLook() / unsharpMask() in
-// tools/preview_lab/app.html:
-//   auto balance -> auto contrast -> linear white balance -> midtone gamma
-//   -> shadow/highlight tint -> vignette -> gaussian unsharp sharpen
-// The lab's grain stage is not ported: its default is 0 (off) and noise here
-// would cost a full extra pass. Values differ from the lab by construction
-// because the canvas is RGB565 (5/6/5 bits): expect mild extra banding on
-// smooth gradients vs. the lab's 8-bit model.
+// Stage order follows filmLook() and the downstream nodes:
+//   auto balance -> auto contrast -> linear white balance -> 3x3 matrix
+//   -> saturation -> gamma + smoothstep contrast -> shadow/highlight tint
+//   -> monochrome -> vignette -> grain -> vibrance -> gaussian unsharp sharpen
+// Superia skips the matrix, saturation, vibrance and grain stages (its node
+// defaults make them identity/off); T-Max skips matrix, saturation, vibrance
+// and tints, and enables the monochrome mix. Values differ from the lab by
+// construction because the canvas is RGB565 (5/6/5 bits): expect mild extra
+// banding on smooth gradients vs. the lab's 8-bit model. Kodachrome's/T-Max's
+// grain size of 1.2 is below the lab's blur threshold (sigma < 0.3), so only
+// the amount is reproduced; the device grain is the same per-pixel noise,
+// monochrome.
 
-// Tunables, all -D overridable. Values = preview_lab node defaults.
+// Superia tunables, all -D overridable. Values = preview_lab node defaults.
 #ifndef SUPERIA_AUTO_BALANCE
 #define SUPERIA_AUTO_BALANCE 0.55f
 #endif
@@ -293,6 +310,203 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 #define SUPERIA_USM_RING_W 1280
 #endif
 
+// ---- per-filter look parameters -------------------------------------------
+// The shared pipeline reads FILM_*; each filter maps those to its own
+// -D-overridable names. Kodachrome values are the preview_lab node defaults
+// for the chain "Kodachrome 64 -> Vibrance (0.5) -> Sharpen (0.4, sigma 1)".
+#if JPEG_FILTER == JPEG_FILTER_KODACHROME_USM
+#ifndef KODACHROME_AUTO_BALANCE
+#define KODACHROME_AUTO_BALANCE 0.62f
+#endif
+#ifndef KODACHROME_AUTO_CONTRAST
+#define KODACHROME_AUTO_CONTRAST 0.62f
+#endif
+#ifndef KODACHROME_SATURATION
+#define KODACHROME_SATURATION 1.24f
+#endif
+#ifndef KODACHROME_MIDTONE_GAMMA
+#define KODACHROME_MIDTONE_GAMMA 0.94f
+#endif
+#ifndef KODACHROME_TONE_CONTRAST
+#define KODACHROME_TONE_CONTRAST 0.60f
+#endif
+#ifndef KODACHROME_MAT_RR
+#define KODACHROME_MAT_RR 1.10f
+#endif
+#ifndef KODACHROME_MAT_RG
+#define KODACHROME_MAT_RG (-0.04f)
+#endif
+#ifndef KODACHROME_MAT_RB
+#define KODACHROME_MAT_RB (-0.02f)
+#endif
+#ifndef KODACHROME_MAT_GR
+#define KODACHROME_MAT_GR (-0.03f)
+#endif
+#ifndef KODACHROME_MAT_GG
+#define KODACHROME_MAT_GG 1.00f
+#endif
+#ifndef KODACHROME_MAT_GB
+#define KODACHROME_MAT_GB 0.02f
+#endif
+#ifndef KODACHROME_MAT_BR
+#define KODACHROME_MAT_BR (-0.02f)
+#endif
+#ifndef KODACHROME_MAT_BG
+#define KODACHROME_MAT_BG 0.02f
+#endif
+#ifndef KODACHROME_MAT_BB
+#define KODACHROME_MAT_BB 0.99f
+#endif
+#ifndef KODACHROME_SHADOW_R
+#define KODACHROME_SHADOW_R (-0.004f)
+#endif
+#ifndef KODACHROME_SHADOW_G
+#define KODACHROME_SHADOW_G 0.002f
+#endif
+#ifndef KODACHROME_SHADOW_B
+#define KODACHROME_SHADOW_B 0.012f
+#endif
+#ifndef KODACHROME_HIGHLIGHT_R
+#define KODACHROME_HIGHLIGHT_R 0.046f
+#endif
+#ifndef KODACHROME_HIGHLIGHT_G
+#define KODACHROME_HIGHLIGHT_G 0.004f
+#endif
+#ifndef KODACHROME_HIGHLIGHT_B
+#define KODACHROME_HIGHLIGHT_B (-0.024f)
+#endif
+#ifndef KODACHROME_VIGNETTE
+#define KODACHROME_VIGNETTE 0.10f
+#endif
+#ifndef KODACHROME_GRAIN
+#define KODACHROME_GRAIN 0.010f
+#endif
+#ifndef KODACHROME_VIBRANCE
+#define KODACHROME_VIBRANCE 0.50f
+#endif
+#ifndef KODACHROME_USM_AMOUNT
+#define KODACHROME_USM_AMOUNT 0.40f
+#endif
+#ifndef KODACHROME_USM_SIGMA
+#define KODACHROME_USM_SIGMA 1.00f
+#endif
+#endif  // JPEG_FILTER_KODACHROME_USM
+
+// T-Max 400 values are the preview_lab node defaults for
+// "T-Max 400 -> Sharpen (0.4, sigma 1)".
+#if JPEG_FILTER == JPEG_FILTER_TMAX_USM
+#ifndef TMAX_AUTO_BALANCE
+#define TMAX_AUTO_BALANCE 0.70f
+#endif
+#ifndef TMAX_AUTO_CONTRAST
+#define TMAX_AUTO_CONTRAST 0.55f
+#endif
+#ifndef TMAX_MIDTONE_GAMMA
+#define TMAX_MIDTONE_GAMMA 0.98f
+#endif
+#ifndef TMAX_TONE_CONTRAST
+#define TMAX_TONE_CONTRAST 0.80f
+#endif
+#ifndef TMAX_MONO_R
+#define TMAX_MONO_R 0.30f
+#endif
+#ifndef TMAX_MONO_G
+#define TMAX_MONO_G 0.59f
+#endif
+#ifndef TMAX_MONO_B
+#define TMAX_MONO_B 0.11f
+#endif
+#ifndef TMAX_VIGNETTE
+#define TMAX_VIGNETTE 0.30f
+#endif
+#ifndef TMAX_GRAIN
+#define TMAX_GRAIN 0.030f
+#endif
+#ifndef TMAX_USM_AMOUNT
+#define TMAX_USM_AMOUNT 0.40f
+#endif
+#ifndef TMAX_USM_SIGMA
+#define TMAX_USM_SIGMA 1.00f
+#endif
+#endif  // JPEG_FILTER_TMAX_USM
+
+#if JPEG_FILTER == JPEG_FILTER_KODACHROME_USM
+#define FILM_AUTO_BALANCE KODACHROME_AUTO_BALANCE
+#define FILM_AUTO_CONTRAST KODACHROME_AUTO_CONTRAST
+#define FILM_MIDTONE_GAMMA KODACHROME_MIDTONE_GAMMA
+#define FILM_TONE_CONTRAST KODACHROME_TONE_CONTRAST
+#define FILM_SATURATION KODACHROME_SATURATION
+#define FILM_SHADOW_R KODACHROME_SHADOW_R
+#define FILM_SHADOW_G KODACHROME_SHADOW_G
+#define FILM_SHADOW_B KODACHROME_SHADOW_B
+#define FILM_HIGHLIGHT_R KODACHROME_HIGHLIGHT_R
+#define FILM_HIGHLIGHT_G KODACHROME_HIGHLIGHT_G
+#define FILM_HIGHLIGHT_B KODACHROME_HIGHLIGHT_B
+#define FILM_VIGNETTE KODACHROME_VIGNETTE
+#define FILM_GRAIN KODACHROME_GRAIN
+#define FILM_VIBRANCE KODACHROME_VIBRANCE
+#define FILM_USM_AMOUNT KODACHROME_USM_AMOUNT
+#define FILM_USM_SIGMA KODACHROME_USM_SIGMA
+#define FILM_USM_RAD ((int)(3.0f * KODACHROME_USM_SIGMA + 0.999f))
+#define FILM_WB_R 1.0f
+#define FILM_WB_G 1.0f
+#define FILM_WB_B 1.0f
+#define FILM_HAS_MATRIX 1
+#define FILM_TINTS_GRADED 1
+#define FILM_MONO 0
+#elif JPEG_FILTER == JPEG_FILTER_TMAX_USM
+#define FILM_AUTO_BALANCE TMAX_AUTO_BALANCE
+#define FILM_AUTO_CONTRAST TMAX_AUTO_CONTRAST
+#define FILM_MIDTONE_GAMMA TMAX_MIDTONE_GAMMA
+#define FILM_TONE_CONTRAST TMAX_TONE_CONTRAST
+#define FILM_SATURATION 1.0f
+#define FILM_SHADOW_R 0.0f
+#define FILM_SHADOW_G 0.0f
+#define FILM_SHADOW_B 0.0f
+#define FILM_HIGHLIGHT_R 0.0f
+#define FILM_HIGHLIGHT_G 0.0f
+#define FILM_HIGHLIGHT_B 0.0f
+#define FILM_VIGNETTE TMAX_VIGNETTE
+#define FILM_GRAIN TMAX_GRAIN
+#define FILM_VIBRANCE 0.0f
+#define FILM_USM_AMOUNT TMAX_USM_AMOUNT
+#define FILM_USM_SIGMA TMAX_USM_SIGMA
+#define FILM_USM_RAD ((int)(3.0f * TMAX_USM_SIGMA + 0.999f))
+#define FILM_WB_R 1.0f
+#define FILM_WB_G 1.0f
+#define FILM_WB_B 1.0f
+#define FILM_HAS_MATRIX 0
+#define FILM_TINTS_GRADED 0
+#define FILM_MONO 1
+#define FILM_MONO_R TMAX_MONO_R
+#define FILM_MONO_G TMAX_MONO_G
+#define FILM_MONO_B TMAX_MONO_B
+#else
+#define FILM_AUTO_BALANCE SUPERIA_AUTO_BALANCE
+#define FILM_AUTO_CONTRAST SUPERIA_AUTO_CONTRAST
+#define FILM_MIDTONE_GAMMA SUPERIA_MIDTONE_GAMMA
+#define FILM_TONE_CONTRAST 0.0f
+#define FILM_SATURATION 1.0f
+#define FILM_SHADOW_R SUPERIA_SHADOW_R
+#define FILM_SHADOW_G SUPERIA_SHADOW_G
+#define FILM_SHADOW_B SUPERIA_SHADOW_B
+#define FILM_HIGHLIGHT_R SUPERIA_HIGHLIGHT_R
+#define FILM_HIGHLIGHT_G SUPERIA_HIGHLIGHT_G
+#define FILM_HIGHLIGHT_B SUPERIA_HIGHLIGHT_B
+#define FILM_VIGNETTE SUPERIA_VIGNETTE
+#define FILM_GRAIN 0.0f
+#define FILM_VIBRANCE 0.0f
+#define FILM_USM_AMOUNT SUPERIA_USM_AMOUNT
+#define FILM_USM_SIGMA SUPERIA_USM_SIGMA
+#define FILM_USM_RAD SUPERIA_USM_RAD
+#define FILM_WB_R SUPERIA_WB_R
+#define FILM_WB_G SUPERIA_WB_G
+#define FILM_WB_B SUPERIA_WB_B
+#define FILM_HAS_MATRIX 0
+#define FILM_TINTS_GRADED 0
+#define FILM_MONO 0
+#endif
+
 // ---- lab math helpers ------------------------------------------------------
 
 // always_inline: the LX6 has no float divide or square root, so every `/` on a
@@ -349,6 +563,7 @@ static float   usmLutGamma[SUPERIA_LUT_N];  // powf(x, midtone gamma), once
 static float   usmLutVign[SUPERIA_LUT_N];   // powf(d, 1.2), once
 // The midtone gamma scales all three channels by lutGamma[L]/L. That division
 // is a __divsf3 call per pixel, so the quotient is tabulated next to the curve.
+// The film "contrast" smoothstep is folded into the same curve.
 static float   usmLutGammaScale[SUPERIA_LUT_N];
 // Auto contrast's scale is (L + (s-L)*ac)/L, and `s` depends on this frame's
 // percentiles, so it is rebuilt per shot -- 512 divisions instead of 1.31 M.
@@ -356,8 +571,10 @@ static float   usmLutGammaScale[SUPERIA_LUT_N];
 // that back to 1 would visibly lift highlights.
 #define SUPERIA_CSCALE_N 512
 static float   usmLutContrast[SUPERIA_CSCALE_N];
+// Vibrance needs 1/max(r,g,b); 256 divisions once instead of one per pixel.
+static float   usmLutInvMax[SUPERIA_LUT_N];
 
-static const float superiaWbGain[3] = { SUPERIA_WB_R, SUPERIA_WB_G, SUPERIA_WB_B };
+static const float filmWbGain[3] = { FILM_WB_R, FILM_WB_G, FILM_WB_B };
 static bool usmLutsReady = false;
 
 static inline float usmLinearToSrgb(float t) {
@@ -372,7 +589,7 @@ static void usmBuildWbLut(void) {
   for (int c = 0; c < 3; c++)
     for (int i = 0; i < SUPERIA_LUT_N; i++)
       usmLutWb[c][i] =
-          usmToU8(255.0f * usmLinearToSrgb(usmLutToLin[i] * superiaWbGain[c]));
+          usmToU8(255.0f * usmLinearToSrgb(usmLutToLin[i] * filmWbGain[c]));
 }
 
 static void usmInitLuts(void) {
@@ -384,17 +601,24 @@ static void usmInitLuts(void) {
   }
   usmBuildWbLut();
   // Compile-time conditions: an identity/unwanted curve is never built.
-  if (SUPERIA_MIDTONE_GAMMA != 1.0f)
+  if (FILM_MIDTONE_GAMMA != 1.0f || FILM_TONE_CONTRAST != 0.0f)
     for (int i = 0; i < SUPERIA_LUT_N; i++) {
       const float t = i / (float)(SUPERIA_LUT_N - 1);
-      usmLutGamma[i] = powf(t, SUPERIA_MIDTONE_GAMMA);
-      usmLutGammaScale[i] = t > 1e-4f ? usmLutGamma[i] / t : 0.0f;
+      float v = FILM_MIDTONE_GAMMA != 1.0f ? powf(t, FILM_MIDTONE_GAMMA) : t;
+      if (FILM_TONE_CONTRAST != 0.0f)
+        v = v + FILM_TONE_CONTRAST * (v * v * (3.0f - 2.0f * v) - v);
+      v = usmClampF(v, 0.0f, 1.0f);
+      usmLutGamma[i] = v;
+      usmLutGammaScale[i] = t > 1e-4f ? v / t : 0.0f;
     }
   // Vignette needs r^2.4 where r = sqrt(d), so powf(d, 1.2) -- one lookup, no
   // per-pixel sqrt.
-  if (SUPERIA_VIGNETTE > 0)
+  if (FILM_VIGNETTE > 0)
     for (int i = 0; i < SUPERIA_LUT_N; i++)
       usmLutVign[i] = powf(i / (float)(SUPERIA_LUT_N - 1), 1.2f);
+  if (FILM_VIBRANCE > 0)
+    for (int i = 0; i < SUPERIA_LUT_N; i++)
+      usmLutInvMax[i] = i > 0 ? 255.0f / (float)i : 0.0f;
   usmLutsReady = true;
 }
 
@@ -437,9 +661,21 @@ struct UsmLook {
   uint16_t* px;
   int w, h;
   float gainR, gainG, gainB;
-  bool doBalance, doContrast, doGamma, doVign;
+  bool doBalance, doContrast, doWb, doTone, doVign;
+  bool doMatrix, doSat, doVibrance, doGrain;
   float cx, cy, invCxn, invCyn;
 };
+
+// Cheap deterministic per-pixel noise in [-1, 1]. One integer hash, no state.
+// The lab's grain size 1.2 is below its own blur threshold (sigma < 0.3), so
+// it is unblurred noise; at a 1% amount the distribution shape is invisible on
+// a 5/6/5 canvas, so a uniform hash replaces the lab's Gaussian.
+static USM_ALWAYS_INLINE float usmNoise(int x, int y) {
+  uint32_t h = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u + 0x9E3779B9u;
+  h = (h ^ (h >> 13)) * 1274126177u;
+  h ^= h >> 16;
+  return (float)(h & 0xFFFFu) * (2.0f / 65535.0f) - 1.0f;
+}
 
 static void usmLookRows(const UsmLook& c, int y0, int y1) {
   uint16_t* px = c.px;
@@ -462,26 +698,73 @@ static void usmLookRows(const UsmLook& c, int y0, int y1) {
         const float sc = usmLutContrast[li];
         f[0] *= sc; f[1] *= sc; f[2] *= sc;
       }
-      for (int ch = 0; ch < 3; ch++)
-        f[ch] = usmLutWb[ch][usmToU8(f[ch] * 255.0f)] * USM_INV255;
+      if (c.doWb) {
+        for (int ch = 0; ch < 3; ch++)
+          f[ch] = usmLutWb[ch][usmToU8(f[ch] * 255.0f)] * USM_INV255;
+      }
       L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
-      if (c.doGamma) {
+
+#if FILM_HAS_MATRIX
+      if (c.doMatrix) {
+        const float r = f[0], g = f[1], b = f[2];
+        f[0] = KODACHROME_MAT_RR * r + KODACHROME_MAT_RG * g + KODACHROME_MAT_RB * b;
+        f[1] = KODACHROME_MAT_GR * r + KODACHROME_MAT_GG * g + KODACHROME_MAT_GB * b;
+        f[2] = KODACHROME_MAT_BR * r + KODACHROME_MAT_BG * g + KODACHROME_MAT_BB * b;
+      }
+#endif
+      if (c.doSat) {
+        L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
+        for (int ch = 0; ch < 3; ch++) f[ch] = L + (f[ch] - L) * FILM_SATURATION;
+      }
+      L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
+
+      if (c.doTone) {
         const float sc = usmLutGammaScale[usmToU8(L * 255.0f)];
         f[0] *= sc; f[1] *= sc; f[2] *= sc;
       }
+#if FILM_TINTS_GRADED
+      // The lab tints read the luma of the graded image, after gamma/contrast.
+      L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
+#endif
       {
         const float Lc = usmClampF(L, 0.0f, 1.0f);
         const float shw = (1.0f - Lc) * (1.0f - Lc);
         const float hiw = Lc * Lc;
-        f[0] += SUPERIA_SHADOW_R * shw + SUPERIA_HIGHLIGHT_R * hiw;
-        f[1] += SUPERIA_SHADOW_G * shw + SUPERIA_HIGHLIGHT_G * hiw;
-        f[2] += SUPERIA_SHADOW_B * shw + SUPERIA_HIGHLIGHT_B * hiw;
+        f[0] += FILM_SHADOW_R * shw + FILM_HIGHLIGHT_R * hiw;
+        f[1] += FILM_SHADOW_G * shw + FILM_HIGHLIGHT_G * hiw;
+        f[2] += FILM_SHADOW_B * shw + FILM_HIGHLIGHT_B * hiw;
       }
+#if FILM_MONO
+      // Panchromatic B&W mix; the lab applies it after the tints and before
+      // the optical stages. T-Max's node tint is neutral, so no tint term.
+      {
+        const float g = FILM_MONO_R * f[0] + FILM_MONO_G * f[1] + FILM_MONO_B * f[2];
+        f[0] = g; f[1] = g; f[2] = g;
+      }
+#endif
       if (c.doVign) {
         const float xx = ((float)x - c.cx) * c.invCxn;
         const float d = (xx * xx + yy * yy) * 0.5f;
-        const float vs = usmClampF(1.0f - SUPERIA_VIGNETTE * usmLut8(usmLutVign, d), 0.0f, 1.0f);
+        const float vs = usmClampF(1.0f - FILM_VIGNETTE * usmLut8(usmLutVign, d), 0.0f, 1.0f);
         f[0] *= vs; f[1] *= vs; f[2] *= vs;
+      }
+      if (c.doGrain) {
+        const float Lg = usmClampF(0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2],
+                                   0.0f, 1.0f);
+        const float wgt = 0.35f + 0.65f * (1.0f - fabsf(2.0f * Lg - 1.0f));
+        const float n = usmNoise(x, y) * (1.514f * FILM_GRAIN * wgt);
+        f[0] += n; f[1] += n; f[2] += n;
+      }
+      if (c.doVibrance) {
+        float mx = f[0], mn = f[0];
+        if (f[1] > mx) mx = f[1];
+        if (f[2] > mx) mx = f[2];
+        if (f[1] < mn) mn = f[1];
+        if (f[2] < mn) mn = f[2];
+        const float sat = (mx - mn) * usmLutInvMax[usmToU8(mx * 255.0f)];
+        const float gain = 1.0f + FILM_VIBRANCE * (1.0f - sat);
+        const float avg = (f[0] + f[1] + f[2]) * (1.0f / 3.0f);
+        for (int ch = 0; ch < 3; ch++) f[ch] = avg + (f[ch] - avg) * gain;
       }
       px[(size_t)y * w + x] = usmPack565(usmToU8(f[0] * 255.0f),
                                         usmToU8(f[1] * 255.0f),
@@ -649,15 +932,15 @@ static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
 
 // Adapter from fmt2jpg_cb's callback into the caller's sink (as in the border
 // filter; only one filter branch is compiled at a time).
-struct SuperiaJpgOutCtx {
+struct FilmJpgOutCtx {
   JpegWriteFn write;
   void* arg;
   size_t written;
   bool failed;
 };
 
-static size_t superiaJpgOutCb(void* arg, size_t index, const void* data, size_t len) {
-  SuperiaJpgOutCtx* c = (SuperiaJpgOutCtx*)arg;
+static size_t filmJpgOutCb(void* arg, size_t index, const void* data, size_t len) {
+  FilmJpgOutCtx* c = (FilmJpgOutCtx*)arg;
   (void)index;
   const size_t n = c->write(c->arg, (const uint8_t*)data, len);
   c->written += n;
@@ -721,14 +1004,14 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
   }
 
   float gainR = 1.0f, gainG = 1.0f, gainB = 1.0f;
-  if (SUPERIA_AUTO_BALANCE > 0 && maskedN >= 200) {
+  if (FILM_AUTO_BALANCE > 0 && maskedN >= 200) {
     const float mr = sumR / (float)maskedN / 255.0f;
     const float mg = sumG / (float)maskedN / 255.0f;
     const float mb = sumB / (float)maskedN / 255.0f;
     const float target = (mr + mg + mb) / 3.0f;
-    gainR = 1.0f + (target / (mr > 1e-4f ? mr : 1e-4f) - 1.0f) * SUPERIA_AUTO_BALANCE;
-    gainG = 1.0f + (target / (mg > 1e-4f ? mg : 1e-4f) - 1.0f) * SUPERIA_AUTO_BALANCE;
-    gainB = 1.0f + (target / (mb > 1e-4f ? mb : 1e-4f) - 1.0f) * SUPERIA_AUTO_BALANCE;
+    gainR = 1.0f + (target / (mr > 1e-4f ? mr : 1e-4f) - 1.0f) * FILM_AUTO_BALANCE;
+    gainG = 1.0f + (target / (mg > 1e-4f ? mg : 1e-4f) - 1.0f) * FILM_AUTO_BALANCE;
+    gainB = 1.0f + (target / (mb > 1e-4f ? mb : 1e-4f) - 1.0f) * FILM_AUTO_BALANCE;
   }
 
   // Pass 2: histogram of the post-balance, pre-WB luma (the lab computes its
@@ -762,11 +1045,16 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
 
   // Pass 3: the whole look in one per-pixel pass, in lab order. The white
   // balance is one byte lookup per channel (fused toLin/gain/toSrgb table).
-  const bool doBalance  = (SUPERIA_AUTO_BALANCE > 0) && (maskedN >= 200);
-  const bool doContrast = (SUPERIA_AUTO_CONTRAST > 0) && ((hi - lo) >= 0.02f);
-  const bool doGamma    = (SUPERIA_MIDTONE_GAMMA != 1.0f);
-  const bool doVign     = (SUPERIA_VIGNETTE > 0);
-  const float ac = SUPERIA_AUTO_CONTRAST;
+  const bool doBalance  = (FILM_AUTO_BALANCE > 0) && (maskedN >= 200);
+  const bool doContrast = (FILM_AUTO_CONTRAST > 0) && ((hi - lo) >= 0.02f);
+  const bool doWb       = (FILM_WB_R != 1.0f || FILM_WB_G != 1.0f || FILM_WB_B != 1.0f);
+  const bool doTone     = (FILM_MIDTONE_GAMMA != 1.0f || FILM_TONE_CONTRAST != 0.0f);
+  const bool doVign     = (FILM_VIGNETTE > 0);
+  const bool doMatrix   = FILM_HAS_MATRIX != 0;
+  const bool doSat      = FILM_SATURATION != 1.0f;
+  const bool doVibrance = FILM_VIBRANCE > 0;
+  const bool doGrain    = FILM_GRAIN > 0;
+  const float ac = FILM_AUTO_CONTRAST;
   const float cx = (float)(w - 1) * 0.5f, cy = (float)(h - 1) * 0.5f;
   const float cxn = cx > 1.0f ? cx : 1.0f, cyn = cy > 1.0f ? cy : 1.0f;
   const float invCxn = 1.0f / cxn, invCyn = 1.0f / cyn;
@@ -781,7 +1069,8 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
   }
 
   const UsmLook look = { px, w, h, gainR, gainG, gainB,
-                         doBalance, doContrast, doGamma, doVign,
+                         doBalance, doContrast, doWb, doTone, doVign,
+                         doMatrix, doSat, doVibrance, doGrain,
                          cx, cy, invCxn, invCyn };
   usmLookRows(look, 0, h);
   mark(gJpegCaptureTiming.lookMs);
@@ -807,8 +1096,8 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
   // __divsf3 call, while `mull` + add pipelines; the rows are already
   // quantised to 8 bits, so nothing is lost beyond 1 LSB of blur rounding.
 
-  if (SUPERIA_USM_AMOUNT > 0 && SUPERIA_USM_SIGMA > 0) {
-    int rad = SUPERIA_USM_RAD;
+  if (FILM_USM_AMOUNT > 0 && FILM_USM_SIGMA > 0) {
+    int rad = FILM_USM_RAD;
     if (rad < 1) rad = 1;
     if (rad > 8) rad = 8;  // the switch below instantiates radii 1..8
 
@@ -817,7 +1106,7 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
     float kernF[SUPERIA_USM_MAX_RADIUS * 2 + 1];
     float ksum = 0.0f;
     for (int d = -rad; d <= rad; d++) {
-      const float v = expf(-0.5f * (float)(d * d) * (1.0f / (SUPERIA_USM_SIGMA * SUPERIA_USM_SIGMA)));
+      const float v = expf(-0.5f * (float)(d * d) * (1.0f / (FILM_USM_SIGMA * FILM_USM_SIGMA)));
       kernF[d + rad] = v;
       ksum += v;
     }
@@ -828,7 +1117,7 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
       ksumQ8 += kern[d];
     }
     kern[rad] += 256 - ksumQ8;
-    const int amountQ8 = (int)(SUPERIA_USM_AMOUNT * 256.0f + 0.5f);
+    const int amountQ8 = (int)(FILM_USM_AMOUNT * 256.0f + 0.5f);
 
     const int slots = usmSlotsPerGroup(rad);
     const bool heapRing =
@@ -872,9 +1161,9 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
     px[i] = (uint16_t)((px[i] >> 8) | (px[i] << 8));
   }
 
-  SuperiaJpgOutCtx out = { write, arg, 0, false };
+  FilmJpgOutCtx out = { write, arg, 0, false };
   const bool encoded = fmt2jpg_cb(canvas, canvasBytes, w, h, PIXFORMAT_RGB565,
-                                  quality, superiaJpgOutCb, &out);
+                                  quality, filmJpgOutCb, &out);
   free(canvas);
   mark(gJpegCaptureTiming.encodeMs);
 
@@ -885,5 +1174,5 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
 }
 
 #else
-#error "JPEG_FILTER must be JPEG_FILTER_NONE, JPEG_FILTER_WHITE_BORDER or JPEG_FILTER_SUPERIA_USM"
+#error "JPEG_FILTER must be JPEG_FILTER_NONE, JPEG_FILTER_WHITE_BORDER, JPEG_FILTER_SUPERIA_USM, JPEG_FILTER_KODACHROME_USM or JPEG_FILTER_TMAX_USM"
 #endif

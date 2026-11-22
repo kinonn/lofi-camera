@@ -74,7 +74,7 @@ uv pip install --python .venv\Scripts\python.exe -r tools/preview_lab/requiremen
 
 # only one mode, or a single image
 .venv\Scripts\python.exe tools\preview_lab\run_preview_lab.py --modes dither
-.venv\Scripts\python.exe tools\preview_lab\run_preview_lab.py --input test-images/img_0027.jpg
+.venv\Scripts\python.exe tools\preview_lab\run_preview_lab.py --input test-images/img_0134.jpg
 
 # sample 12 chronological frames from a video; photo alpha blends each with
 # temporal state from its previous sampled frame

@@ -248,7 +248,7 @@ def chain(img, unpack, dumps=None, usm=True):
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    default_img = Path(__file__).parents[2] / "test-images" / "img_0037.jpg"
+    default_img = Path(__file__).parents[2] / "test-images" / "img_0134.jpg"
     ap.add_argument("input", nargs="?", default=str(default_img))
     ap.add_argument("--stages", action="store_true",
                     help="dump per-stage images of the fixed story")
