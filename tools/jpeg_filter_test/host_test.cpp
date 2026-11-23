@@ -21,6 +21,8 @@
 //                            off by zeroing their macros (Superia)
 //   3  T-Max, S-curve off    -DTMAX_TONE_GAIN=1 -DTMAX_HIGHLIGHT_ROLLOFF=0,
 //                            i.e. the pre-S-curve look, for an A/B against 0
+//   4  Kodachrome, S-curve off -DKODACHROME_TONE_GAIN=1
+//                            -DKODACHROME_HIGHLIGHT_ROLLOFF=0, same A/B idea
 //
 // Usage: host_test <in.jpg> <out.jpg> [quality]
 // quality applies to the re-encode like on device -- default 10, the
@@ -59,6 +61,10 @@
 // 3 differ only by the curve (same look, same border, same sharpen).
 #define TMAX_TONE_GAIN 1.0f
 #define TMAX_HIGHLIGHT_ROLLOFF 0.0f
+#elif FILTER_MODE == 4
+// The Kodachrome look with its S-curve at identity, same A/B against mode 0.
+#define KODACHROME_TONE_GAIN 1.0f
+#define KODACHROME_HIGHLIGHT_ROLLOFF 0.0f
 #endif
 #include "jpeg_filter.h"
 

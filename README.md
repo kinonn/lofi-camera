@@ -142,8 +142,8 @@ decode or re-encode, so it costs nothing.
 | Look | Effect | Output |
 |---|---|---|
 | `NONE` | Pass-through | SXGA 1280×1024 |
-| `SUPERIA` | Fuji Superia 400 film look + gaussian unsharp sharpen, ported from the `tools/preview_lab` chain with the lab's default parameters. One decode, one fused colour pass, sharpen as a second pass, one re-encode — no intermediate JPEG round trips. The lab's grain stage is not ported (its default is 0 = off). Measured on the S3 at 240 MHz with `-O3`: about 6.6 s per SXGA shot (decode 0.95, stats 0.65, look 2.09, sharpen 1.24, encode 1.4 s); it was ~14–15 s on the ESP32-CAM. | SXGA 1280×1024 |
-| `KODACHROME` | Kodak Kodachrome 64 film look + vibrance + gaussian unsharp, ported from the `tools/preview_lab` chain “Kodachrome 64 → Vibrance (0.5) → Sharpen (0.4, sigma 1)”. Same one-decode, one fused colour pass, one sharpen, one re-encode design. The lab's grain is reproduced as per-pixel monochrome noise (the default grain size 1.2 is below the lab's own blur threshold). Measured on the S3 at 240 MHz with `-O3`: about 7.3 s per SXGA shot (decode 0.87, stats 0.66, look 2.71, sharpen 1.28, encode 1.35 s). | SXGA 1280×1024 |
+| `SUPERIA` | Fuji Superia 400 film look + gaussian unsharp sharpen, ported from the `tools/preview_lab` chain with the lab's default parameters. One decode, one fused colour pass, sharpen as a second pass, one re-encode — no intermediate JPEG round trips. The lab's grain stage is not ported (its default is 0 = off). Measured on the S3 at 240 MHz with `-O3`: about 6.5 s per SXGA shot (decode 0.89, stats 0.62, look 2.04, sharpen 1.17, encode 1.36 s); it was ~14–15 s on the ESP32-CAM. | SXGA 1280×1024 |
+| `KODACHROME` | Kodak Kodachrome 64 film look + vibrance + gaussian unsharp, ported from the `tools/preview_lab` chain “Kodachrome 64 → Vibrance (0.5) → Sharpen (0.4, sigma 1)”. Same one-decode, one fused colour pass, one sharpen, one re-encode design. The lab's grain is reproduced as per-pixel monochrome noise (the default grain size 1.2 is below the lab's own blur threshold), and the look carries the same S-curve as T-Max (`KODACHROME_TONE_GAIN` 1.12 about mid-grey, then a `KODACHROME_HIGHLIGHT_ROLLOFF` 0.08 shoulder) folded into the tone LUT. Measured on the S3 at 240 MHz with `-O3`: about 7.25 s per SXGA shot (decode 0.92, stats 0.62, look 2.98, sharpen 1.17, encode 1.43 s). | SXGA 1280×1024 |
 | `TMAX` | Kodak T-Max 400 panchromatic B&W + gaussian unsharp, ported from the `tools/preview_lab` chain “T-Max 400 → Sharpen (0.4, sigma 1)”. Same fused design; the panchromatic mix is 0.30/0.59/0.11, with the node's contrast 0.80, vignette 0.30 and grain 0.030, plus an S-curve (`TMAX_TONE_GAIN` 1.12 about mid-grey, then a `TMAX_HIGHLIGHT_ROLLOFF` 0.08 shoulder) that lifts the highlights without clipping them while the shadows go down — see the T-Max macro list below. Measured on the S3 at 240 MHz with `-O3`: about 6.5 s per SXGA shot (decode 0.92, stats 0.65, look 1.71, sharpen 1.28, encode 1.54 s). | SXGA 1280×1024 |
 
 A long press toggles a 24 px preserving white border on any look. Unlike the
@@ -159,12 +159,13 @@ inset and the border is filled around it, with no crop or resampling.
 | any look, border off | 1280×1024 |
 | any look, border on | 1328×1072 |
 
-The T-Max border variant measured 7.25 s per SXGA shot with the 24 px frame
-(encode 2.37 s, about +0.7 s over the plain look); the Superia and
+The T-Max border variant measured 6.34 s per SXGA shot with the 24 px frame
+(decode 0.88, stats 0.62, look 1.80, sharpen 0.80, encode 1.80 s). The first
+runtime-selectable build was about 0.9 s slower: every look parameter was read
+from flash once per pixel, the zero-valued tint block still ran, and the
+sharpen blurred all three planes of a monochrome image. The Superia and
 Kodachrome border variants add the same border/encode stage (not separately
-measured). The numbers predate the runtime-parameter refactor; the extra stage
-branches are uniform and expected to be small, but re-check with
-`-DCAPTURE_TIMING` and `/timing.txt` if the exact figure matters.
+measured).
 
 Controls (GPIO14 → GND, internal pull-up):
 
@@ -203,8 +204,9 @@ scalar).
 
 The Kodachrome filter inlines its node defaults as `KODACHROME_*` macros
 (auto balance 0.62, auto contrast 0.62, saturation 1.24, midtone gamma 0.94,
-smoothstep contrast 0.60, warm 3×3 matrix, shadow/highlight tint, vignette
-0.10, grain 0.010, vibrance 0.50, unsharp amount 0.40 at sigma 1.00),
+smoothstep contrast 0.40, S-curve gain 1.12 with a 0.08 highlight shoulder,
+warm 3×3 matrix, shadow/highlight tint, vignette 0.10, grain 0.010, vibrance
+0.50, unsharp amount 0.40 at sigma 1.00),
 overridable with `-DKODACHROME_<NAME>=<value>`. The 3×3 matrix entries are
 `KODACHROME_MAT_RR` … `KODACHROME_MAT_BB`. The white balance is identity, so
 the linear-light LUT is skipped for this look.

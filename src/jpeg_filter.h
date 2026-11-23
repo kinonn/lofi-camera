@@ -261,7 +261,7 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 #define KODACHROME_MIDTONE_GAMMA 0.94f
 #endif
 #ifndef KODACHROME_TONE_CONTRAST
-#define KODACHROME_TONE_CONTRAST 0.60f
+#define KODACHROME_TONE_CONTRAST 0.40f
 #endif
 #ifndef KODACHROME_MAT_RR
 #define KODACHROME_MAT_RR 1.10f
@@ -323,6 +323,23 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 #ifndef KODACHROME_USM_SIGMA
 #define KODACHROME_USM_SIGMA 1.00f
 #endif
+// The S-curve, same two stages and same order as the T-Max look (and as the
+// lab's tone()): a mid-grey slope that darkens shadows and lifts highlights,
+// then a tanh shoulder that keeps the lifted highlights from clipping. The
+// values mirror T-Max's 1.12/0.08 so the slide gains the same separation;
+// Kodachrome's gentler smoothstep blend (0.60 vs 0.80) keeps the overall
+// curve below T-Max's. Identity is 1.0/0.0, which reproduces the pre-S-curve
+// look exactly.
+#ifndef KODACHROME_TONE_GAIN
+#define KODACHROME_TONE_GAIN 1.12f
+#endif
+#ifndef KODACHROME_HIGHLIGHT_ROLLOFF
+#define KODACHROME_HIGHLIGHT_ROLLOFF 0.08f
+#endif
+static_assert(
+    KODACHROME_HIGHLIGHT_ROLLOFF >= 0.0f && KODACHROME_HIGHLIGHT_ROLLOFF < 1.0f,
+    "KODACHROME_HIGHLIGHT_ROLLOFF must be in [0, 1): 1 would flatten the "
+    "whole tonal range into the knee");
 
 // T-Max 400 values are the preview_lab node defaults for
 // "T-Max 400 -> Sharpen (0.4, sigma 1)".
@@ -416,7 +433,10 @@ struct FilmLookParams {
   float monoR, monoG, monoB;
 };
 
-static const FilmLookParams FILM_LOOKS[FILTER_LOOK_COUNT] = {
+// constexpr so the per-look stage set below is a true compile-time value:
+// each look gets its own instantiation of the look pass and the per-pixel
+// stage branches fold away (that is the ~0.3 s the runtime-generic loop cost).
+static constexpr FilmLookParams FILM_LOOKS[FILTER_LOOK_COUNT] = {
   // NONE: the look pass is skipped, so these values are inert.
   { 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f,
     1.0f, 0.0f, 1.0f,
@@ -437,11 +457,11 @@ static const FilmLookParams FILM_LOOKS[FILTER_LOOK_COUNT] = {
     false, false, false,
     1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
     1.0f, 1.0f, 1.0f },
-  // Kodachrome 64: warm matrix, vibrance, grain, graded tints, no S-curve.
+  // Kodachrome 64: warm matrix, vibrance, grain, graded tints, S-curve.
   { KODACHROME_AUTO_BALANCE, KODACHROME_AUTO_CONTRAST,
     1.0f, 1.0f, 1.0f,
     KODACHROME_MIDTONE_GAMMA, KODACHROME_TONE_CONTRAST,
-    1.0f, 0.0f,
+    KODACHROME_TONE_GAIN, KODACHROME_HIGHLIGHT_ROLLOFF,
     KODACHROME_SATURATION,
     KODACHROME_SHADOW_R, KODACHROME_SHADOW_G, KODACHROME_SHADOW_B,
     KODACHROME_HIGHLIGHT_R, KODACHROME_HIGHLIGHT_G, KODACHROME_HIGHLIGHT_B,
@@ -465,6 +485,47 @@ static const FilmLookParams FILM_LOOKS[FILTER_LOOK_COUNT] = {
     false, false, true,
     1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
     TMAX_MONO_R, TMAX_MONO_G, TMAX_MONO_B },
+};
+
+// Which stages a look actually runs, derived from the table itself so the
+// dispatch below and the parameters can never disagree. This replaces the
+// per-pixel `if (c.do...)` flags the runtime-generic loop paid for: each look
+// instantiates its own look pass and the dead branches vanish at compile time.
+enum LookStage : int {
+  LOOK_NONE          = 0,
+  LOOK_WB            = 1 << 0,
+  LOOK_TONE          = 1 << 1,
+  LOOK_VIGN          = 1 << 2,
+  LOOK_MATRIX        = 1 << 3,
+  LOOK_SAT           = 1 << 4,
+  LOOK_VIBRANCE      = 1 << 5,
+  LOOK_GRAIN         = 1 << 6,
+  LOOK_TINTS         = 1 << 7,
+  LOOK_GRADED_TINTS  = 1 << 8,
+  LOOK_MONO          = 1 << 9,
+};
+
+static constexpr int lookStages(const FilmLookParams& p) {
+  return ((p.wbR != 1.0f || p.wbG != 1.0f || p.wbB != 1.0f) ? LOOK_WB : 0) |
+         ((p.midtoneGamma != 1.0f || p.toneContrast != 0.0f ||
+           p.toneGain != 1.0f || p.highlightRolloff > 0.0f) ? LOOK_TONE : 0) |
+         ((p.vignette > 0.0f) ? LOOK_VIGN : 0) |
+         (p.hasMatrix ? LOOK_MATRIX : 0) |
+         ((p.saturation != 1.0f) ? LOOK_SAT : 0) |
+         ((p.vibrance > 0.0f) ? LOOK_VIBRANCE : 0) |
+         ((p.grain > 0.0f) ? LOOK_GRAIN : 0) |
+         ((p.shadowR != 0.0f || p.shadowG != 0.0f || p.shadowB != 0.0f ||
+           p.highlightR != 0.0f || p.highlightG != 0.0f ||
+           p.highlightB != 0.0f) ? LOOK_TINTS : 0) |
+         (p.gradedTints ? LOOK_GRADED_TINTS : 0) |
+         (p.mono ? LOOK_MONO : 0);
+}
+
+static constexpr int LOOK_STAGES[FILTER_LOOK_COUNT] = {
+  lookStages(FILM_LOOKS[FILTER_LOOK_NONE]),
+  lookStages(FILM_LOOKS[FILTER_LOOK_SUPERIA]),
+  lookStages(FILM_LOOKS[FILTER_LOOK_KODACHROME]),
+  lookStages(FILM_LOOKS[FILTER_LOOK_TMAX]),
 };
 
 // The macros below are the hot-loop names the existing pipeline already uses;
@@ -621,11 +682,15 @@ static void usmInitLuts(void) {
     usmLutVign[i] = powf(t, 1.2f);
     usmLutInvMax[i] = i > 0 ? 255.0f / (float)i : 0.0f;
   }
-  usmBuildWbLut();
+  // Identity gains (Kodachrome/T-Max) never read this table -- doWb is false
+  // for them -- so skip ~768 powf round trips that decode timing would
+  // otherwise pay on every shot.
+  if (FILM_WB_R != 1.0f || FILM_WB_G != 1.0f || FILM_WB_B != 1.0f)
+    usmBuildWbLut();
   // An identity/unwanted curve is skipped, but the decision is now runtime.
-  // Every stage of the tonal curve has to be listed here AND in the doTone()
-  // test in jpegFilterStream(): a stage missing from either one is silently
-  // dropped, not merely mis-tuned.
+  // Every stage of the tonal curve has to be listed here AND in lookStages()
+  // below: a stage missing from either one is silently dropped, not merely
+  // mis-tuned.
   if (FILM_MIDTONE_GAMMA != 1.0f || FILM_TONE_CONTRAST != 0.0f ||
       FILM_TONE_GAIN != 1.0f || FILM_TONE_ROLLOFF > 0.0f)
     for (int i = 0; i < SUPERIA_LUT_N; i++) {
@@ -687,13 +752,18 @@ static inline int usmSlotsPerGroup(int rad) {
 // Per-pixel, no neighbour reads. Kept as a row-range function so a second core
 // could take a band later; currently run on one core (a second busy core drew
 // enough current to brown out the board).
+//
+// The look-constant stages are a template parameter (LOOK_STAGES, derived
+// from the table at compile time) so each look gets its own instantiation and
+// the per-pixel stage branches fold away -- the runtime-generic loop cost
+// about 0.3 s per colour shot in branch checks and register pressure alone.
+// The content-dependent stages (auto balance needs this frame's masked means,
+// auto contrast its percentiles) stay runtime flags.
 struct UsmLook {
   uint16_t* px;
   int w, h;
   float gainR, gainG, gainB;
-  bool doBalance, doContrast, doWb, doTone, doVign;
-  bool doMatrix, doSat, doVibrance, doGrain;
-  bool doGradedTints, doMono;
+  bool doBalance, doContrast;
   float cx, cy, invCxn, invCyn;
 };
 
@@ -708,9 +778,23 @@ static USM_ALWAYS_INLINE float usmNoise(int x, int y) {
   return (float)(h & 0xFFFFu) * (2.0f / 65535.0f) - 1.0f;
 }
 
+template <int STAGES>
 static void usmLookRows(const UsmLook& c, int y0, int y1) {
   uint16_t* px = c.px;
   const int w = c.w;
+  // The look table is const, so it lives in flash: reading FILM_* inside the
+  // pixel loop became one pointer load per parameter per pixel when looks
+  // turned runtime-selectable. Read them once per call instead so the loop
+  // works from registers (or at worst a cached stack slot).
+  const float sat = FILM_SATURATION;
+  const float shR = FILM_SHADOW_R, shG = FILM_SHADOW_G, shB = FILM_SHADOW_B;
+  const float hiR = FILM_HIGHLIGHT_R, hiG = FILM_HIGHLIGHT_G,
+      hiB = FILM_HIGHLIGHT_B;
+  const float mRR = FILM_MAT_RR, mRG = FILM_MAT_RG, mRB = FILM_MAT_RB;
+  const float mGR = FILM_MAT_GR, mGG = FILM_MAT_GG, mGB = FILM_MAT_GB;
+  const float mBR = FILM_MAT_BR, mBG = FILM_MAT_BG, mBB = FILM_MAT_BB;
+  const float monoR = FILM_MONO_R, monoG = FILM_MONO_G, monoB = FILM_MONO_B;
+  const float vign = FILM_VIGNETTE, grain = FILM_GRAIN, vib = FILM_VIBRANCE;
   for (int y = y0; y < y1; y++) {
     const float yy = ((float)y - c.cy) * c.invCyn;
     for (int x = 0; x < w; x++) {
@@ -729,67 +813,89 @@ static void usmLookRows(const UsmLook& c, int y0, int y1) {
         const float sc = usmLutContrast[li];
         f[0] *= sc; f[1] *= sc; f[2] *= sc;
       }
-      if (c.doWb) {
+      if (STAGES & LOOK_WB) {
         for (int ch = 0; ch < 3; ch++)
           f[ch] = usmLutWb[ch][usmToU8(f[ch] * 255.0f)] * USM_INV255;
       }
       L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
 
-      if (c.doMatrix) {
+      if (STAGES & LOOK_MATRIX) {
         const float r = f[0], g = f[1], b = f[2];
-        f[0] = FILM_MAT_RR * r + FILM_MAT_RG * g + FILM_MAT_RB * b;
-        f[1] = FILM_MAT_GR * r + FILM_MAT_GG * g + FILM_MAT_GB * b;
-        f[2] = FILM_MAT_BR * r + FILM_MAT_BG * g + FILM_MAT_BB * b;
+        f[0] = mRR * r + mRG * g + mRB * b;
+        f[1] = mGR * r + mGG * g + mGB * b;
+        f[2] = mBR * r + mBG * g + mBB * b;
       }
-      if (c.doSat) {
+      if (STAGES & LOOK_SAT) {
+        // Saturation pivots on the post-matrix luma; the tone stage below then
+        // needs the post-saturation luma, so both are recomputed here. Without
+        // either stage the WB-step luma is still current.
         L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
-        for (int ch = 0; ch < 3; ch++) f[ch] = L + (f[ch] - L) * FILM_SATURATION;
+        for (int ch = 0; ch < 3; ch++) f[ch] = L + (f[ch] - L) * sat;
+        L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
+      } else if (STAGES & LOOK_MATRIX) {
+        L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
       }
-      L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
 
-      if (c.doTone) {
+      if (STAGES & LOOK_TONE) {
         const float sc = usmLutGammaScale[usmToU8(L * 255.0f)];
         f[0] *= sc; f[1] *= sc; f[2] *= sc;
       }
-      if (c.doGradedTints) {
+      if (STAGES & LOOK_GRADED_TINTS) {
         // The lab tints read the luma of the graded image, after gamma/contrast.
         L = 0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2];
       }
-      {
+      if (STAGES & LOOK_TINTS) {
         const float Lc = usmClampF(L, 0.0f, 1.0f);
         const float shw = (1.0f - Lc) * (1.0f - Lc);
         const float hiw = Lc * Lc;
-        f[0] += FILM_SHADOW_R * shw + FILM_HIGHLIGHT_R * hiw;
-        f[1] += FILM_SHADOW_G * shw + FILM_HIGHLIGHT_G * hiw;
-        f[2] += FILM_SHADOW_B * shw + FILM_HIGHLIGHT_B * hiw;
+        f[0] += shR * shw + hiR * hiw;
+        f[1] += shG * shw + hiG * hiw;
+        f[2] += shB * shw + hiB * hiw;
       }
-      if (c.doMono) {
-        // Panchromatic B&W mix; the lab applies it after the tints and before
-        // the optical stages. T-Max's node tint is neutral, so no tint term.
-        const float g = FILM_MONO_R * f[0] + FILM_MONO_G * f[1] + FILM_MONO_B * f[2];
-        f[0] = g; f[1] = g; f[2] = g;
+      if (STAGES & LOOK_MONO) {
+        // Panchromatic B&W mix. Everything after the mix is channel-uniform,
+        // so the tail runs on one scalar instead of three channels; vibrance
+        // is exactly identity on grey (sat == 0, so the gain cancels around
+        // the average) and is skipped outright.
+        float g = monoR * f[0] + monoG * f[1] + monoB * f[2];
+        if (STAGES & LOOK_VIGN) {
+          const float xx = ((float)x - c.cx) * c.invCxn;
+          const float d = (xx * xx + yy * yy) * 0.5f;
+          g *= usmClampF(1.0f - vign * usmLut8(usmLutVign, d), 0.0f, 1.0f);
+        }
+        if (STAGES & LOOK_GRAIN) {
+          // Same luma expression as the colour path (the weights do not sum to
+          // exactly 1.0f in binary), so the output stays bit-identical.
+          const float Lg = usmClampF(0.2126f * g + 0.7152f * g + 0.0722f * g,
+                                     0.0f, 1.0f);
+          const float wgt = 0.35f + 0.65f * (1.0f - fabsf(2.0f * Lg - 1.0f));
+          g += usmNoise(x, y) * (1.514f * grain * wgt);
+        }
+        const uint8_t v = usmToU8(g * 255.0f);
+        px[(size_t)y * w + x] = usmPack565(v, v, v);
+        continue;
       }
-      if (c.doVign) {
+      if (STAGES & LOOK_VIGN) {
         const float xx = ((float)x - c.cx) * c.invCxn;
         const float d = (xx * xx + yy * yy) * 0.5f;
-        const float vs = usmClampF(1.0f - FILM_VIGNETTE * usmLut8(usmLutVign, d), 0.0f, 1.0f);
+        const float vs = usmClampF(1.0f - vign * usmLut8(usmLutVign, d), 0.0f, 1.0f);
         f[0] *= vs; f[1] *= vs; f[2] *= vs;
       }
-      if (c.doGrain) {
+      if (STAGES & LOOK_GRAIN) {
         const float Lg = usmClampF(0.2126f * f[0] + 0.7152f * f[1] + 0.0722f * f[2],
                                    0.0f, 1.0f);
         const float wgt = 0.35f + 0.65f * (1.0f - fabsf(2.0f * Lg - 1.0f));
-        const float n = usmNoise(x, y) * (1.514f * FILM_GRAIN * wgt);
+        const float n = usmNoise(x, y) * (1.514f * grain * wgt);
         f[0] += n; f[1] += n; f[2] += n;
       }
-      if (c.doVibrance) {
+      if (STAGES & LOOK_VIBRANCE) {
         float mx = f[0], mn = f[0];
         if (f[1] > mx) mx = f[1];
         if (f[2] > mx) mx = f[2];
         if (f[1] < mn) mn = f[1];
         if (f[2] < mn) mn = f[2];
-        const float sat = (mx - mn) * usmLutInvMax[usmToU8(mx * 255.0f)];
-        const float gain = 1.0f + FILM_VIBRANCE * (1.0f - sat);
+        const float s = (mx - mn) * usmLutInvMax[usmToU8(mx * 255.0f)];
+        const float gain = 1.0f + vib * (1.0f - s);
         const float avg = (f[0] + f[1] + f[2]) * (1.0f / 3.0f);
         for (int ch = 0; ch < 3; ch++) f[ch] = avg + (f[ch] - avg) * gain;
       }
@@ -815,8 +921,8 @@ static void usmLookRows(const UsmLook& c, int y0, int y1) {
 // MACs. Wider kernels use 16/24 slots and the scalar path.
 template <int R>
 static void usmHblurRowT(const uint8_t* __restrict src, int16_t* __restrict dst,
-                         const int* __restrict k, int w, int stride) {
-  for (int c = 0; c < 3; c++) {
+                         const int* __restrict k, int w, int stride, int chans) {
+  for (int c = 0; c < chans; c++) {
     const uint8_t* s = src + c * w;
     int16_t* d = dst + (size_t)c * w * stride;
 
@@ -890,8 +996,12 @@ static bool usmSimdSelfTest() {
 template <int R>
 static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
                         uint8_t* row8, const int* k, int amountQ8,
-                        int stride, bool allowSimd) {
+                        int stride, bool allowSimd, bool mono) {
   const int ringRows = 2 * R + 1;
+  // A mono look packs one value into all three channels, and R and B share the
+  // same 5-bit grid, so their planes -- and therefore their unsharp results --
+  // are identical: two blurs cover the frame instead of three.
+  const int chans = mono ? 2 : 3;
 
   // Horizontal blur of canvas row ysrc into its ring slot (ysrc outside the
   // frame replicates row 0/h-1). `ring + slot` is the group's slot 0.
@@ -903,10 +1013,10 @@ static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
       usmUnpack565(src[x], rgb);
       row8[x] = rgb[0];
       row8[w + x] = rgb[1];
-      row8[2 * w + x] = rgb[2];
+      if (!mono) row8[2 * w + x] = rgb[2];
     }
     const int slot = (ysrc % ringRows + ringRows) % ringRows;
-    usmHblurRowT<R>(row8, ring + slot, k, w, stride);
+    usmHblurRowT<R>(row8, ring + slot, k, w, stride, chans);
   };
 
   for (int y = -R; y <= R; y++) hblurSlot(y);  // prime the ring window
@@ -929,7 +1039,7 @@ static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
 #if !USM_SIMD_ENABLED
     (void)allowSimd;
 #endif
-    for (int c = 0; c < 3; c++) {
+    for (int c = 0; c < chans; c++) {
       int16_t* grp = ring + (size_t)c * w * stride;
 #if USM_SIMD_ENABLED
       if (allowSimd && stride == USM_SLOTS_PER_GROUP)
@@ -943,6 +1053,15 @@ static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
     for (int x = 0; x < w; x++) {
       uint8_t rgb[3];
       usmUnpack565(prow[x], rgb);
+      if (mono) {
+        const int b0 = row8[x], b1 = row8[w + x];
+        int v0 = (int)rgb[0] + ((((int)rgb[0] - b0) * amountQ8 + 128) >> 8);
+        int v1 = (int)rgb[1] + ((((int)rgb[1] - b1) * amountQ8 + 128) >> 8);
+        const uint8_t o0 = (uint8_t)(v0 < 0 ? 0 : (v0 > 255 ? 255 : v0));
+        const uint8_t o1 = (uint8_t)(v1 < 0 ? 0 : (v1 > 255 ? 255 : v1));
+        prow[x] = usmPack565(o0, o1, o0);
+        continue;
+      }
       uint8_t out[3];
       for (int c = 0; c < 3; c++) {
         const int blurred = row8[c * w + x];
@@ -1091,18 +1210,10 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
 
     // Pass 3: the whole look in one per-pixel pass, in lab order. The white
     // balance is one byte lookup per channel (fused toLin/gain/toSrgb table).
+    // The look-constant stage set comes from LOOK_STAGES (compile time, derived
+    // from the same table); only the content-gated stages stay runtime flags.
     const bool doBalance  = (FILM_AUTO_BALANCE > 0) && (maskedN >= 200);
     const bool doContrast = (FILM_AUTO_CONTRAST > 0) && ((hi - lo) >= 0.02f);
-    const bool doWb       = (FILM_WB_R != 1.0f || FILM_WB_G != 1.0f || FILM_WB_B != 1.0f);
-    const bool doTone     = (FILM_MIDTONE_GAMMA != 1.0f || FILM_TONE_CONTRAST != 0.0f ||
-                             FILM_TONE_GAIN != 1.0f || FILM_TONE_ROLLOFF > 0.0f);
-    const bool doVign     = (FILM_VIGNETTE > 0);
-    const bool doMatrix   = gFilm->hasMatrix;
-    const bool doSat      = (FILM_SATURATION != 1.0f);
-    const bool doVibrance = FILM_VIBRANCE > 0;
-    const bool doGrain    = FILM_GRAIN > 0;
-    const bool doGradedTints = gFilm->gradedTints;
-    const bool doMono     = gFilm->mono;
     const float ac = FILM_AUTO_CONTRAST;
     const float cx = (float)(w - 1) * 0.5f, cy = (float)(h - 1) * 0.5f;
     const float cxn = cx > 1.0f ? cx : 1.0f, cyn = cy > 1.0f ? cy : 1.0f;
@@ -1118,11 +1229,21 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
     }
 
     const UsmLook look = { px, w, h, gainR, gainG, gainB,
-                           doBalance, doContrast, doWb, doTone, doVign,
-                           doMatrix, doSat, doVibrance, doGrain,
-                           doGradedTints, doMono,
+                           doBalance, doContrast,
                            cx, cy, invCxn, invCyn };
-    usmLookRows(look, 0, h);
+    switch (gFilterLook) {
+      case FILTER_LOOK_SUPERIA:
+        usmLookRows<LOOK_STAGES[FILTER_LOOK_SUPERIA]>(look, 0, h);
+        break;
+      case FILTER_LOOK_KODACHROME:
+        usmLookRows<LOOK_STAGES[FILTER_LOOK_KODACHROME]>(look, 0, h);
+        break;
+      case FILTER_LOOK_TMAX:
+        usmLookRows<LOOK_STAGES[FILTER_LOOK_TMAX]>(look, 0, h);
+        break;
+      default:
+        break;  // NONE never reaches the look pass (doLook guard above)
+    }
     mark(gJpegCaptureTiming.lookMs);
 
     // ---- sharpen: separable gaussian unsharp per channel ----------------------
@@ -1185,14 +1306,14 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
       }
 
       switch (rad) {
-        case 1: usmSharpenT<1>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
-        case 2: usmSharpenT<2>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
-        case 3: usmSharpenT<3>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
-        case 4: usmSharpenT<4>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
-        case 5: usmSharpenT<5>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
-        case 6: usmSharpenT<6>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
-        case 7: usmSharpenT<7>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
-        default: usmSharpenT<8>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing); break;
+        case 1: usmSharpenT<1>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing, gFilm->mono); break;
+        case 2: usmSharpenT<2>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing, gFilm->mono); break;
+        case 3: usmSharpenT<3>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing, gFilm->mono); break;
+        case 4: usmSharpenT<4>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing, gFilm->mono); break;
+        case 5: usmSharpenT<5>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing, gFilm->mono); break;
+        case 6: usmSharpenT<6>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing, gFilm->mono); break;
+        case 7: usmSharpenT<7>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing, gFilm->mono); break;
+        default: usmSharpenT<8>(px, w, h, ring, row8, kern, amountQ8, slots, !heapRing, gFilm->mono); break;
       }
       if (heapRing) free(ring);
       if (heapRow) free(row8);
