@@ -359,6 +359,42 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 #ifndef TMAX_USM_SIGMA
 #define TMAX_USM_SIGMA 1.00f
 #endif
+// The S-curve has two halves, both folded into the tonal LUT:
+//
+//   TMAX_TONE_GAIN       slope about mid-grey, applied after the smoothstep
+//                        blend. >1 darkens the shadows and lifts the highlights
+//                        symmetrically, which is what a genuine contrast
+//                        increase does -- and, on its own, it clips.
+//   TMAX_HIGHLIGHT_ROLLOFF  film's shoulder: everything above 1 - rolloff is
+//                        compressed into a tanh knee that asymptotes below
+//                        white instead of clipping. It is what keeps a lifted
+//                        highlight from reading as blown, and it buys back the
+//                        headroom the unsharp mask below would otherwise eat
+//                        (USM runs after the tone stage and clamps at 255).
+//
+// Same two stages, same order, as tools/film_lab/film_emulation.py's tone()
+// (contrast_gain then _highlight_rolloff) -- the lab is the design bench, so
+// the firmware copies its curve rather than inventing one. The identity is 1.0
+// for the gain and 0 for the rolloff: either one alone is a valid look, and
+// both at identity reproduce the pre-S-curve T-Max exactly.
+//
+// 1.12 / 0.08 is measured, not guessed: against the pre-change binary on a
+// linear ramp, the upper-mid tones rise 208 -> 218 and the top of the ramp
+// rises 228 -> 238, while the last code stays at the old value (228) instead of
+// following it up -- that held top is the shoulder. Shadows move the other way
+// (pixels under 6/255 go 6.5% -> 14.6% of the ramp) and the distinct levels in
+// the ramp go 36 -> 54, so the S adds separation rather than flattening it. A
+// 0.16 knee put the top of the ramp back at 228, undoing the lift; 0.08 is the
+// narrowest knee that still gives the unsharp mask headroom to clip into.
+#ifndef TMAX_TONE_GAIN
+#define TMAX_TONE_GAIN 1.12f
+#endif
+#ifndef TMAX_HIGHLIGHT_ROLLOFF
+#define TMAX_HIGHLIGHT_ROLLOFF 0.08f
+#endif
+static_assert(TMAX_HIGHLIGHT_ROLLOFF >= 0.0f && TMAX_HIGHLIGHT_ROLLOFF < 1.0f,
+              "TMAX_HIGHLIGHT_ROLLOFF must be in [0, 1): 1 would flatten the "
+              "whole tonal range into the knee");
 
 // Per-look runtime parameters. The three looks share one pipeline; selecting a
 // look changes only this table entry. Every value stays -D-overridable through
@@ -367,6 +403,7 @@ struct FilmLookParams {
   float autoBalance, autoContrast;
   float wbR, wbG, wbB;
   float midtoneGamma, toneContrast;
+  float toneGain, highlightRolloff;
   float saturation;
   float shadowR, shadowG, shadowB;
   float highlightR, highlightG, highlightB;
@@ -381,15 +418,18 @@ struct FilmLookParams {
 
 static const FilmLookParams FILM_LOOKS[FILTER_LOOK_COUNT] = {
   // NONE: the look pass is skipped, so these values are inert.
-  { 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.0f,
+  { 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f,
+    1.0f, 0.0f, 1.0f,
     0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
     0.0f, 0.0f, false, false, false,
     1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
     1.0f, 1.0f, 1.0f },
-  // Superia 400: no matrix, no saturation/vibrance/grain.
+  // Superia 400: no matrix, no saturation/vibrance/grain, no S-curve.
   { SUPERIA_AUTO_BALANCE, SUPERIA_AUTO_CONTRAST,
     SUPERIA_WB_R, SUPERIA_WB_G, SUPERIA_WB_B,
-    SUPERIA_MIDTONE_GAMMA, 0.0f, 1.0f,
+    SUPERIA_MIDTONE_GAMMA, 0.0f,
+    1.0f, 0.0f,
+    1.0f,
     SUPERIA_SHADOW_R, SUPERIA_SHADOW_G, SUPERIA_SHADOW_B,
     SUPERIA_HIGHLIGHT_R, SUPERIA_HIGHLIGHT_G, SUPERIA_HIGHLIGHT_B,
     SUPERIA_VIGNETTE, 0.0f, 0.0f,
@@ -397,10 +437,11 @@ static const FilmLookParams FILM_LOOKS[FILTER_LOOK_COUNT] = {
     false, false, false,
     1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
     1.0f, 1.0f, 1.0f },
-  // Kodachrome 64: warm matrix, vibrance, grain, graded tints.
+  // Kodachrome 64: warm matrix, vibrance, grain, graded tints, no S-curve.
   { KODACHROME_AUTO_BALANCE, KODACHROME_AUTO_CONTRAST,
     1.0f, 1.0f, 1.0f,
     KODACHROME_MIDTONE_GAMMA, KODACHROME_TONE_CONTRAST,
+    1.0f, 0.0f,
     KODACHROME_SATURATION,
     KODACHROME_SHADOW_R, KODACHROME_SHADOW_G, KODACHROME_SHADOW_B,
     KODACHROME_HIGHLIGHT_R, KODACHROME_HIGHLIGHT_G, KODACHROME_HIGHLIGHT_B,
@@ -411,10 +452,13 @@ static const FilmLookParams FILM_LOOKS[FILTER_LOOK_COUNT] = {
     KODACHROME_MAT_GR, KODACHROME_MAT_GG, KODACHROME_MAT_GB,
     KODACHROME_MAT_BR, KODACHROME_MAT_BG, KODACHROME_MAT_BB,
     1.0f, 1.0f, 1.0f },
-  // T-Max 400: panchromatic monochrome, grain, no matrix/saturation/vibrance.
+  // T-Max 400: panchromatic monochrome, grain, S-curve with a film shoulder,
+  // no matrix/saturation/vibrance.
   { TMAX_AUTO_BALANCE, TMAX_AUTO_CONTRAST,
     1.0f, 1.0f, 1.0f,
-    TMAX_MIDTONE_GAMMA, TMAX_TONE_CONTRAST, 1.0f,
+    TMAX_MIDTONE_GAMMA, TMAX_TONE_CONTRAST,
+    TMAX_TONE_GAIN, TMAX_HIGHLIGHT_ROLLOFF,
+    1.0f,
     0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
     TMAX_VIGNETTE, TMAX_GRAIN, 0.0f,
     TMAX_USM_AMOUNT, TMAX_USM_SIGMA,
@@ -434,6 +478,8 @@ static const FilmLookParams* gFilm = &FILM_LOOKS[FILTER_DEFAULT_LOOK];
 #define FILM_WB_B           (gFilm->wbB)
 #define FILM_MIDTONE_GAMMA  (gFilm->midtoneGamma)
 #define FILM_TONE_CONTRAST  (gFilm->toneContrast)
+#define FILM_TONE_GAIN      (gFilm->toneGain)
+#define FILM_TONE_ROLLOFF   (gFilm->highlightRolloff)
 #define FILM_SATURATION     (gFilm->saturation)
 #define FILM_SHADOW_R       (gFilm->shadowR)
 #define FILM_SHADOW_G       (gFilm->shadowG)
@@ -528,11 +574,12 @@ static USM_ALWAYS_INLINE void usmUnpack565(uint16_t v, uint8_t rgb[3]) {
 #define SUPERIA_LUT_N 256
 static float   usmLutToLin[SUPERIA_LUT_N];  // sRGB -> linear, built once
 static uint8_t usmLutWb[3][SUPERIA_LUT_N];  // sRGB -> gain -> sRGB, once
-static float   usmLutGamma[SUPERIA_LUT_N];  // powf(x, midtone gamma), once
 static float   usmLutVign[SUPERIA_LUT_N];   // powf(d, 1.2), once
 // The midtone gamma scales all three channels by lutGamma[L]/L. That division
 // is a __divsf3 call per pixel, so the quotient is tabulated next to the curve.
-// The film "contrast" smoothstep is folded into the same curve.
+// The film "contrast" smoothstep, the mid-grey slope and the highlight shoulder
+// are folded into the same curve. (The curve's own value is not tabulated: the
+// only consumer is this quotient.)
 static float   usmLutGammaScale[SUPERIA_LUT_N];
 // Auto contrast's scale is (L + (s-L)*ac)/L, and `s` depends on this frame's
 // percentiles, so it is rebuilt per shot -- 512 divisions instead of 1.31 M.
@@ -576,14 +623,31 @@ static void usmInitLuts(void) {
   }
   usmBuildWbLut();
   // An identity/unwanted curve is skipped, but the decision is now runtime.
-  if (FILM_MIDTONE_GAMMA != 1.0f || FILM_TONE_CONTRAST != 0.0f)
+  // Every stage of the tonal curve has to be listed here AND in the doTone()
+  // test in jpegFilterStream(): a stage missing from either one is silently
+  // dropped, not merely mis-tuned.
+  if (FILM_MIDTONE_GAMMA != 1.0f || FILM_TONE_CONTRAST != 0.0f ||
+      FILM_TONE_GAIN != 1.0f || FILM_TONE_ROLLOFF > 0.0f)
     for (int i = 0; i < SUPERIA_LUT_N; i++) {
       const float t = i / (float)(SUPERIA_LUT_N - 1);
       float v = FILM_MIDTONE_GAMMA != 1.0f ? powf(t, FILM_MIDTONE_GAMMA) : t;
       if (FILM_TONE_CONTRAST != 0.0f)
         v = v + FILM_TONE_CONTRAST * (v * v * (3.0f - 2.0f * v) - v);
+      // Slope about mid-grey: the S proper. Shadows go down, highlights go up,
+      // and everything past 0/1 would clip -- which is why the shoulder below
+      // is not optional when this is above 1.
+      if (FILM_TONE_GAIN != 1.0f) v = 0.5f + (v - 0.5f) * FILM_TONE_GAIN;
       v = usmClampF(v, 0.0f, 1.0f);
-      usmLutGamma[i] = v;
+      // Film's shoulder. Same expression as the lab's _highlight_rolloff():
+      // a tanh knee of width `rolloff` starting at 1 - rolloff, so white
+      // saturates towards 1 instead of being pinned there. Clipping happens
+      // above *before* this, exactly as in the lab, so the knee never receives
+      // a value over 1 and the plateau it leaves is bounded by the clip point.
+      const float rolloff = usmClampF(FILM_TONE_ROLLOFF, 0.0f, 0.99f);
+      if (rolloff > 0.0f) {
+        const float knee = 1.0f - rolloff;
+        if (v > knee) v = knee + rolloff * tanhf((v - knee) / rolloff);
+      }
       usmLutGammaScale[i] = t > 1e-4f ? v / t : 0.0f;
     }
 }
@@ -1030,7 +1094,8 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
     const bool doBalance  = (FILM_AUTO_BALANCE > 0) && (maskedN >= 200);
     const bool doContrast = (FILM_AUTO_CONTRAST > 0) && ((hi - lo) >= 0.02f);
     const bool doWb       = (FILM_WB_R != 1.0f || FILM_WB_G != 1.0f || FILM_WB_B != 1.0f);
-    const bool doTone     = (FILM_MIDTONE_GAMMA != 1.0f || FILM_TONE_CONTRAST != 0.0f);
+    const bool doTone     = (FILM_MIDTONE_GAMMA != 1.0f || FILM_TONE_CONTRAST != 0.0f ||
+                             FILM_TONE_GAIN != 1.0f || FILM_TONE_ROLLOFF > 0.0f);
     const bool doVign     = (FILM_VIGNETTE > 0);
     const bool doMatrix   = gFilm->hasMatrix;
     const bool doSat      = (FILM_SATURATION != 1.0f);

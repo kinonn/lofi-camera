@@ -142,7 +142,7 @@ decode or re-encode, so it costs nothing.
 | `NONE` | Pass-through | SXGA 1280×1024 |
 | `SUPERIA` | Fuji Superia 400 film look + gaussian unsharp sharpen, ported from the `tools/preview_lab` chain with the lab's default parameters. One decode, one fused colour pass, sharpen as a second pass, one re-encode — no intermediate JPEG round trips. The lab's grain stage is not ported (its default is 0 = off). Measured on the S3 at 240 MHz with `-O3`: about 6.6 s per SXGA shot (decode 0.95, stats 0.65, look 2.09, sharpen 1.24, encode 1.4 s); it was ~14–15 s on the ESP32-CAM. | SXGA 1280×1024 |
 | `KODACHROME` | Kodak Kodachrome 64 film look + vibrance + gaussian unsharp, ported from the `tools/preview_lab` chain “Kodachrome 64 → Vibrance (0.5) → Sharpen (0.4, sigma 1)”. Same one-decode, one fused colour pass, one sharpen, one re-encode design. The lab's grain is reproduced as per-pixel monochrome noise (the default grain size 1.2 is below the lab's own blur threshold). Measured on the S3 at 240 MHz with `-O3`: about 7.3 s per SXGA shot (decode 0.87, stats 0.66, look 2.71, sharpen 1.28, encode 1.35 s). | SXGA 1280×1024 |
-| `TMAX` | Kodak T-Max 400 panchromatic B&W + gaussian unsharp, ported from the `tools/preview_lab` chain “T-Max 400 → Sharpen (0.4, sigma 1)”. Same fused design; the panchromatic mix is 0.30/0.59/0.11, with the node's contrast 0.80, vignette 0.30 and grain 0.030. Measured on the S3 at 240 MHz with `-O3`: about 6.5 s per SXGA shot (decode 0.92, stats 0.65, look 1.71, sharpen 1.28, encode 1.54 s). | SXGA 1280×1024 |
+| `TMAX` | Kodak T-Max 400 panchromatic B&W + gaussian unsharp, ported from the `tools/preview_lab` chain “T-Max 400 → Sharpen (0.4, sigma 1)”. Same fused design; the panchromatic mix is 0.30/0.59/0.11, with the node's contrast 0.80, vignette 0.30 and grain 0.030, plus an S-curve (`TMAX_TONE_GAIN` 1.12 about mid-grey, then a `TMAX_HIGHLIGHT_ROLLOFF` 0.08 shoulder) that lifts the highlights without clipping them while the shadows go down — see the T-Max macro list below. Measured on the S3 at 240 MHz with `-O3`: about 6.5 s per SXGA shot (decode 0.92, stats 0.65, look 1.71, sharpen 1.28, encode 1.54 s). | SXGA 1280×1024 |
 
 A long press toggles a 24 px preserving white border on any look. Unlike the
 old `WHITE_BORDER`, the frame **grows**: the image is shifted intact into the
@@ -212,6 +212,19 @@ The T-Max look inlines its node defaults as `TMAX_*` macros (auto balance
 panchromatic mix 0.30/0.59/0.11, vignette 0.30, grain 0.030, unsharp amount
 0.40 at sigma 1.00). It has no colour matrix, saturation or vibrance stage;
 `TMAX_MONO_R/G/B` adjust the B&W channel mix.
+
+Its tone stage is the only one with the lab's full curve. After the smoothstep
+blend it applies `TMAX_TONE_GAIN` (default 1.12), a slope about mid-grey that
+darkens the shadows and lifts the highlights, and then
+`TMAX_HIGHLIGHT_ROLLOFF` (default 0.08), a tanh shoulder that compresses
+everything above `1 - rolloff` so lifted highlights saturate towards white
+instead of clipping — the same `contrast_gain` → `_highlight_rolloff` pair, in
+the same order, as the lab's `tone()`. Both are folded into the existing
+256-entry tonal LUT, so the per-pixel cost is unchanged; set either to its
+identity (`1.0` / `0.0`) to get the pre-S-curve look back. The shoulder matters
+because the unsharp mask runs *after* the tone stage and clamps at 255: without
+it, a steeper S eats highlight detail that the sharpen pass then cannot recover.
+`TMAX_HIGHLIGHT_ROLLOFF` is range-checked at compile time (0 ≤ r < 1).
 
 **Memory.** `NONE` with border off does not allocate a canvas at all. Every
 re-encoded state decodes into one RGB565 canvas. Bordered states grow the

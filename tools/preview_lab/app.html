@@ -646,13 +646,15 @@ const DEFS = {
         {k:"autoContrast",label:"auto contrast",type:"number",def:0.55,step:"0.05"},
         {k:"midtoneGamma",label:"midtone gamma",type:"number",def:0.98,step:"0.01"},
         {k:"contrast",label:"contrast",type:"number",def:0.80,step:"0.01"},
+        {k:"toneGain",label:"tone gain (S-curve slope)",type:"number",def:1.12,step:"0.02"},
+        {k:"highlightRolloff",label:"highlight rolloff (shoulder)",type:"number",def:0.08,step:"0.01"},
         {k:"vignette",label:"vignette",type:"number",def:0.3,step:"0.01"},
         {k:"grain",label:"grain",type:"number",def:0.03,step:"0.001"},
         {k:"grainSize",label:"grain size",type:"number",def:1.2,step:"0.1"}],
       contract:{recipe:"Kodak T-Max 400 panchromatic B&W, run through the tools/film_lab shared chain (no film_lab preset yet)",
-        stages:["auto_balance", "auto_contrast", "monochrome mix", "midtone gamma", "smoothstep contrast", "vignette", "grain"],
+        stages:["auto_balance", "auto_contrast", "monochrome mix", "midtone gamma", "smoothstep contrast", "mid-grey tone gain", "highlight rolloff", "vignette", "grain"],
         monochromeMix:[0.30,0.59,0.11],
-        contrastControl:"the contrast parameter is the smoothstep blend amount applied after gamma",
+        contrastControl:"the contrast parameter is the smoothstep blend amount applied after gamma; tone gain is a linear slope about mid-grey and highlight rolloff a tanh shoulder above 1 - rolloff, both after it",
         grainRandomness:"fixed-seed PRNG"},
       hasIn:true, hasOut:true},
   grayscale:{title:"Grayscale", operation:"grayscale", group:"pre", desc:"decodePreviewGray math",
@@ -1182,7 +1184,7 @@ function buildPipelineConfig(outputNode){
     photo:{contrast:"contrastGain",threshold:"threshold",strength:"errorDiffusionStrength"},
     canny:{blur:"gaussianBlurPasses",low:"lowThreshold",high:"highThreshold"},
     kodachrome:{contrast:"smoothstepContrast"},
-    tmax:{contrast:"smoothstepContrast"},
+    tmax:{contrast:"smoothstepContrast",toneGain:"contrastGain",highlightRolloff:"highlightRolloff"},
   };
   let effectiveDataType=null;
   const configNodes=chain.map((node,index)=>{

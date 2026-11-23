@@ -51,6 +51,7 @@ MODES = {
     "full": (0, 2, "Superia 400 + USM (firmware)"),
     "kodachrome": (0, 3, "Kodachrome 64 + Vibrance + USM (firmware)"),
     "tmax": (0, 4, "T-Max 400 + USM (firmware)"),
+    "tmax_flat": (3, 4, "T-Max 400 + USM, S-curve off (before)"),
     "superia_border": (0, 5, "Superia 400 + USM + 24 px border"),
     "kodachrome_border": (0, 6, "Kodachrome 64 + Vibrance + USM + 24 px border"),
     "tmax_border": (0, 7, "T-Max 400 + USM + 24 px border"),

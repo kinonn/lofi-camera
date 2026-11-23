@@ -19,6 +19,8 @@
 //   1  look only             -D..._USM_AMOUNT=0 (Superia)
 //   2  USM only              balance/contrast/WB/gamma/tint/vignette switched
 //                            off by zeroing their macros (Superia)
+//   3  T-Max, S-curve off    -DTMAX_TONE_GAIN=1 -DTMAX_HIGHLIGHT_ROLLOFF=0,
+//                            i.e. the pre-S-curve look, for an A/B against 0
 //
 // Usage: host_test <in.jpg> <out.jpg> [quality]
 // quality applies to the re-encode like on device -- default 10, the
@@ -52,6 +54,11 @@
 #define SUPERIA_HIGHLIGHT_G 0.0f
 #define SUPERIA_HIGHLIGHT_B 0.0f
 #define SUPERIA_VIGNETTE 0
+#elif FILTER_MODE == 3
+// The T-Max look with the S-curve's two stages at identity, so mode 0 and mode
+// 3 differ only by the curve (same look, same border, same sharpen).
+#define TMAX_TONE_GAIN 1.0f
+#define TMAX_HIGHLIGHT_ROLLOFF 0.0f
 #endif
 #include "jpeg_filter.h"
 
