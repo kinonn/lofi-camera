@@ -67,17 +67,19 @@ core's S3 build (`CONFIG_SCCB_HARDWARE_I2C_PORT1`), so the buses don't collide.
   automatically — no power cycle.
 - Loop: live preview — the **same SXGA JPEG stream** the stills come from is
   decoded at 1/8 scale (160×128), luma-converted, aspect-fit to 80×64 and
-  centred on the 128×64 OLED, then rendered by the selected preview mode. The
-  panel runs at 400 kHz I2C and the camera at two frame buffers, so the
+  centred on the 128×64 OLED, then rendered by the selected preview mode. An
+  active look is marked with its initial (`S`/`K`/`T`) in the top-right corner,
+  and the preserving border draws a 1 px frame around the panel. The panel runs
+  at 400 kHz I2C and the camera at two frame buffers, so the
   viewfinder settles at ~5 fps at SXGA; the sensor frame period, not the
   renderer, is the limit.
 - Button press (debounced 50 ms): captures **SXGA (1280×1024) JPEG at
   `jpeg_quality = 10`**, saves as `/img_NNNN.jpg` (next free index, never
   overwritten). Expect roughly 90–120 KB per photo — measured at 0.57 bpp on
   the OV2640 module; an OV3660 has a different bitrate and colour response.
-  - Success → OLED shows `Saved to SD` + filename for ~0.9 s.
-  - Failure → `Capture FAILED` (no frame from the sensor) or
-    `Save FAILED` (SD write error / filter error).
+  - Success → OLED shows `Saved` + filename for ~0.9 s.
+  - Failure → `CAM FAILED` (no frame from the sensor) or
+    `SD FAILED` (SD write error / filter error).
   - Because preview and capture share one camera configuration, a shot needs
     **no deinit/init cycle and no AWB/AEC settle** — the next frame is simply
     written to the card. Capture is ~0.2–0.4 s instead of ~1.5–2.5 s.
@@ -86,7 +88,7 @@ core's S3 build (`CONFIG_SCCB_HARDWARE_I2C_PORT1`), so the buses don't collide.
 - Filter button on GPIO14: a short press cycles the capture look
   (`NONE → SUPERIA → KODACHROME → TMAX`), a ≥700 ms hold toggles the 24 px
   preserving white border. The selection is applied to the next shot, stored
-  in NVS, and survives a reboot. The OLED shows the new state for ~1.5 s.
+  in NVS, and survives a reboot. The OLED shows the new state for ~2 s.
   The button is captured by an ISR because the ~5 fps viewfinder loop would
   miss a normal tap if it polled the pin.
 - The sensor runs neutral tone (contrast 0) since it feeds both the preview and
@@ -102,7 +104,7 @@ core's S3 build (`CONFIG_SCCB_HARDWARE_I2C_PORT1`), so the buses don't collide.
   without a good frame does the camera get restarted, so the brief frame
   drops that happen around mode switches and SD activity are ignored.
   Repeated failures back off 1 s → 2 s → 4 s → 8 s, showing
-  `Camera offline / retry Ns`, instead of oscillating between messages.
+  `Offline / retry Ns`, instead of oscillating between messages.
 
 ## Preview renderer
 
@@ -171,13 +173,13 @@ Controls (GPIO14 → GND, internal pull-up):
 | Short press | `NONE` → `SUPERIA` → `KODACHROME` → `TMAX` → `NONE` |
 | Long press (≥700 ms) | Toggle the 24 px border |
 
-The OLED shows the new look/border for ~1.5 s. The selection is stored in NVS
+The OLED shows the new look/border for ~2 s. The selection is stored in NVS
 (namespace `lofi`, keys `look` and `border`), so it survives a reboot. Defaults
 are set by `FILTER_DEFAULT_LOOK` (`FILTER_LOOK_TMAX`) and
 `FILTER_DEFAULT_BORDER` (`0`); erase flash and re-upload (`pio run -t erase`
 then `pio run -t upload`) to return to them. The button pin and timings are
 `FILTER_BUTTON_PIN` (`14`), `FILTER_LONG_PRESS_MS` (`700`),
-`FILTER_DEBOUNCE_MS` (`30`) and `FILTER_TOAST_MS` (`1500`) in
+`FILTER_DEBOUNCE_MS` (`30`) and `FILTER_TOAST_MS` (`2000`) in
 `src/main.cpp`, all `-D` overridable.
 
 Tunables (all `-D` overridable):
@@ -271,7 +273,7 @@ overridable macros, and no extra `#elif` branch is needed.
   needs no cable changes.
 - Camera init failure never halts the unit: it retries forever with an
   attempt counter, so a brownout or slow sensor power-up recovers by itself.
-- Capture outcomes are distinct: `Saved to SD`, `SD card full`,
+- Capture outcomes are distinct: `Saved`, `SD card full`,
   `SD write error`, `10000 files`, `camera error`.
 - Free space is checked before a write starts, and a short write deletes the
   partial file so a truncated JPEG never consumes a name slot.

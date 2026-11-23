@@ -52,7 +52,7 @@
 #define FILTER_DEBOUNCE_MS 30
 #endif
 #ifndef FILTER_TOAST_MS
-#define FILTER_TOAST_MS 1500
+#define FILTER_TOAST_MS 2000
 #endif
 #define OLED_ADDR 0x3C
 #define SCREEN_WIDTH 128
@@ -142,16 +142,71 @@ int sdFailStreak = 0;
 unsigned long lastSdCheck = 0;
 unsigned long lastFrameT = 0;  // time of the last good viewfinder frame
 
+// One horizontally centred line in the default 5x7 font at `size`. The cell
+// advances 6 px per size step, so a 2x line tops out at 10 characters.
+static void centeredText(const char* s, int y, uint8_t size) {
+  display.setTextSize(size);
+  display.setCursor((SCREEN_WIDTH - (int)strlen(s) * 6 * size) / 2, y);
+  display.print(s);
+}
+
+// Status screen: one 2x headline and up to two 1x details, centred as a block.
+// The 2x font is 16 px tall and advances 12 px, so headlines must stay at 10
+// characters or less; details keep 1x because they carry filenames and
+// counters. The filter toast below uses the same hierarchy.
 void showText(const char* l1, const char* l2 = nullptr, const char* l3 = nullptr) {
   DBG("[OLED] %s %s %s\n", l1, l2 ? l2 : "", l3 ? l3 : "");
   if (!oledReady) return;
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println(l1);
-  if (l2) display.println(l2);
-  if (l3) display.println(l3);
+
+  // 16 px headline, then a 6 px gap and 8 px per detail line.
+  const int lines = 1 + (l2 ? 1 : 0) + (l3 ? 1 : 0);
+  int y = (SCREEN_HEIGHT - (16 + (lines - 1) * 14)) / 2;
+  centeredText(l1, y, 2);
+  if (l2) {
+    y += 22;
+    centeredText(l2, y, 1);
+  }
+  if (l3) {
+    y += 14;
+    centeredText(l3, y, 1);
+  }
+  display.display();
+}
+
+// Filter toast. The look name is the thing being chosen, so it gets the 2x
+// font (16 px tall) and the border state is a 1x caption underneath. A 2x
+// glyph advances 12 px, so only 10 characters fit per line: split the
+// two-word names at their space (Kodachrome/64, Superia/400, T-Max/400)
+// rather than letting the printer wrap mid-word. Status screens use the same
+// 2x headline + 1x detail hierarchy through showText().
+static void showFilterToast(const char* name, bool borderOn) {
+  DBG("[OLED] %s Border %s\n", name, borderOn ? "on" : "off");
+  if (!oledReady) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  char line1[16];
+  char line2[16] = "";
+  const char* space = strchr(name, ' ');
+  if (space) {
+    snprintf(line1, sizeof(line1), "%.*s", (int)(space - name), name);
+    snprintf(line2, sizeof(line2), "%s", space + 1);
+  } else {
+    snprintf(line1, sizeof(line1), "%s", name);
+  }
+
+  const int nameLines = line2[0] ? 2 : 1;
+  const int nameH = nameLines * 16;
+  const int top = (SCREEN_HEIGHT - (nameH + 6 + 8)) / 2;  // name, gap, caption
+
+  centeredText(line1, top, 2);
+  if (nameLines == 2) centeredText(line2, top + 16, 2);
+  centeredText(borderOn ? "Border ON" : "Border OFF", top + nameH + 6, 1);
+  // Trace the panel edge when the saved JPEG will get the preserving border:
+  // one drawRect call previews the state faster than the caption alone.
+  if (borderOn) display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
   display.display();
 }
 
@@ -186,14 +241,8 @@ static void applyFilterEvents(uint8_t shortCount, uint8_t longCount) {
   if (longCount & 1u) jpegFilterToggleBorder();
   saveFilterSelection();
 
-  char line[32];
-  if (jpegFilterGetLook() == FILTER_LOOK_NONE && jpegFilterGetBorder()) {
-    snprintf(line, sizeof(line), "Filter: With border");
-  } else {
-    snprintf(line, sizeof(line), "Filter: %s",
-             jpegFilterLookName(jpegFilterGetLook()));
-  }
-  showText(line, jpegFilterGetBorder() ? "Border: on" : "Border: off");
+  showFilterToast(jpegFilterLookName(jpegFilterGetLook()),
+                  jpegFilterGetBorder());
   // Do not block here: the shutter and SD probe must keep running. The loop
   // suppresses preview frames until this deadline so the toast stays visible.
   filterToastUntil = millis() + FILTER_TOAST_MS;
@@ -438,6 +487,25 @@ void drawPreview(const uint8_t* img, int w, int h) {
   if (frame.w <= 0 || frame.h <= 0) return;
   display.clearDisplay();
   previewDraw(display, frame);
+
+  // The saved-border state and active look belong to the JPEG pipeline, but
+  // the viewfinder is the only always-on display, so mirror them here. Both
+  // are drawn after the renderer, which owns the image and never the panel.
+  if (jpegFilterGetBorder()) {
+    display.drawRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_WHITE);
+  }
+  const FilterLook look = jpegFilterGetLook();
+  if (look != FILTER_LOOK_NONE) {
+    // 2x glyph cell is 12x16. The black fill keeps the initial readable over
+    // the dithered image; the 2 px inset leaves the border frame visible.
+    const int x = SCREEN_WIDTH - 14;
+    const int y = 2;
+    display.fillRect(x, y, 12, 16, SSD1306_BLACK);
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(2);
+    display.setCursor(x, y);
+    display.print(jpegFilterLookName(look)[0]);
+  }
   display.display();
 }
 
@@ -508,7 +576,7 @@ bool sdAlive() {
 // Block until a card is mounted, showing status on the OLED. Used at boot and
 // again whenever a card is pulled at runtime.
 void waitForSD() {
-  showText("Checking SD...", "FAT32 microSD");
+  showText("SD card", "checking...");
   sdReady = initSD();
   unsigned int waits = 0;
   while (!sdReady) {
@@ -698,19 +766,19 @@ void savePhoto() {
     return;
   }
 
-  showText("Capturing...", "SXGA JPEG");
+  showText("Capturing", "SXGA JPEG");
 
   char name[24];
   PhotoResult result = captureStill(name, sizeof(name));
 
   switch (result) {
-    case PHOTO_OK:         showText("Saved to SD", name); break;
-    case PHOTO_NO_SPACE:   showText("Save FAILED", "SD card full"); break;
-    case PHOTO_INDEX_FULL: showText("Save FAILED", "10000 files"); break;
-    case PHOTO_WRITE_FAIL: showText("Save FAILED", "SD write error"); break;
-    case PHOTO_FILTER_FAIL: showText("Save FAILED", "filter error"); break;
+    case PHOTO_OK:         showText("Saved", name); break;
+    case PHOTO_NO_SPACE:   showText("SD FAILED", "SD card full"); break;
+    case PHOTO_INDEX_FULL: showText("SD FAILED", "10000 files"); break;
+    case PHOTO_WRITE_FAIL: showText("SD FAILED", "SD write error"); break;
+    case PHOTO_FILTER_FAIL: showText("SD FAILED", "filter error"); break;
     case PHOTO_CAM_FAIL:
-    default:               showText("Capture FAILED", "camera error"); break;
+    default:               showText("CAM FAILED", "camera error"); break;
   }
   delay(result == PHOTO_OK ? 900 : 1200);
 
@@ -726,7 +794,7 @@ bool recoverCamera() {
   char line[20];
   snprintf(line, sizeof(line), "attempt %u", restarts + 1);
   DBG("Viewfinder stalled -- restarting camera (attempt %u)\n", restarts + 1);
-  showText("Camera restart", line);
+  showText("Restarting", line);
 
   if (restartCamera()) {
     restarts = 0;
@@ -746,7 +814,7 @@ bool recoverCamera() {
   if (backoff > CAM_BACKOFF_MAX_MS) backoff = CAM_BACKOFF_MAX_MS;
   snprintf(line, sizeof(line), "retry %lus", backoff / 1000);
   DBG("Camera restart failed -- backing off %lu ms\n", backoff);
-  showText("Camera offline", line);
+  showText("Offline", line);
   delay(backoff);
   return false;
 }
@@ -797,7 +865,7 @@ void waitForCamera() {
   for (;;) {
     char line[20];
     snprintf(line, sizeof(line), "attempt %u", attempt + 1);
-    showText(attempt == 0 ? "Init camera..." : "Retry camera...", line);
+    showText("Camera", attempt == 0 ? "starting" : line);
     const char* mode = nullptr;
     if (cameraStart(&mode)) {
       showText("Camera OK", mode);
@@ -829,10 +897,10 @@ void setup() {
     DBG("SSD1306 not found -- continuing without OLED\n");
   }
 
-  char info[24];
-  snprintf(info, sizeof(info), "PSRAM %u KB",
-           (unsigned)(ESP.getPsramSize() / 1024));
-  showText("ESP32-S3 CAM", info, resetReasonStr());
+  char info[32];
+  snprintf(info, sizeof(info), "ESP32-S3 PSRAM %u MB",
+           (unsigned)(ESP.getPsramSize() / (1024 * 1024)));
+  showText("lo-fi Cam", info, resetReasonStr());
   delay(1500);  // long enough to actually read the two diagnostic lines
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
