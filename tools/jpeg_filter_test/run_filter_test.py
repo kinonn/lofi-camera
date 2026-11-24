@@ -4,8 +4,8 @@ Firmware capture-filter test bench.
 
 Builds the REAL src/jpeg_filter.h as host binaries under WSL and runs it
 over the sample JPEGs, producing the runtime matrix: None (pass-through),
-None + border (WITH_BORDER), the Superia/Kodachrome/T-Max looks, the
-Superia look alone, the USM alone, and the three looks with the image
+None + border (WITH_BORDER), the Superia/Kodachrome/T-Max/Portra looks, the
+Superia look alone, the USM alone, and the four looks with the image
 inset into a 24 px white border, plus an HTML gallery and contact sheets
 for side-by-side inspection.
 
@@ -53,9 +53,11 @@ MODES = {
     "kodachrome_flat": (4, 3, "Kodachrome 64 + Vibrance + USM, S-curve off (before)"),
     "tmax": (0, 4, "T-Max 400 + USM (firmware)"),
     "tmax_flat": (3, 4, "T-Max 400 + USM, S-curve off (before)"),
+    "portra": (0, 8, "Portra 400 + USM (firmware)"),
     "superia_border": (0, 5, "Superia 400 + USM + 24 px border"),
     "kodachrome_border": (0, 6, "Kodachrome 64 + Vibrance + USM + 24 px border"),
     "tmax_border": (0, 7, "T-Max 400 + USM + 24 px border"),
+    "portra_border": (0, 9, "Portra 400 + USM + 24 px border"),
 }
 
 
@@ -122,9 +124,9 @@ def write_gallery(out_dir: Path, groups) -> Path:
 <p class="hint">Output of the real src/jpeg_filter.h compiled for the host
 (WSL), over the test captures: None (pass-through), None + 24 px border
 (WITH_BORDER), the Superia 400 look alone, the USM alone, Superia 400 +
-USM, Kodachrome 64 + Vibrance + USM, T-Max 400 B&amp;W + USM, and the
-same three looks with the image inset into a 24 px white border. Click
-any card for full size; contact sheet links in each filename.</p>
+USM, Kodachrome 64 + Vibrance + USM, T-Max 400 B&amp;W + USM, Portra 400 +
+USM, and the same four looks with the image inset into a 24 px white
+border. Click any card for full size; contact sheet links in each filename.</p>
 {"".join(rows)}
 </body>
 </html>""", encoding="utf-8")

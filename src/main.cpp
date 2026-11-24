@@ -220,7 +220,9 @@ static void loadFilterSelection(void) {
     return;
   }
   uint8_t look = prefs.getUChar(PREFS_KEY_LOOK, (uint8_t)FILTER_DEFAULT_LOOK);
-  if (look >= FILTER_LOOK_COUNT) look = FILTER_DEFAULT_LOOK;
+  // Superia is retired from the button cycle; do not restore a stale selection.
+  if (look >= FILTER_LOOK_COUNT || look == FILTER_LOOK_SUPERIA)
+    look = FILTER_DEFAULT_LOOK;
   jpegFilterSetLook((FilterLook)look);
   jpegFilterSetBorder(prefs.getBool(PREFS_KEY_BORDER, FILTER_DEFAULT_BORDER));
   DBG("Filter restored: %s, border %s\n", jpegFilterLookName(jpegFilterGetLook()),
@@ -236,7 +238,7 @@ static void saveFilterSelection(void) {
 static void applyFilterEvents(uint8_t shortCount, uint8_t longCount) {
   if (!shortCount && !longCount) return;
 
-  const uint8_t steps = (uint8_t)(shortCount % FILTER_LOOK_COUNT);
+  const uint8_t steps = (uint8_t)(shortCount % FILTER_CYCLE_COUNT);
   for (uint8_t i = 0; i < steps; i++) jpegFilterNextLook();
   if (longCount & 1u) jpegFilterToggleBorder();
   saveFilterSelection();

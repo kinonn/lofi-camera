@@ -145,6 +145,10 @@ decode or re-encode, so it costs nothing.
 | `SUPERIA` | Fuji Superia 400 film look + gaussian unsharp sharpen, ported from the `tools/preview_lab` chain with the lab's default parameters. One decode, one fused colour pass, sharpen as a second pass, one re-encode — no intermediate JPEG round trips. The lab's grain stage is not ported (its default is 0 = off). Measured on the S3 at 240 MHz with `-O3`: about 6.5 s per SXGA shot (decode 0.89, stats 0.62, look 2.04, sharpen 1.17, encode 1.36 s); it was ~14–15 s on the ESP32-CAM. | SXGA 1280×1024 |
 | `KODACHROME` | Kodak Kodachrome 64 film look + vibrance + gaussian unsharp, ported from the `tools/preview_lab` chain “Kodachrome 64 → Vibrance (0.5) → Sharpen (0.4, sigma 1)”. Same one-decode, one fused colour pass, one sharpen, one re-encode design. The lab's grain is reproduced as per-pixel monochrome noise (the default grain size 1.2 is below the lab's own blur threshold), and the look carries the same S-curve as T-Max (`KODACHROME_TONE_GAIN` 1.12 about mid-grey, then a `KODACHROME_HIGHLIGHT_ROLLOFF` 0.08 shoulder) folded into the tone LUT. Measured on the S3 at 240 MHz with `-O3`: about 7.25 s per SXGA shot (decode 0.92, stats 0.62, look 2.98, sharpen 1.17, encode 1.43 s). | SXGA 1280×1024 |
 | `TMAX` | Kodak T-Max 400 panchromatic B&W + gaussian unsharp, ported from the `tools/preview_lab` chain “T-Max 400 → Sharpen (0.4, sigma 1)”. Same fused design; the panchromatic mix is 0.30/0.59/0.11, with the node's contrast 0.80, vignette 0.30 and grain 0.030, plus an S-curve (`TMAX_TONE_GAIN` 1.12 about mid-grey, then a `TMAX_HIGHLIGHT_ROLLOFF` 0.08 shoulder) that lifts the highlights without clipping them while the shadows go down — see the T-Max macro list below. Measured on the S3 at 240 MHz with `-O3`: about 6.5 s per SXGA shot (decode 0.92, stats 0.65, look 1.71, sharpen 1.28, encode 1.54 s). | SXGA 1280×1024 |
+| `PORTRA` | Kodak Portra 400 warm golden-pastel film look + gaussian unsharp, ported from the `tools/preview_lab` chain “Portra 400 → Sharpen (0.3, sigma 1)”. Same fused design; auto balance 0.60, auto contrast 0.45, saturation 0.95, white balance 1.04/1.00/0.96, midtone gamma 0.98, smoothstep contrast 0.14, tone gain 1.00 with a 0.03 highlight shoulder, shadow/highlight tint, vignette 0.06, grain 0.010. Not separately measured on hardware. | SXGA 1280×1024 |
+
+`SUPERIA` is retired from the button cycle. The implementation remains for the
+host test, and a saved `SUPERIA` selection falls back to the default on boot.
 
 A long press toggles a 24 px preserving white border on any look. Unlike the
 old `WHITE_BORDER`, the frame **grows**: the image is shifted intact into the
@@ -163,15 +167,15 @@ The T-Max border variant measured 6.34 s per SXGA shot with the 24 px frame
 (decode 0.88, stats 0.62, look 1.80, sharpen 0.80, encode 1.80 s). The first
 runtime-selectable build was about 0.9 s slower: every look parameter was read
 from flash once per pixel, the zero-valued tint block still ran, and the
-sharpen blurred all three planes of a monochrome image. The Superia and
-Kodachrome border variants add the same border/encode stage (not separately
-measured).
+sharpen blurred all three planes of a monochrome image. The Superia,
+Kodachrome and Portra border variants add the same border/encode stage (not
+separately measured).
 
 Controls (GPIO14 → GND, internal pull-up):
 
 | Gesture | Action |
 |---|---|
-| Short press | `NONE` → `SUPERIA` → `KODACHROME` → `TMAX` → `NONE` |
+| Short press | `NONE` → `KODACHROME` → `TMAX` → `PORTRA` → `NONE` |
 | Long press (≥700 ms) | Toggle the 24 px border |
 
 The OLED shows the new look/border for ~2 s. The selection is stored in NVS
@@ -230,6 +234,15 @@ because the unsharp mask runs *after* the tone stage and clamps at 255: without
 it, a steeper S eats highlight detail that the sharpen pass then cannot recover.
 `TMAX_HIGHLIGHT_ROLLOFF` is range-checked at compile time (0 ≤ r < 1).
 
+The Portra filter inlines its node defaults as `PORTRA_*` macros (auto balance
+0.60, auto contrast 0.45, saturation 0.95, white balance 1.04/1.00/0.96,
+midtone gamma 0.98, smoothstep contrast 0.14, tone gain 1.00 with a 0.03
+highlight shoulder, shadow/highlight tint, vignette 0.06, grain 0.010, unsharp
+amount 0.30 at sigma 1.00), overridable with
+`-DPORTRA_<NAME>=<value>`. It has no matrix, vibrance or monochrome stage;
+its grain size 1.2 is below the lab's blur threshold, so only the amount is
+reproduced.
+
 **Memory.** `NONE` with border off does not allocate a canvas at all. Every
 re-encoded state decodes into one RGB565 canvas. Bordered states grow the
 frame: the canvas is `(w+2b) × (h+2b)` (1328×1072 at 24 px), while the
@@ -251,7 +264,7 @@ The border canvas grows with `JPEG_FILTER_INSET_PX`, and
 bound is 0.25 bytes/pixel at encoder quality 10; with the default
 `JPEG_REENCODE_QUALITY` of 60 the budget doubles to 0.5 bytes/pixel.
 
-All three looks share one runtime-parameterized pipeline, one LUT set and the
+All five looks share one runtime-parameterized pipeline, one LUT set and the
 same ring/LUT working set. The sharpen ring (one 16-byte group per
 channel/pixel, holding the 2·radius+1 blurred rows as int16 slots, ~61 KB at
 SXGA) and LUTs (~5 KB) live in internal DRAM, not PSRAM, so peak PSRAM stays
@@ -265,9 +278,10 @@ host, on wider kernels, and when the ring comes from the PSRAM heap. Check the
 link size after any change to these buffers.
 
 Adding a look: add a `FilterLook` value, a `FilmLookParams` entry in
-`FILM_LOOKS`, and a name in `jpegFilterLookName()`; the shared pipeline and
-the border stage pick it up automatically. All values are ordinary `-D`
-overridable macros, and no extra `#elif` branch is needed.
+`FILM_LOOKS`, a name in `jpegFilterLookName()`, an entry in `LOOK_STAGES`, and
+a dispatch case in `jpegFilterStream`; the shared pipeline and the border stage
+pick it up automatically. All values are ordinary `-D` overridable macros, and
+no extra `#elif` branch is needed.
 
 ## Robustness
 
@@ -315,7 +329,7 @@ pio device monitor -b 115200 -p COM6     # USB CDC serial monitor
 ```
 
 Build output with the checked-in flags (runtime filters, USB CDC, `-O3`):
-RAM 45.1 % (147,644 / 327,680 B), Flash 15.3 % (510,185 / 3,342,336 B).
+RAM 45.1 % (147,644 / 327,680 B), Flash 15.5 % (516,845 / 3,342,336 B).
 
 ### Upload checklist
 
@@ -342,9 +356,9 @@ packages in `tools/film_lab/requirements.txt`; see its
 [README](tools/film_lab/README.md) for setup and options.
 
 `tools/jpeg_filter_test/` compiles the real `src/jpeg_filter.h` for the host
-(under WSL) and runs all ten test modes — `NONE`, `WITH_BORDER`, the three
-looks, the three bordered looks, and the Superia look/USM diagnostics — over
-the sample captures. It writes an HTML gallery to
+(under WSL) and runs the full host test matrix — `NONE`, `WITH_BORDER`, the
+four looks, the four bordered looks, and the Superia/Kodachrome/T-Max
+diagnostics — over the sample captures. It writes an HTML gallery to
 `tools/jpeg_filter_test/out/gallery/index.html`. This is the check that
 `NONE` is byte-identical pass-through and that every bordered output is
 1328×1072 with the image intact.

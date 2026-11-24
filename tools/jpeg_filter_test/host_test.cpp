@@ -13,6 +13,8 @@
 //   5  Superia 400 + border
 //   6  Kodachrome 64 + border
 //   7  T-Max 400 + border
+//   8  Portra 400
+//   9  Portra 400 + border
 // FILTER_MODE selects which part of the chain is active, by the same -D
 // macros the firmware exposes (see platformio.ini):
 //   0  as shipped            look + USM sharpen
@@ -82,6 +84,8 @@ static void selectFilter(int kind) {
     case 5: look = FILTER_LOOK_SUPERIA;    border = true;  break;
     case 6: look = FILTER_LOOK_KODACHROME; border = true;  break;
     case 7: look = FILTER_LOOK_TMAX;       border = true;  break;
+    case 8: look = FILTER_LOOK_PORTRA;     border = false; break;
+    case 9: look = FILTER_LOOK_PORTRA;     border = true;  break;
     default: break;
   }
   jpegFilterSetLook(look);
@@ -92,9 +96,9 @@ static void selectFilter(int kind) {
 static void selfCheck() {
   jpegFilterSetLook(FILTER_LOOK_NONE);
   jpegFilterSetBorder(false);
-  assert(jpegFilterNextLook() == FILTER_LOOK_SUPERIA);
   assert(jpegFilterNextLook() == FILTER_LOOK_KODACHROME);
   assert(jpegFilterNextLook() == FILTER_LOOK_TMAX);
+  assert(jpegFilterNextLook() == FILTER_LOOK_PORTRA);
   assert(jpegFilterNextLook() == FILTER_LOOK_NONE);
   assert(jpegFilterToggleBorder() == true);
   assert(jpegFilterToggleBorder() == false);
@@ -165,9 +169,10 @@ int main(int argc, char **argv) {
 
   // The harness exits 0 only if the output shape and the pass-through contract
   // are right; otherwise a corrupted border or pass-through would go unnoticed.
-  const int border = (FILTER_KIND == 1 || FILTER_KIND >= 5)
-                         ? JPEG_FILTER_INSET_PX
-                         : 0;
+  const bool bordered = FILTER_KIND == 1 || FILTER_KIND == 5 ||
+                        FILTER_KIND == 6 || FILTER_KIND == 7 ||
+                        FILTER_KIND == 9;
+  const int border = bordered ? JPEG_FILTER_INSET_PX : 0;
   const uint16_t wantW = (uint16_t)(fb.width + 2 * border);
   const uint16_t wantH = (uint16_t)(fb.height + 2 * border);
   bool pass = ok && written == sink.n && sink.n > 0 && ow == wantW &&

@@ -629,6 +629,34 @@ const DEFS = {
         stages:["auto_balance", "auto_contrast", "linear white balance", "midtone gamma", "shadow/highlight tint", "vignette", "grain"],
         grainRandomness:"fixed-seed PRNG; values differ from the numpy stream used by the lab"},
       hasIn:true, hasOut:true},
+  // Portra 400: the film_lab preset ported onto the shared host chain,
+  // nudged golden-yellow toward the film.recipes "Kodak Portra Grainy"
+  // recipe (Classic Negative, 5200K +2R -5B, Highlights -2).
+  portra:  {title:"Kodak Portra 400", operation:"film_look_kodak_portra_400", group:"pre", desc:"golden pastels · creamy skin",
+      params:[{k:"autoBalance",label:"auto balance",type:"number",def:0.60,step:"0.05"},
+        {k:"autoContrast",label:"auto contrast",type:"number",def:0.45,step:"0.05"},
+        {k:"saturation",label:"saturation",type:"number",def:0.95,step:"0.01"},
+        {k:"wbR",label:"white balance R",type:"number",def:1.04,step:"0.01"},
+        {k:"wbG",label:"white balance G",type:"number",def:1.00,step:"0.01"},
+        {k:"wbB",label:"white balance B",type:"number",def:0.96,step:"0.01"},
+        {k:"midtoneGamma",label:"midtone gamma",type:"number",def:0.98,step:"0.01"},
+        {k:"contrast",label:"contrast",type:"number",def:0.14,step:"0.01"},
+        {k:"toneGain",label:"tone gain (S-curve slope)",type:"number",def:1.00,step:"0.02"},
+        {k:"highlightRolloff",label:"highlight rolloff (shoulder)",type:"number",def:0.03,step:"0.01"},
+        {k:"shadowR",label:"shadow tint R",type:"number",def:0.005,step:"0.002"},
+        {k:"shadowG",label:"shadow tint G",type:"number",def:0.003,step:"0.002"},
+        {k:"shadowB",label:"shadow tint B",type:"number",def:0.001,step:"0.002"},
+        {k:"highlightR",label:"highlight tint R",type:"number",def:0.045,step:"0.002"},
+        {k:"highlightG",label:"highlight tint G",type:"number",def:0.020,step:"0.002"},
+        {k:"highlightB",label:"highlight tint B",type:"number",def:-0.020,step:"0.002"},
+        {k:"vignette",label:"vignette",type:"number",def:0.06,step:"0.01"},
+        {k:"grain",label:"grain",type:"number",def:0.010,step:"0.001"},
+        {k:"grainSize",label:"grain size",type:"number",def:1.2,step:"0.1"}],
+      contract:{recipe:"tools/film_lab kodak_portra_400, warmed toward the film.recipes Kodak Portra Grainy recipe",
+        stages:["auto_balance", "auto_contrast", "linear white balance", "saturation", "midtone gamma", "smoothstep contrast", "mid-grey tone gain", "highlight rolloff", "shadow/highlight tint", "vignette", "grain"],
+        notes:"exposure 0.05 EV and softness 0.10 from the film_lab preset have no equivalent stage in this host chain; WB, saturation and highlight tint lean the grade golden-yellow; the highlight shoulder is a small addition for the creamy Portra highlight rolloff",
+        grainRandomness:"fixed-seed PRNG; values differ from the numpy stream used by the lab"},
+      hasIn:true, hasOut:true},
   kodachrome:{title:"Kodak Kodachrome 64", operation:"film_look_kodak_kodachrome_64", group:"pre", desc:"warm reds · golden highlights",
       matrix:[[1.10,-0.04,-0.02],[-0.03,1.00,0.02],[-0.02,0.02,0.99]],
       params:[{k:"autoBalance",label:"auto balance",type:"number",def:0.62,step:"0.05"},
@@ -650,6 +678,36 @@ const DEFS = {
       contract:{recipe:"tools/film_lab kodak_kodachrome_64",
         stages:["auto_balance", "auto_contrast", "3x3 colour matrix", "saturation", "midtone gamma", "smoothstep contrast", "mid-grey tone gain", "highlight rolloff", "shadow/highlight tint", "vignette", "grain"],
         matrix:[[1.10,-0.04,-0.02],[-0.03,1.00,0.02],[-0.02,0.02,0.99]],
+        grainRandomness:"fixed-seed PRNG; values differ from the numpy stream used by the lab"},
+      hasIn:true, hasOut:true},
+  // Classic Negative: Fujifilm's negative-film sim. Defaults follow the lead
+  // recipe on the Fuji X Weekly Classic Negative tag page (KinaColor 26):
+  // warm cast, strong reds, slightly diminished greens, deep shadows.
+  classicneg:{title:"Fuji Classic Negative", operation:"film_look_fuji_classic_negative", group:"pre", desc:"warm reds · muted greens",
+      matrix:[[1.10,-0.05,-0.02],[-0.03,0.97,0.03],[-0.02,0.04,0.95]],
+      params:[{k:"autoBalance",label:"auto balance",type:"number",def:0.50,step:"0.05"},
+        {k:"autoContrast",label:"auto contrast",type:"number",def:0.60,step:"0.05"},
+        {k:"saturation",label:"saturation",type:"number",def:1.10,step:"0.01"},
+        {k:"wbR",label:"white balance R",type:"number",def:1.03,step:"0.01"},
+        {k:"wbG",label:"white balance G",type:"number",def:1.00,step:"0.01"},
+        {k:"wbB",label:"white balance B",type:"number",def:0.96,step:"0.01"},
+        {k:"midtoneGamma",label:"midtone gamma",type:"number",def:1.03,step:"0.01"},
+        {k:"contrast",label:"contrast",type:"number",def:0.42,step:"0.01"},
+        {k:"toneGain",label:"tone gain (S-curve slope)",type:"number",def:1.08,step:"0.02"},
+        {k:"highlightRolloff",label:"highlight rolloff (shoulder)",type:"number",def:0.09,step:"0.01"},
+        {k:"shadowR",label:"shadow tint R",type:"number",def:-0.006,step:"0.002"},
+        {k:"shadowG",label:"shadow tint G",type:"number",def:0.000,step:"0.002"},
+        {k:"shadowB",label:"shadow tint B",type:"number",def:0.012,step:"0.002"},
+        {k:"highlightR",label:"highlight tint R",type:"number",def:0.024,step:"0.002"},
+        {k:"highlightG",label:"highlight tint G",type:"number",def:0.008,step:"0.002"},
+        {k:"highlightB",label:"highlight tint B",type:"number",def:-0.010,step:"0.002"},
+        {k:"vignette",label:"vignette",type:"number",def:0.16,step:"0.01"},
+        {k:"grain",label:"grain",type:"number",def:0.014,step:"0.001"},
+        {k:"grainSize",label:"grain size",type:"number",def:1.1,step:"0.1"}],
+      contract:{recipe:"Fuji X Weekly Classic Negative tag recipes; defaults follow KinaColor 26 (warm cast, strong reds, diminished greens)",
+        filmSimulation:"Classic Negative",
+        stages:["auto_balance", "auto_contrast", "linear white balance", "3x3 colour matrix", "saturation", "midtone gamma", "smoothstep contrast", "mid-grey tone gain", "highlight rolloff", "shadow/highlight tint", "vignette", "grain"],
+        matrix:[[1.10,-0.05,-0.02],[-0.03,0.97,0.03],[-0.02,0.04,0.95]],
         grainRandomness:"fixed-seed PRNG; values differ from the numpy stream used by the lab"},
       hasIn:true, hasOut:true},
   tmax:    {title:"Kodak T-Max 400", operation:"film_look_kodak_tmax_400", group:"pre", desc:"fine-grain B&W",
@@ -1166,7 +1224,9 @@ function buildPipelineConfig(outputNode){
     input:{inputs:[],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
     vibrance:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
     superia:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
+    portra:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
     kodachrome:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
+    classicneg:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
     tmax:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/rgb8-interleaved"}]},
     grayscale:{inputs:[{id:"input",dataType:"image/rgb8-interleaved"}],outputs:[{id:"output",dataType:"image/gray8"}]},
     resize:{inputs:[{id:"input",dataType:"image/gray8"}],outputs:[{id:"output",dataType:"image/gray8"}]},
@@ -1195,7 +1255,9 @@ function buildPipelineConfig(outputNode){
     atkinson:{threshold:"threshold"},
     photo:{contrast:"contrastGain",threshold:"threshold",strength:"errorDiffusionStrength"},
     canny:{blur:"gaussianBlurPasses",low:"lowThreshold",high:"highThreshold"},
+    portra:{contrast:"smoothstepContrast",toneGain:"contrastGain",highlightRolloff:"highlightRolloff"},
     kodachrome:{contrast:"smoothstepContrast",toneGain:"contrastGain",highlightRolloff:"highlightRolloff"},
+    classicneg:{contrast:"smoothstepContrast",toneGain:"contrastGain",highlightRolloff:"highlightRolloff"},
     tmax:{contrast:"smoothstepContrast",toneGain:"contrastGain",highlightRolloff:"highlightRolloff"},
   };
   let effectiveDataType=null;
@@ -1417,8 +1479,16 @@ async function execChain(chain){
         if(!rgb || gray) throw new Error("Fuji Superia 400 must come after Input and before Grayscale");
         rgb = filmLook(rgb,W,H,p); break;
       }
+      case "portra": {
+        if(!rgb || gray) throw new Error("Kodak Portra 400 must come after Input and before Grayscale");
+        rgb = filmLook(rgb,W,H,p); break;
+      }
       case "kodachrome": {
         if(!rgb || gray) throw new Error("Kodak Kodachrome 64 must come after Input and before Grayscale");
+        rgb = filmLook(rgb,W,H,p,{matrix:node.def.matrix}); break;
+      }
+      case "classicneg": {
+        if(!rgb || gray) throw new Error("Fuji Classic Negative must come after Input and before Grayscale");
         rgb = filmLook(rgb,W,H,p,{matrix:node.def.matrix}); break;
       }
       case "tmax": {

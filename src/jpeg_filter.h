@@ -10,11 +10,13 @@
 //   NONE             write the camera frame unchanged (zero cost)
 //   WITH_BORDER      image unchanged, inset into a larger canvas with a white
 //                    frame around it (no crop, no resampling)
-//   SUPERIA_USM      Fuji Superia 400 look + unsharp sharpen
+//   SUPERIA_USM      Fuji Superia 400 look + unsharp sharpen (retired from the
+//                    button cycle; kept for the host test)
 //   KODACHROME_USM   Kodak Kodachrome 64 look + vibrance + unsharp sharpen
 //   TMAX_USM         Kodak T-Max 400 panchromatic B&W + unsharp sharpen
+//   PORTRA_USM       Kodak Portra 400 warm golden-pastel + unsharp sharpen
 //
-// The three looks can also be combined with the same white frame. The runtime
+// The four looks can also be combined with the same white frame. The runtime
 // state is {look, border}; the long-press border toggle in main.cpp turns any
 // look (including NONE) into its bordered variant. NONE + border is the filter
 // formerly called WHITE_BORDER, now WITH_BORDER.
@@ -39,6 +41,7 @@ enum FilterLook : uint8_t {
   FILTER_LOOK_SUPERIA,
   FILTER_LOOK_KODACHROME,
   FILTER_LOOK_TMAX,
+  FILTER_LOOK_PORTRA,
   FILTER_LOOK_COUNT
 };
 
@@ -83,6 +86,7 @@ static inline const char* jpegFilterLookName(FilterLook look) {
     case FILTER_LOOK_SUPERIA:    return "Superia 400";
     case FILTER_LOOK_KODACHROME: return "Kodachrome 64";
     case FILTER_LOOK_TMAX:       return "T-Max 400";
+    case FILTER_LOOK_PORTRA:     return "Portra 400";
     default:                     return "?";
   }
 }
@@ -163,6 +167,7 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 //   Superia    "Fuji Superia 400 -> Sharpen"
 //   Kodachrome "Kodak Kodachrome 64 -> Vibrance -> Sharpen"
 //   T-Max      "Kodak T-Max 400 -> Sharpen" (panchromatic B&W)
+//   Portra     "Kodak Portra 400 -> Sharpen (0.3, sigma 1)"
 // All are ported from tools/preview_lab/app.html. Design: one decode, a single
 // fused colour pass, one neighbourhood pass, one encode. Every look stage is
 // elementwise, so running them as separate JPEG filters would only add
@@ -174,13 +179,15 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 //   -> saturation -> gamma + smoothstep contrast -> shadow/highlight tint
 //   -> monochrome -> vignette -> grain -> vibrance -> gaussian unsharp sharpen
 // Superia skips the matrix, saturation, vibrance and grain stages (its node
-// defaults make them identity/off); T-Max skips matrix, saturation, vibrance
-// and tints, and enables the monochrome mix. Values differ from the lab by
-// construction because the canvas is RGB565 (5/6/5 bits): expect mild extra
-// banding on smooth gradients vs. the lab's 8-bit model. Kodachrome's/T-Max's
-// grain size of 1.2 is below the lab's blur threshold (sigma < 0.3), so only
-// the amount is reproduced; the device grain is the same per-pixel noise,
-// monochrome.
+// defaults make them identity/off); Kodachrome adds a matrix, saturation,
+// vibrance and grain; T-Max skips matrix, saturation, vibrance and tints, and
+// enables the monochrome mix; Portra adds WB, saturation, tone, tints,
+// vignette and grain, with no matrix, vibrance or monochrome stage. Values
+// differ from the lab by construction because the canvas is RGB565 (5/6/5
+// bits): expect mild extra banding on smooth gradients vs. the lab's 8-bit
+// model. Kodachrome's/T-Max's/Portra's grain size of 1.2 is below the lab's
+// blur threshold (sigma < 0.3), so only the amount is reproduced; the device
+// grain is the same per-pixel noise, monochrome.
 
 // Superia tunables, all -D overridable. Values = preview_lab node defaults.
 #ifndef SUPERIA_AUTO_BALANCE
@@ -413,9 +420,77 @@ static_assert(TMAX_HIGHLIGHT_ROLLOFF >= 0.0f && TMAX_HIGHLIGHT_ROLLOFF < 1.0f,
               "TMAX_HIGHLIGHT_ROLLOFF must be in [0, 1): 1 would flatten the "
               "whole tonal range into the knee");
 
-// Per-look runtime parameters. The three looks share one pipeline; selecting a
+// Portra 400 values are the preview_lab node defaults for
+// "Portra 400 -> Sharpen (0.3, sigma 1)". The grade is soft, slightly
+// desaturated and golden-yellow; the 0.03 shoulder keeps the highlights creamy.
+#ifndef PORTRA_AUTO_BALANCE
+#define PORTRA_AUTO_BALANCE 0.60f
+#endif
+#ifndef PORTRA_AUTO_CONTRAST
+#define PORTRA_AUTO_CONTRAST 0.45f
+#endif
+#ifndef PORTRA_SATURATION
+#define PORTRA_SATURATION 0.95f
+#endif
+#ifndef PORTRA_WB_R
+#define PORTRA_WB_R 1.04f
+#endif
+#ifndef PORTRA_WB_G
+#define PORTRA_WB_G 1.00f
+#endif
+#ifndef PORTRA_WB_B
+#define PORTRA_WB_B 0.96f
+#endif
+#ifndef PORTRA_MIDTONE_GAMMA
+#define PORTRA_MIDTONE_GAMMA 0.98f
+#endif
+#ifndef PORTRA_TONE_CONTRAST
+#define PORTRA_TONE_CONTRAST 0.14f
+#endif
+#ifndef PORTRA_TONE_GAIN
+#define PORTRA_TONE_GAIN 1.00f
+#endif
+#ifndef PORTRA_HIGHLIGHT_ROLLOFF
+#define PORTRA_HIGHLIGHT_ROLLOFF 0.03f
+#endif
+#ifndef PORTRA_SHADOW_R
+#define PORTRA_SHADOW_R 0.005f
+#endif
+#ifndef PORTRA_SHADOW_G
+#define PORTRA_SHADOW_G 0.003f
+#endif
+#ifndef PORTRA_SHADOW_B
+#define PORTRA_SHADOW_B 0.001f
+#endif
+#ifndef PORTRA_HIGHLIGHT_R
+#define PORTRA_HIGHLIGHT_R 0.045f
+#endif
+#ifndef PORTRA_HIGHLIGHT_G
+#define PORTRA_HIGHLIGHT_G 0.020f
+#endif
+#ifndef PORTRA_HIGHLIGHT_B
+#define PORTRA_HIGHLIGHT_B (-0.020f)
+#endif
+#ifndef PORTRA_VIGNETTE
+#define PORTRA_VIGNETTE 0.06f
+#endif
+#ifndef PORTRA_GRAIN
+#define PORTRA_GRAIN 0.010f
+#endif
+#ifndef PORTRA_USM_AMOUNT
+#define PORTRA_USM_AMOUNT 0.30f
+#endif
+#ifndef PORTRA_USM_SIGMA
+#define PORTRA_USM_SIGMA 1.00f
+#endif
+static_assert(
+    PORTRA_HIGHLIGHT_ROLLOFF >= 0.0f && PORTRA_HIGHLIGHT_ROLLOFF < 1.0f,
+    "PORTRA_HIGHLIGHT_ROLLOFF must be in [0, 1): 1 would flatten the whole "
+    "tonal range into the knee");
+
+// Per-look runtime parameters. The five looks share one pipeline; selecting a
 // look changes only this table entry. Every value stays -D-overridable through
-// the SUPERIA_*, KODACHROME_* and TMAX_* macros above.
+// the SUPERIA_*, KODACHROME_*, TMAX_* and PORTRA_* macros above.
 struct FilmLookParams {
   float autoBalance, autoContrast;
   float wbR, wbG, wbB;
@@ -485,6 +560,20 @@ static constexpr FilmLookParams FILM_LOOKS[FILTER_LOOK_COUNT] = {
     false, false, true,
     1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
     TMAX_MONO_R, TMAX_MONO_G, TMAX_MONO_B },
+  // Portra 400: soft colour, golden highlights, tints read after the tone
+  // stage, no matrix/vibrance/monochrome.
+  { PORTRA_AUTO_BALANCE, PORTRA_AUTO_CONTRAST,
+    PORTRA_WB_R, PORTRA_WB_G, PORTRA_WB_B,
+    PORTRA_MIDTONE_GAMMA, PORTRA_TONE_CONTRAST,
+    PORTRA_TONE_GAIN, PORTRA_HIGHLIGHT_ROLLOFF,
+    PORTRA_SATURATION,
+    PORTRA_SHADOW_R, PORTRA_SHADOW_G, PORTRA_SHADOW_B,
+    PORTRA_HIGHLIGHT_R, PORTRA_HIGHLIGHT_G, PORTRA_HIGHLIGHT_B,
+    PORTRA_VIGNETTE, PORTRA_GRAIN, 0.0f,
+    PORTRA_USM_AMOUNT, PORTRA_USM_SIGMA,
+    false, true, false,
+    1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+    1.0f, 1.0f, 1.0f },
 };
 
 // Which stages a look actually runs, derived from the table itself so the
@@ -526,6 +615,7 @@ static constexpr int LOOK_STAGES[FILTER_LOOK_COUNT] = {
   lookStages(FILM_LOOKS[FILTER_LOOK_SUPERIA]),
   lookStages(FILM_LOOKS[FILTER_LOOK_KODACHROME]),
   lookStages(FILM_LOOKS[FILTER_LOOK_TMAX]),
+  lookStages(FILM_LOOKS[FILTER_LOOK_PORTRA]),
 };
 
 // The macros below are the hot-loop names the existing pipeline already uses;
@@ -577,8 +667,26 @@ static inline void jpegFilterSetLook(FilterLook look) {
     gFilm = &FILM_LOOKS[look];
   }
 }
+
+// Button cycle. Superia stays implemented and keeps its enum slot so stored
+// look indices do not shift, but it is no longer offered at runtime.
+static constexpr FilterLook FILTER_CYCLE[] = {
+    FILTER_LOOK_NONE, FILTER_LOOK_KODACHROME, FILTER_LOOK_TMAX,
+    FILTER_LOOK_PORTRA,
+};
+static constexpr uint8_t FILTER_CYCLE_COUNT =
+    (uint8_t)(sizeof(FILTER_CYCLE) / sizeof(FILTER_CYCLE[0]));
+
 static inline FilterLook jpegFilterNextLook(void) {
-  gFilterLook = (FilterLook)(((unsigned)gFilterLook + 1u) % FILTER_LOOK_COUNT);
+  for (uint8_t i = 0; i < FILTER_CYCLE_COUNT; i++) {
+    if (FILTER_CYCLE[i] == gFilterLook) {
+      gFilterLook = FILTER_CYCLE[(i + 1) % FILTER_CYCLE_COUNT];
+      gFilm = &FILM_LOOKS[gFilterLook];
+      return gFilterLook;
+    }
+  }
+  // A retired look (e.g. an old NVS value) restarts at the first option.
+  gFilterLook = FILTER_CYCLE[0];
   gFilm = &FILM_LOOKS[gFilterLook];
   return gFilterLook;
 }
@@ -1240,6 +1348,9 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
         break;
       case FILTER_LOOK_TMAX:
         usmLookRows<LOOK_STAGES[FILTER_LOOK_TMAX]>(look, 0, h);
+        break;
+      case FILTER_LOOK_PORTRA:
+        usmLookRows<LOOK_STAGES[FILTER_LOOK_PORTRA]>(look, 0, h);
         break;
       default:
         break;  // NONE never reaches the look pass (doLook guard above)
