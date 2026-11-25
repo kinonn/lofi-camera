@@ -145,7 +145,7 @@ decode or re-encode, so it costs nothing.
 | `SUPERIA` | Fuji Superia 400 film look + gaussian unsharp sharpen, ported from the `tools/preview_lab` chain with the lab's default parameters. One decode, one fused colour pass, sharpen as a second pass, one re-encode — no intermediate JPEG round trips. The lab's grain stage is not ported (its default is 0 = off). Measured on the S3 at 240 MHz with `-O3`: about 6.5 s per SXGA shot (decode 0.89, stats 0.62, look 2.04, sharpen 1.17, encode 1.36 s); it was ~14–15 s on the ESP32-CAM. | SXGA 1280×1024 |
 | `KODACHROME` | Kodak Kodachrome 64 film look + vibrance + gaussian unsharp, ported from the `tools/preview_lab` chain “Kodachrome 64 → Vibrance (0.5) → Sharpen (0.4, sigma 1)”. Same one-decode, one fused colour pass, one sharpen, one re-encode design. The lab's grain is reproduced as per-pixel monochrome noise (the default grain size 1.2 is below the lab's own blur threshold), and the look carries the same S-curve as T-Max (`KODACHROME_TONE_GAIN` 1.12 about mid-grey, then a `KODACHROME_HIGHLIGHT_ROLLOFF` 0.08 shoulder) folded into the tone LUT. Measured on the S3 at 240 MHz with `-O3`: about 7.25 s per SXGA shot (decode 0.92, stats 0.62, look 2.98, sharpen 1.17, encode 1.43 s). | SXGA 1280×1024 |
 | `TMAX` | Kodak T-Max 400 panchromatic B&W + gaussian unsharp, ported from the `tools/preview_lab` chain “T-Max 400 → Sharpen (0.4, sigma 1)”. Same fused design; the panchromatic mix is 0.30/0.59/0.11, with the node's contrast 0.80, vignette 0.30 and grain 0.030, plus an S-curve (`TMAX_TONE_GAIN` 1.12 about mid-grey, then a `TMAX_HIGHLIGHT_ROLLOFF` 0.08 shoulder) that lifts the highlights without clipping them while the shadows go down — see the T-Max macro list below. Measured on the S3 at 240 MHz with `-O3`: about 6.5 s per SXGA shot (decode 0.92, stats 0.65, look 1.71, sharpen 1.28, encode 1.54 s). | SXGA 1280×1024 |
-| `PORTRA` | Kodak Portra 400 warm golden-pastel film look + gaussian unsharp, ported from the `tools/preview_lab` chain “Portra 400 → Sharpen (0.3, sigma 1)”. Same fused design; auto balance 0.60, auto contrast 0.45, saturation 0.95, white balance 1.04/1.00/0.96, midtone gamma 0.98, smoothstep contrast 0.14, tone gain 1.00 with a 0.03 highlight shoulder, shadow/highlight tint, vignette 0.06, grain 0.010. Not separately measured on hardware. | SXGA 1280×1024 |
+| `PORTRA` | Kodak Portra 400 warm golden-pastel film look + gaussian unsharp, ported from the `tools/preview_lab` chain “Portra 400 → Sharpen (0.3, sigma 1)”. Same fused design; auto balance 0.60, auto contrast 0.45, saturation 0.95, white balance 1.04/1.00/0.96, midtone gamma 0.98, smoothstep contrast 0.14, tone gain 1.00 with a 0.03 highlight shoulder, shadow/highlight tint, vignette 0.06, grain 0.010. Not measured unbordered; the bordered variant is 7.02 s single-core / 6.01 s dual-core (timing table below). | SXGA 1280×1024 |
 
 `SUPERIA` is retired from the button cycle. The implementation remains for the
 host test, and a saved `SUPERIA` selection falls back to the default on boot.
@@ -202,9 +202,22 @@ On the S3 the statistics passes and the look pass are split by row across both
 LX7 cores (`JPEG_FILTER_DUALCORE`, default `1`). The worker is created on the
 first filtered capture and the build falls back to the single-core path if it
 cannot be created; the arithmetic is unchanged, so the host test and existing
-outputs stay byte-identical. The timing table above is the single-core
-measurement — the dual-core totals have not been re-measured on hardware yet.
-`-DJPEG_FILTER_DUALCORE=0` reproduces the table exactly.
+outputs stay byte-identical.
+
+Measured on the connected S3 at 240 MHz with the 24 px border, three shots per
+build:
+
+| Look + border | Stats | Look | Total |
+|---|---|---|---|
+| T-Max 400, single core | 0.57 s | 1.41 s | 5.88 s |
+| T-Max 400, dual core | 0.35 s | 0.85 s | 4.96 s |
+| Portra 400, single core | 0.57 s | 2.51 s | 7.02 s |
+| Portra 400, dual core | 0.35 s | 1.62 s | 6.01 s |
+
+The splittable stages scale about 1.65x rather than 2x (the shared cache/PSRAM
+path is the likely ceiling); total capture drops ~15 %. No brownout reset
+occurred during the bench runs. `-DJPEG_FILTER_DUALCORE=0` reproduces the
+single-core rows.
 
 The Superia look inlines the preview lab's node defaults as `SUPERIA_*`
 macros (auto balance 0.55, auto contrast 0.56, white balance 0.98/1.01/1.00,
@@ -321,10 +334,9 @@ Known limitations (by design, not bugs):
 - The shutter is the onboard BOOT button (GPIO0), so holding it through a
   reset puts the ROM in download mode instead of booting the firmware.
 - Capture blocks the loop: about 0.2-0.4 s with `NONE`; the filtered looks
-  block for the whole shot (single-core measurements: ~6.5 s T-Max and ~7.2 s
-  with T-Max + border). The dual-core build splits only stats/look and has not
-  been timed on hardware yet, so the preview still pauses while the file is
-  written.
+  block for the whole shot (measured with the 24 px border: ~5.0 s T-Max and
+  ~6.0 s Portra on the dual-core build, vs ~5.9 s and ~7.0 s single-core), so
+  the preview pauses while the file is written.
 - SXGA stills need PSRAM: the stream reserves two ~256 KB frame buffers. If
   that allocation fails, the boot ladder (`CAM_MODES` in `src/main.cpp`) steps
   down to XGA, SVGA and finally VGA on its own, and the OLED reports which
