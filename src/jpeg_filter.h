@@ -164,12 +164,13 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 #endif
 
 // ---- dual-core row splitting ----------------------------------------------
-// The stats passes and the look pass are independent per row, so the second
-// LX7 core runs one half-frame while the loop task runs the other. The first
-// S3 port kept this serial because a second busy core browned out the board on
-// USB power; the unit is now powered from an 18650 + 5 V boost, which has the
-// headroom. -DJPEG_FILTER_DUALCORE=0 restores the single-core path for power
-// experiments; the host test always takes it (no FreeRTOS there).
+// The stats, look and sharpen passes are independent per row (sharpen needs a
+// small copy of the boundary rows because it writes the canvas in place), so
+// the second LX7 core runs one half-frame while the loop task runs the other.
+// The first S3 port kept this serial because a second busy core browned out the
+// board on USB power; the unit is now powered from an 18650 + 5 V boost, which
+// has the headroom. -DJPEG_FILTER_DUALCORE=0 restores the single-core path for
+// power experiments; the host test always takes it (no FreeRTOS there).
 #ifndef JPEG_FILTER_DUALCORE
 #define JPEG_FILTER_DUALCORE 1
 #endif
@@ -877,6 +878,17 @@ static uint32_t usmHistB[SUPERIA_HIST_N];
 static int16_t usmRing[3u * SUPERIA_USM_RING_W * USM_SLOTS_PER_GROUP]
     __attribute__((aligned(16)));
 static uint8_t usmRow8[3u * SUPERIA_USM_RING_W];
+#if JPEG_FILTER_PARALLEL
+// The second band needs its own ring and 8-bit row buffer. The halo holds the
+// 2*rad canvas rows around the split: the canvas is sharpened in place, so
+// both bands read those rows from this copy instead of racing the other band's
+// writes. Sized for the default rad 3; wider kernels stay single-core.
+#define USM_PARALLEL_MAX_RAD 3
+static int16_t usmRing2[3u * SUPERIA_USM_RING_W * USM_SLOTS_PER_GROUP]
+    __attribute__((aligned(16)));
+static uint8_t usmRow8b[3u * SUPERIA_USM_RING_W];
+static uint16_t usmHalo[2u * USM_PARALLEL_MAX_RAD * SUPERIA_USM_RING_W];
+#endif
 
 // Slots per 16-byte group for a given radius: 8 for rad <= 3, 16/24 above.
 static inline int usmSlotsPerGroup(int rad) {
@@ -886,9 +898,11 @@ static inline int usmSlotsPerGroup(int rad) {
 // ---- row-splitting worker --------------------------------------------------
 // One persistent worker pinned to core 0 owns the first half of a stage; the
 // loop task (core 1) runs the second half and joins on a semaphore. Rows are
-// independent in both stats passes and in the look pass, so the split changes
-// no arithmetic: integer reductions are merged exactly and every pixel keeps
-// its own x/y, including the grain hash and vignette.
+// independent in the stats and look passes; the sharpen pass is also row-
+// independent once the 2R boundary rows are copied (see usmSharpenT), because
+// it rewrites the canvas it reads. The split changes no arithmetic: integer
+// reductions are merged exactly and every pixel keeps its own x/y, including
+// the grain hash and vignette.
 typedef void (*ParallelBandFn)(int y0, int y1, int slot);
 
 #if JPEG_FILTER_PARALLEL
@@ -946,10 +960,9 @@ static inline void parallelRun(ParallelBandFn fn, int h) {
 
 // ---- look pass -------------------------------------------------------------
 // Per-pixel, no neighbour reads. Kept as a row-range function so the second
-// core can take a band: the stats and look passes split the frame in half on
-// the S3 (JPEG_FILTER_DUALCORE); sharpen is still single-core. The old
-// USB-powered board browned out with a second busy core, the 18650 + 5 V boost
-// is the intended supply.
+// core can take a band: the stats, look and sharpen passes split the frame in
+// half on the S3 (JPEG_FILTER_DUALCORE). The old USB-powered board browned out
+// with a second busy core, the 18650 + 5 V boost is the intended supply.
 //
 // The look-constant stages are a template parameter (LOOK_STAGES, derived
 // from the table at compile time) so each look gets its own instantiation and
@@ -1208,10 +1221,14 @@ static bool usmSimdSelfTest() {
 }
 #endif
 
+// One sharpen band. `y0..y1` is the output row range, `ring`/`row8` are this
+// band's working set, and `halo` (parallel only) holds the 2R source rows
+// around the split so neither band reads canvas rows the other is rewriting.
 template <int R>
-static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
-                        uint8_t* row8, const int* k, int amountQ8,
-                        int stride, bool allowSimd, bool mono) {
+static void usmSharpenBandT(uint16_t* px, int w, int h, int16_t* ring,
+                            uint8_t* row8, const uint16_t* halo, int haloY0,
+                            int haloY1, const int* k, int amountQ8, int stride,
+                            bool allowSimd, bool mono, int y0, int y1) {
   const int ringRows = 2 * R + 1;
   // A mono look packs one value into all three channels, and R and B share the
   // same 5-bit grid, so their planes -- and therefore their unsharp results --
@@ -1222,7 +1239,10 @@ static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
   // frame replicates row 0/h-1). `ring + slot` is the group's slot 0.
   auto hblurSlot = [&](int ysrc) {
     const int yc = ysrc < 0 ? 0 : (ysrc > h - 1 ? h - 1 : ysrc);
-    const uint16_t* src = px + (size_t)yc * w;
+    const uint16_t* src =
+        (halo && yc >= haloY0 && yc < haloY1)
+            ? halo + (size_t)(yc - haloY0) * w
+            : px + (size_t)yc * w;
     for (int x = 0; x < w; x++) {
       uint8_t rgb[3];
       usmUnpack565(src[x], rgb);
@@ -1234,11 +1254,11 @@ static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
     usmHblurRowT<R>(row8, ring + slot, k, w, stride, chans);
   };
 
-  for (int y = -R; y <= R; y++) hblurSlot(y);  // prime the ring window
+  for (int y = y0 - R; y <= y0 + R; y++) hblurSlot(y);  // prime the ring
 
-  static int16_t coeff[24] __attribute__((aligned(16)));
+  int16_t coeff[24] __attribute__((aligned(16)));
 
-  for (int y = 0; y < h; y++) {
+  for (int y = y0; y < y1; y++) {
     uint16_t* prow = px + (size_t)y * w;
 
     // Rotate the kernel into ring-slot order for this output row: slot s
@@ -1285,8 +1305,77 @@ static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
       }
       prow[x] = usmPack565(out[0], out[1], out[2]);
     }
-    hblurSlot(y + R + 1);  // slide the window; overwrites row y-R's slot
+    // Slide the window for the next output row. Skipping the last row avoids
+    // reading a source row outside this band's halo after the other band may
+    // have rewritten it.
+    if (y + 1 < y1) hblurSlot(y + R + 1);
   }
+}
+
+#if JPEG_FILTER_PARALLEL
+// Sharpen state for the second core. Only the default rad <= 3 uses this
+// path; the band split and the halo layout follow the same h/2 split as
+// parallelRun(). Slot 0 is the worker (the existing ring), slot 1 the loop
+// task (the second static ring).
+static uint16_t* gSharpPx = nullptr;
+static int gSharpW = 0, gSharpH = 0;
+static int16_t* gSharpRing[2] = {nullptr, nullptr};
+static uint8_t* gSharpRow8[2] = {nullptr, nullptr};
+static const uint16_t* gSharpHalo = nullptr;
+static int gSharpHaloY0 = 0, gSharpHaloY1 = 0;
+static const int* gSharpK = nullptr;
+static int gSharpAmountQ8 = 0, gSharpStride = 0;
+static bool gSharpSimd = false, gSharpMono = false;
+static void (*gSharpThunk)(int slot, int y0, int y1) = nullptr;
+
+static void usmSharpenBand(int y0, int y1, int slot) {
+  gSharpThunk(slot, y0, y1);
+}
+
+template <int R>
+static void usmSharpenThunkT(int slot, int y0, int y1) {
+  usmSharpenBandT<R>(gSharpPx, gSharpW, gSharpH, gSharpRing[slot],
+                     gSharpRow8[slot], gSharpHalo, gSharpHaloY0,
+                     gSharpHaloY1, gSharpK, gSharpAmountQ8, gSharpStride,
+                     gSharpSimd, gSharpMono, y0, y1);
+}
+#endif
+
+template <int R>
+static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
+                        uint8_t* row8, const int* k, int amountQ8,
+                        int stride, bool allowSimd, bool mono) {
+#if JPEG_FILTER_PARALLEL
+  // `allowSimd` is true only when the ring is the static one (w <= RING_W and
+  // rad <= 3); that is also exactly when the second static ring exists.
+  if (allowSimd && R <= USM_PARALLEL_MAX_RAD && h >= 2 * R) {
+    const int haloY0 = h / 2 - R;
+    const int haloRows = 2 * R;
+    memcpy(usmHalo, px + (size_t)haloY0 * w,
+           (size_t)haloRows * w * sizeof(uint16_t));
+
+    gSharpPx = px;
+    gSharpW = w;
+    gSharpH = h;
+    gSharpRing[0] = ring;
+    gSharpRow8[0] = row8;
+    gSharpRing[1] = usmRing2;
+    gSharpRow8[1] = usmRow8b;
+    gSharpHalo = usmHalo;
+    gSharpHaloY0 = haloY0;
+    gSharpHaloY1 = haloY0 + haloRows;
+    gSharpK = k;
+    gSharpAmountQ8 = amountQ8;
+    gSharpStride = stride;
+    gSharpSimd = allowSimd;
+    gSharpMono = mono;
+    gSharpThunk = &usmSharpenThunkT<R>;
+    parallelRun(usmSharpenBand, h);
+    return;
+  }
+#endif
+  usmSharpenBandT<R>(px, w, h, ring, row8, nullptr, 0, 0, k, amountQ8,
+                     stride, allowSimd, mono, 0, h);
 }
 
 // ---- statistics bands ------------------------------------------------------
