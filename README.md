@@ -163,10 +163,10 @@ inset and the border is filled around it, with no crop or resampling.
 | any look, border off | 1280×1024 |
 | any look, border on | 1328×1072 |
 
-The T-Max border variant measured 6.34 s per SXGA shot with the 24 px frame
-(decode 0.88, stats 0.62, look 1.80, sharpen 0.80, encode 1.80 s). The first
-runtime-selectable build was about 0.9 s slower: every look parameter was read
-from flash once per pixel, the zero-valued tint block still ran, and the
+The T-Max border variant measures 5.88 s per SXGA shot with the 24 px frame on
+one core and 4.59 s on both (full breakdown in the dual-core table below). The
+first runtime-selectable build was about 0.9 s slower: every look parameter was
+read from flash once per pixel, the zero-valued tint block still ran, and the
 sharpen blurred all three planes of a monochrome image. The Superia,
 Kodachrome and Portra border variants add the same border/encode stage (not
 separately measured).
@@ -200,11 +200,13 @@ Tunables (all `-D` overridable):
 
 On the S3 the statistics passes, the look pass and the sharpen pass are split by
 row across both LX7 cores (`JPEG_FILTER_DUALCORE`, default `1`). The worker is
-created on the first filtered capture and the build falls back to the
-single-core path if it cannot be created; the arithmetic is unchanged, so the
-host test and existing outputs stay byte-identical. The canvas is sharpened in
-place, so the two sharpen bands copy the 2R boundary rows into a small halo
-before either starts writing.
+pinned to core 0, created on the first filtered capture, and the build falls
+back to the single-core path if it cannot be created; the arithmetic is
+unchanged, so the host test and existing outputs stay byte-identical. The
+canvas is sharpened in place, so the two sharpen bands copy the 2R boundary
+rows into a small halo before either starts writing. The per-look stage
+breakdowns in the table above are the original single-core runs; the current
+single-core and dual-core totals are below.
 
 Measured on the connected S3 at 240 MHz with the 24 px border, three shots per
 build:
@@ -218,8 +220,18 @@ build:
 
 Stats and look scale about 1.65x (the shared cache/PSRAM path is the likely
 ceiling); sharpen scales about 1.9x because it works from the internal-DRAM
-ring. Total capture drops ~22 %. No brownout reset occurred during the bench
-runs. `-DJPEG_FILTER_DUALCORE=0` reproduces the single-core rows.
+ring. Total capture drops ~22 %. The parallel sharpen path needs the static
+ring, so a wider `*_USM_SIGMA` (rad > 3) falls back to single-core sharpen; the
+default looks all use rad 3. `-DJPEG_FILTER_DUALCORE=0` reproduces the
+single-core rows.
+
+The split was checked three ways: the host matrix still compiles the same
+per-pixel math, a host harness compares the two-band sharpen with the
+single-band result byte-for-byte, and the phase-2 captures were compared with
+single-core shots of the same scene — the bright row at the split height is
+present in every build, so it is scene content, not a seam. No brownout reset
+occurred during the bench runs; the 18650 + 5 V boost supply is the intended
+field supply and still needs its own soak test.
 
 The Superia look inlines the preview lab's node defaults as `SUPERIA_*`
 macros (auto balance 0.55, auto contrast 0.56, white balance 0.98/1.01/1.00,
