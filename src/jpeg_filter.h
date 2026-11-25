@@ -163,6 +163,28 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 #define USM_SIMD_ENABLED 0
 #endif
 
+// ---- dual-core row splitting ----------------------------------------------
+// The stats passes and the look pass are independent per row, so the second
+// LX7 core runs one half-frame while the loop task runs the other. The first
+// S3 port kept this serial because a second busy core browned out the board on
+// USB power; the unit is now powered from an 18650 + 5 V boost, which has the
+// headroom. -DJPEG_FILTER_DUALCORE=0 restores the single-core path for power
+// experiments; the host test always takes it (no FreeRTOS there).
+#ifndef JPEG_FILTER_DUALCORE
+#define JPEG_FILTER_DUALCORE 1
+#endif
+#if JPEG_FILTER_DUALCORE != 0 && JPEG_FILTER_DUALCORE != 1
+#error "JPEG_FILTER_DUALCORE must be 0 or 1"
+#endif
+#if JPEG_FILTER_DUALCORE && defined(CONFIG_IDF_TARGET_ESP32S3)
+#define JPEG_FILTER_PARALLEL 1
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#else
+#define JPEG_FILTER_PARALLEL 0
+#endif
+
 // Film-look + unsharp sharpening, shared scaffolding for the look filters:
 //   Superia    "Fuji Superia 400 -> Sharpen"
 //   Kodachrome "Kodak Kodachrome 64 -> Vibrance -> Sharpen"
@@ -840,6 +862,11 @@ static USM_ALWAYS_INLINE float usmLut8(const float* lut, float x) {
 #define SUPERIA_HIST_N 2048
 #define SUPERIA_HIST_LMAX 1.5f
 static uint32_t usmHist[SUPERIA_HIST_N];
+#if JPEG_FILTER_PARALLEL
+// The two cores fill separate bin tables so neither touches the other's bins;
+// usmHistB is merged into usmHist before the percentile scan.
+static uint32_t usmHistB[SUPERIA_HIST_N];
+#endif
 
 // Sharpen ring window, in internal DRAM. One 16-byte group per (channel, x)
 // holding 8 int16 slots in ring-slot order; one aligned 128-bit load feeds
@@ -856,10 +883,73 @@ static inline int usmSlotsPerGroup(int rad) {
   return ((2 * rad + 1 + 7) / 8) * 8;
 }
 
+// ---- row-splitting worker --------------------------------------------------
+// One persistent worker pinned to core 0 owns the first half of a stage; the
+// loop task (core 1) runs the second half and joins on a semaphore. Rows are
+// independent in both stats passes and in the look pass, so the split changes
+// no arithmetic: integer reductions are merged exactly and every pixel keeps
+// its own x/y, including the grain hash and vignette.
+typedef void (*ParallelBandFn)(int y0, int y1, int slot);
+
+#if JPEG_FILTER_PARALLEL
+static TaskHandle_t gParTask = nullptr;
+static SemaphoreHandle_t gParJob = nullptr;
+static SemaphoreHandle_t gParDone = nullptr;
+static ParallelBandFn gParFn = nullptr;
+static int gParSplit = 0;
+
+static void parallelWorker(void*) {
+  for (;;) {
+    if (xSemaphoreTake(gParJob, portMAX_DELAY) != pdTRUE) continue;
+    gParFn(0, gParSplit, 0);
+    xSemaphoreGive(gParDone);
+  }
+}
+
+// Lazily created on the first filtered capture: NONE never starts a task, and
+// a failed allocation leaves the proven single-core path in place instead of
+// failing the shot. `tried` is only touched by the loop task.
+static bool parallelInit(void) {
+  static bool tried = false;
+  if (tried) return gParTask != nullptr;
+  tried = true;
+  gParJob = xSemaphoreCreateBinary();
+  gParDone = xSemaphoreCreateBinary();
+  if (gParJob && gParDone &&
+      xTaskCreatePinnedToCore(parallelWorker, "jpeg_par", 4096, nullptr, 2,
+                              &gParTask, 0) == pdPASS) {
+    return true;
+  }
+  if (gParJob) { vSemaphoreDelete(gParJob); gParJob = nullptr; }
+  if (gParDone) { vSemaphoreDelete(gParDone); gParDone = nullptr; }
+  gParTask = nullptr;
+  return false;
+}
+#endif
+
+// Split `h` rows across both cores. With no worker (host build, task creation
+// failure) the same band function runs the whole frame on slot 0, so callers
+// have one code path and the single-core result stays identical.
+static inline void parallelRun(ParallelBandFn fn, int h) {
+#if JPEG_FILTER_PARALLEL
+  if (h >= 2 && parallelInit()) {
+    gParFn = fn;
+    gParSplit = h / 2;
+    xSemaphoreGive(gParJob);
+    fn(gParSplit, h, 1);
+    xSemaphoreTake(gParDone, portMAX_DELAY);
+    return;
+  }
+#endif
+  fn(0, h, 0);
+}
+
 // ---- look pass -------------------------------------------------------------
-// Per-pixel, no neighbour reads. Kept as a row-range function so a second core
-// could take a band later; currently run on one core (a second busy core drew
-// enough current to brown out the board).
+// Per-pixel, no neighbour reads. Kept as a row-range function so the second
+// core can take a band: the stats and look passes split the frame in half on
+// the S3 (JPEG_FILTER_DUALCORE); sharpen is still single-core. The old
+// USB-powered board browned out with a second busy core, the 18650 + 5 V boost
+// is the intended supply.
 //
 // The look-constant stages are a template parameter (LOOK_STAGES, derived
 // from the table at compile time) so each look gets its own instantiation and
@@ -1012,6 +1102,23 @@ static void usmLookRows(const UsmLook& c, int y0, int y1) {
                                         usmToU8(f[2] * 255.0f));
     }
   }
+}
+
+// Runtime dispatch to the compile-time look instantiation. The switch in
+// jpegFilterStream() selects the function pointer once per shot, so the worker
+// does not need the template or the FILM_* table at all.
+typedef void (*LookBandFn)(const UsmLook&, int, int);
+static LookBandFn gLookBandFn = nullptr;
+static const UsmLook* gLookCtx = nullptr;
+
+template <int STAGES>
+static void usmLookBandT(const UsmLook& c, int y0, int y1) {
+  usmLookRows<STAGES>(c, y0, y1);
+}
+
+static void usmLookBand(int y0, int y1, int slot) {
+  (void)slot;
+  if (gLookBandFn) gLookBandFn(*gLookCtx, y0, y1);
 }
 
 
@@ -1182,6 +1289,77 @@ static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
   }
 }
 
+// ---- statistics bands ------------------------------------------------------
+// Canvas and per-shot constants are set by the loop task before parallelRun()
+// and read-only while the worker runs; the semaphore hand-off orders them.
+static const uint16_t* gBandPx = nullptr;
+static int gBandW = 0;
+static float gBandGainR = 1.0f, gBandGainG = 1.0f, gBandGainB = 1.0f;
+static float gBandHistPerL = 0.0f;
+
+struct UsmStatsSums {
+  uint32_t sumR, sumG, sumB, maskedN;
+};
+static UsmStatsSums usmSums[2];
+
+// Pass 1: masked colour sums for the auto balance. The lab restricts the mean
+// to midtone pixels (0.10 < L < 0.90) so shadows/highlights do not skew the
+// channel gains. Integer sums merge exactly in either order.
+static void usmBalanceBand(int y0, int y1, int slot) {
+  const uint16_t* px = gBandPx;
+  const int w = gBandW;
+  UsmStatsSums s = {0, 0, 0, 0};
+  for (int y = y0; y < y1; y++) {
+    const uint16_t* row = px + (size_t)y * w;
+    for (int x = 0; x < w; x++) {
+      uint8_t rgb[3];
+      usmUnpack565(row[x], rgb);
+      const float L =
+          ((0.2126f * rgb[0]) + (0.7152f * rgb[1]) + (0.0722f * rgb[2])) *
+          USM_INV255;
+      if (L > 0.10f && L < 0.90f) {
+        s.sumR += rgb[0];
+        s.sumG += rgb[1];
+        s.sumB += rgb[2];
+        s.maskedN++;
+      }
+    }
+  }
+  usmSums[slot] = s;
+}
+
+// Pass 2: histogram of the post-balance, pre-WB luma (the lab computes its
+// contrast percentiles at exactly this stage of its chain). The two cores fill
+// separate tables so neither touches the same bins; they are merged before the
+// percentile scan. On the single-core path only usmHist is used.
+static void usmHistBand(int y0, int y1, int slot) {
+#if JPEG_FILTER_PARALLEL
+  uint32_t* hist = slot ? usmHistB : usmHist;
+#else
+  (void)slot;
+  uint32_t* hist = usmHist;
+#endif
+  const uint16_t* px = gBandPx;
+  const int w = gBandW;
+  const float histPerL = gBandHistPerL;
+  const float gainR = gBandGainR, gainG = gBandGainG, gainB = gBandGainB;
+  for (int y = y0; y < y1; y++) {
+    const uint16_t* row = px + (size_t)y * w;
+    for (int x = 0; x < w; x++) {
+      uint8_t rgb[3];
+      usmUnpack565(row[x], rgb);
+      const float L = ((0.2126f * rgb[0] * gainR) +
+                       (0.7152f * rgb[1] * gainG) +
+                       (0.0722f * rgb[2] * gainB)) *
+                      USM_INV255;
+      int bin = (int)(L * histPerL);
+      if (bin < 0) bin = 0;
+      if (bin > SUPERIA_HIST_N - 1) bin = SUPERIA_HIST_N - 1;
+      hist[bin]++;
+    }
+  }
+}
+
 // ---- entry point -----------------------------------------------------------
 
 // Adapter from fmt2jpg_cb's callback into the caller's sink (as in the border
@@ -1262,19 +1440,17 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
   if (doLook) {
     const float histPerL = (float)SUPERIA_HIST_N / SUPERIA_HIST_LMAX;
 
-    // Pass 1: masked colour sums for the auto balance. The lab restricts the
-    // mean to midtone pixels (0.10 < L < 0.90) so shadows/highlights do not
-    // skew the channel gains.
-    uint32_t sumR = 0, sumG = 0, sumB = 0, maskedN = 0;
-    for (size_t i = 0; i < n; i++) {
-      uint8_t rgb[3];
-      usmUnpack565(px[i], rgb);
-      const float L = ((0.2126f * rgb[0]) + (0.7152f * rgb[1]) + (0.0722f * rgb[2])) * USM_INV255;
-      if (L > 0.10f && L < 0.90f) {
-        sumR += rgb[0]; sumG += rgb[1]; sumB += rgb[2];
-        maskedN++;
-      }
-    }
+    // Pass 1: masked colour sums for the auto balance, split across both cores.
+    // The lab restricts the mean to midtone pixels (0.10 < L < 0.90) so
+    // shadows/highlights do not skew the channel gains.
+    gBandPx = px;
+    gBandW = w;
+    memset(usmSums, 0, sizeof(usmSums));
+    parallelRun(usmBalanceBand, h);
+    const uint32_t sumR = usmSums[0].sumR + usmSums[1].sumR;
+    const uint32_t sumG = usmSums[0].sumG + usmSums[1].sumG;
+    const uint32_t sumB = usmSums[0].sumB + usmSums[1].sumB;
+    const uint32_t maskedN = usmSums[0].maskedN + usmSums[1].maskedN;
 
     float gainR = 1.0f, gainG = 1.0f, gainB = 1.0f;
     if (FILM_AUTO_BALANCE > 0 && maskedN >= 200) {
@@ -1288,18 +1464,20 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
     }
 
     // Pass 2: histogram of the post-balance, pre-WB luma (the lab computes its
-    // contrast percentiles at exactly this stage of its chain).
+    // contrast percentiles at exactly this stage of its chain), split across
+    // both cores. The two bin tables are merged before the percentile scan.
     memset(usmHist, 0, sizeof(usmHist));
-    for (size_t i = 0; i < n; i++) {
-      uint8_t rgb[3];
-      usmUnpack565(px[i], rgb);
-      const float L = ((0.2126f * rgb[0] * gainR) + (0.7152f * rgb[1] * gainG)
-                     + (0.0722f * rgb[2] * gainB)) * USM_INV255;
-      int bin = (int)(L * histPerL);
-      if (bin < 0) bin = 0;
-      if (bin > SUPERIA_HIST_N - 1) bin = SUPERIA_HIST_N - 1;
-      usmHist[bin]++;
-    }
+#if JPEG_FILTER_PARALLEL
+    memset(usmHistB, 0, sizeof(usmHistB));
+#endif
+    gBandGainR = gainR;
+    gBandGainG = gainG;
+    gBandGainB = gainB;
+    gBandHistPerL = histPerL;
+    parallelRun(usmHistBand, h);
+#if JPEG_FILTER_PARALLEL
+    for (int b = 0; b < SUPERIA_HIST_N; b++) usmHist[b] += usmHistB[b];
+#endif
     const uint32_t kLo = (uint32_t)(0.01f * (float)(n - 1));
     const uint32_t kHi = (uint32_t)(0.99f * (float)(n - 1));
     float lo = SUPERIA_HIST_LMAX, hi = SUPERIA_HIST_LMAX;
@@ -1339,22 +1517,27 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
     const UsmLook look = { px, w, h, gainR, gainG, gainB,
                            doBalance, doContrast,
                            cx, cy, invCxn, invCyn };
+    // Select the look's compile-time instantiation once, then let parallelRun
+    // hand both row bands through the same function pointer.
+    gLookCtx = &look;
     switch (gFilterLook) {
       case FILTER_LOOK_SUPERIA:
-        usmLookRows<LOOK_STAGES[FILTER_LOOK_SUPERIA]>(look, 0, h);
+        gLookBandFn = &usmLookBandT<LOOK_STAGES[FILTER_LOOK_SUPERIA]>;
         break;
       case FILTER_LOOK_KODACHROME:
-        usmLookRows<LOOK_STAGES[FILTER_LOOK_KODACHROME]>(look, 0, h);
+        gLookBandFn = &usmLookBandT<LOOK_STAGES[FILTER_LOOK_KODACHROME]>;
         break;
       case FILTER_LOOK_TMAX:
-        usmLookRows<LOOK_STAGES[FILTER_LOOK_TMAX]>(look, 0, h);
+        gLookBandFn = &usmLookBandT<LOOK_STAGES[FILTER_LOOK_TMAX]>;
         break;
       case FILTER_LOOK_PORTRA:
-        usmLookRows<LOOK_STAGES[FILTER_LOOK_PORTRA]>(look, 0, h);
+        gLookBandFn = &usmLookBandT<LOOK_STAGES[FILTER_LOOK_PORTRA]>;
         break;
       default:
+        gLookBandFn = nullptr;
         break;  // NONE never reaches the look pass (doLook guard above)
     }
+    if (gLookBandFn) parallelRun(usmLookBand, h);
     mark(gJpegCaptureTiming.lookMs);
 
     // ---- sharpen: separable gaussian unsharp per channel ----------------------

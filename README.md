@@ -196,6 +196,15 @@ Tunables (all `-D` overridable):
 | `JPEG_FILTER_INSET_PX` | `24` | Border width in output pixels, each side. The canvas grows by `2 ×` this; the image is never cropped. Applies to every bordered state, including `WITH_BORDER`. |
 | `JPEG_QUALITY` | `10` | Camera JPEG quality (esp32-camera scale: lower = better) |
 | `JPEG_REENCODE_QUALITY` | `60` | Re-encode quality after a filter runs (fmt2jpg scale: higher = better). The two scales are unrelated — encoder quality 10 means ~5.5× scaled tables plus 4:2:0 subsampling, which visibly solarizes smooth dusk gradients. |
+| `JPEG_FILTER_DUALCORE` | `1` | Split the two statistics passes and the look pass across both S3 cores by row. `0` forces the single-core path. Decode, sharpen and encode stay single-core. |
+
+On the S3 the statistics passes and the look pass are split by row across both
+LX7 cores (`JPEG_FILTER_DUALCORE`, default `1`). The worker is created on the
+first filtered capture and the build falls back to the single-core path if it
+cannot be created; the arithmetic is unchanged, so the host test and existing
+outputs stay byte-identical. The timing table above is the single-core
+measurement — the dual-core totals have not been re-measured on hardware yet.
+`-DJPEG_FILTER_DUALCORE=0` reproduces the table exactly.
 
 The Superia look inlines the preview lab's node defaults as `SUPERIA_*`
 macros (auto balance 0.55, auto contrast 0.56, white balance 0.98/1.01/1.00,
@@ -277,6 +286,10 @@ let the vertical pass use the S3's 8-lane 16-bit dot product
 host, on wider kernels, and when the ring comes from the PSRAM heap. Check the
 link size after any change to these buffers.
 
+The dual-core build adds an 8 KB second histogram table in internal DRAM plus a
+4 KB worker stack and two semaphores allocated once on the first filtered
+capture. PSRAM peak is unchanged; the second core only splits existing rows.
+
 Adding a look: add a `FilterLook` value, a `FilmLookParams` entry in
 `FILM_LOOKS`, a name in `jpegFilterLookName()`, an entry in `LOOK_STAGES`, and
 a dispatch case in `jpegFilterStream`; the shared pipeline and the border stage
@@ -307,9 +320,11 @@ Known limitations (by design, not bugs):
 
 - The shutter is the onboard BOOT button (GPIO0), so holding it through a
   reset puts the ROM in download mode instead of booting the firmware.
-- Capture blocks the loop: about 0.2-0.4 s with `NONE`, the whole ~6.5 s
-  T-Max pass with the default build, and ~7.2 s with T-Max + border, so the
-  preview pauses while the file is written.
+- Capture blocks the loop: about 0.2-0.4 s with `NONE`; the filtered looks
+  block for the whole shot (single-core measurements: ~6.5 s T-Max and ~7.2 s
+  with T-Max + border). The dual-core build splits only stats/look and has not
+  been timed on hardware yet, so the preview still pauses while the file is
+  written.
 - SXGA stills need PSRAM: the stream reserves two ~256 KB frame buffers. If
   that allocation fails, the boot ladder (`CAM_MODES` in `src/main.cpp`) steps
   down to XGA, SVGA and finally VGA on its own, and the OLED reports which
@@ -328,8 +343,9 @@ pio run --target upload --upload-port COM6   # upload to explicit port
 pio device monitor -b 115200 -p COM6     # USB CDC serial monitor
 ```
 
-Build output with the checked-in flags (runtime filters, USB CDC, `-O3`):
-RAM 45.1 % (147,644 / 327,680 B), Flash 15.5 % (516,845 / 3,342,336 B).
+Build output with the checked-in flags (runtime filters, USB CDC, `-O3`,
+dual-core stats/look):
+RAM 47.6 % (155,916 / 327,680 B), Flash 15.5 % (518,121 / 3,342,336 B).
 
 ### Upload checklist
 
