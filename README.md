@@ -96,10 +96,12 @@ core's S3 build (`CONFIG_SCCB_HARDWARE_I2C_PORT1`), so the buses don't collide.
   (`DITHER_CONTRAST`, default `130`).
 - `AE_LEVEL` in `src/main.cpp` is the auto-exposure bias (-2..+2, 0 neutral);
   lower it if highlights blow out.
-- `CAM_VFLIP` / `CAM_HMIRROR` (both `1` by default) rotate the image 180° for
-  an upside-down module mount. The flip is applied at the sensor, so the OLED
-  preview and the saved JPEGs stay consistent. Set both to `0` for a normally
-  oriented module.
+- `CAM_VFLIP` (`1` by default) / `CAM_HMIRROR` (`0` by default) set the sensor
+  orientation. The default vertical flip matches the upside-down module mount;
+  the horizontal mirror stays off so the scene is not left-right reversed. Both
+  are applied at the sensor, so the OLED preview and the saved JPEGs stay
+  consistent. Set both to `0` for a normally oriented module; both `1` gives a
+  180° rotation.
 - Viewfinder self-heal is **time-based**: only after `CAM_STALL_MS` (1500 ms)
   without a good frame does the camera get restarted, so the brief frame
   drops that happen around mode switches and SD activity are ignored.
