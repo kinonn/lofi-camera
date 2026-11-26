@@ -111,12 +111,14 @@ struct JpegCaptureTiming {
 static JpegCaptureTiming gJpegCaptureTiming;
 
 // Re-encode quality, fmt2jpg()/jpge scale (higher = better). NOT comparable
-// with the camera's config.jpeg_quality: that scale is inverted (10 = best),
-// and handing 10 to the encoder puts ~5.5x-scaled standard tables plus 4:2:0
-// subsampling into every still -- the chroma solarization seen on dusk
-// gradients. 60 keeps coarseness at the level of the 5-bit canvas.
+// with the camera's config.jpeg_quality: that scale is inverted, and handing
+// 10 to the encoder puts ~5.5x-scaled standard tables plus 4:2:0 subsampling
+// into every still -- the chroma solarization seen on dusk gradients. 80's
+// luma table (DC 6) matches the q6 sensor's, so the re-encode no longer
+// re-flattens the finer input; 60 was matched to the old q10 sensor and left
+// visible tiles in smooth sky.
 #ifndef JPEG_REENCODE_QUALITY
-#define JPEG_REENCODE_QUALITY 60
+#define JPEG_REENCODE_QUALITY 80
 #endif
 
 // Output-size bound for the free-space check before a file is opened. NONE

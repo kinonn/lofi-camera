@@ -69,9 +69,12 @@
 #define AE_LEVEL 0
 
 // Still JPEG quality, esp32-camera scale 0-63 (lower = better and larger).
+// 6 keeps the sensor's 8x8 blocks out of smooth sky; 10 left visible tiles.
 // The re-encode quality is a separate macro, JPEG_REENCODE_QUALITY, living in
 // jpeg_filter.h -- the encoder (fmt2jpg/jpge) uses the opposite scale.
-#define JPEG_QUALITY 10
+#ifndef JPEG_QUALITY
+#define JPEG_QUALITY 6
+#endif
 
 // Camera orientation. The module is mounted upside down in its housing, so the
 // vertical flip corrects the sensor; CAM_HMIRROR must stay 0 or both the OLED

@@ -74,9 +74,9 @@ core's S3 build (`CONFIG_SCCB_HARDWARE_I2C_PORT1`), so the buses don't collide.
   viewfinder settles at ~5 fps at SXGA; the sensor frame period, not the
   renderer, is the limit.
 - Button press (debounced 50 ms): captures **SXGA (1280×1024) JPEG at
-  `jpeg_quality = 10`**, saves as `/img_NNNN.jpg` (next free index, never
-  overwritten). Expect roughly 90–120 KB per photo — measured at 0.57 bpp on
-  the OV2640 module; an OV3660 has a different bitrate and colour response.
+  `jpeg_quality = 6`**, saves as `/img_NNNN.jpg` (next free index, never
+  overwritten). Expect roughly 100–140 KB per photo — measured at 0.6–0.8 bpp
+  on the OV2640 module; an OV3660 has a different bitrate and colour response.
   - Success → OLED shows `Saved` + filename for ~0.9 s.
   - Failure → `CAM FAILED` (no frame from the sensor) or
     `SD FAILED` (SD write error / filter error).
@@ -196,8 +196,8 @@ Tunables (all `-D` overridable):
 | `FILTER_DEFAULT_LOOK` | `FILTER_LOOK_TMAX` | Look used when NVS has no saved value. |
 | `FILTER_DEFAULT_BORDER` | `0` | Border state used when NVS has no saved value. |
 | `JPEG_FILTER_INSET_PX` | `24` | Border width in output pixels, each side. The canvas grows by `2 ×` this; the image is never cropped. Applies to every bordered state, including `WITH_BORDER`. |
-| `JPEG_QUALITY` | `10` | Camera JPEG quality (esp32-camera scale: lower = better) |
-| `JPEG_REENCODE_QUALITY` | `60` | Re-encode quality after a filter runs (fmt2jpg scale: higher = better). The two scales are unrelated — encoder quality 10 means ~5.5× scaled tables plus 4:2:0 subsampling, which visibly solarizes smooth dusk gradients. |
+| `JPEG_QUALITY` | `6` | Camera JPEG quality (esp32-camera scale: lower = better). 10 left visible 8×8 tiles in smooth sky; 6 is the measured fix. |
+| `JPEG_REENCODE_QUALITY` | `80` | Re-encode quality after a filter runs (fmt2jpg scale: higher = better). The two scales are unrelated — encoder quality 10 means ~5.5× scaled tables plus 4:2:0 subsampling, which visibly solarizes smooth dusk gradients. 80's luma table (DC 6) matches the q6 sensor's, so the re-encode no longer re-flattens the finer input; 60 was matched to the old q10 sensor. |
 | `JPEG_FILTER_DUALCORE` | `1` | Split the two statistics passes, the look pass and the sharpen pass across both S3 cores by row. `0` forces the single-core path. Decode and encode stay single-core. |
 
 On the S3 the statistics passes, the look pass and the sharpen pass are split by
@@ -219,6 +219,11 @@ build:
 | T-Max 400, dual core | 0.35 s | 0.85 s | 0.42 s | 4.59 s |
 | Portra 400, single core | 0.57 s | 2.51 s | 1.17 s | 7.02 s |
 | Portra 400, dual core | 0.35 s | 1.62 s | 0.60 s | 5.51 s |
+
+The table is the q60 build. With the q80 default, a dual-core run measured
+T-Max 5.69 s and Portra 5.63 s; stats/look/sharpen were unchanged, and the
+difference is encode (T-Max 2.61 s, Portra 1.91 s). The per-look stage
+breakdowns above are also q60 runs; at q80 only the encode stage grows.
 
 Stats and look scale about 1.65x (the shared cache/PSRAM path is the likely
 ceiling); sharpen scales about 1.9x because it works from the internal-DRAM
@@ -299,8 +304,8 @@ held in RAM either.
 
 The border canvas grows with `JPEG_FILTER_INSET_PX`, and
 `jpegFilterWorstCaseBytes()` includes the extra rows/columns. The free-space
-bound is 0.25 bytes/pixel at encoder quality 10; with the default
-`JPEG_REENCODE_QUALITY` of 60 the budget doubles to 0.5 bytes/pixel.
+bound is 0.25 bytes/pixel at encoder quality 10 or below; with the default
+`JPEG_REENCODE_QUALITY` of 80 the budget doubles to 0.5 bytes/pixel.
 
 All five looks share one runtime-parameterized pipeline, one LUT set and the
 same ring/LUT working set. The sharpen ring (one 16-byte group per
