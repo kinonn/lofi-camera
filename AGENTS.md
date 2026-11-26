@@ -46,6 +46,14 @@ changing firmware.
   change the other's output.
 - SD writes stream through `JpegWriteFn`; keep the encoded JPEG out of RAM
   (peak PSRAM is ~3.2 MB of 8 MB and depends on it).
+- When `EXIF_ENABLED` is set (default `1`), saved JPEGs carry an APP1 EXIF
+  `ImageDescription` inserted by the SD sink:
+  look, border/inset, source/output dimensions, re-encode quality and
+  per-stage milliseconds (`fb_ms`, `dec_ms`, `stats_ms`, `look_ms`,
+  `sharp_ms`, `enc_ms`, `total_ms`). Stage timings are always collected;
+  `CAPTURE_TIMING` only controls the optional diagnostic log/selftest. The image
+  data is untouched, but `NONE` output is no longer byte-identical at the file
+  level. Keep these fields in sync when a pipeline stage or look is added.
 - No per-frame or per-shot heap allocation. Use `static`/file-scope buffers
   (`PreviewFrame`, the once-allocated `previewRgb`). The dual-core worker task
   and its semaphores are allocated once, not per shot.

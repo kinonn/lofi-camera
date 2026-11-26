@@ -192,7 +192,7 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 //   Superia    "Fuji Superia 400 -> Sharpen"
 //   Kodachrome "Kodak Kodachrome 64 -> Vibrance -> Sharpen"
 //   T-Max      "Kodak T-Max 400 -> Sharpen" (panchromatic B&W)
-//   Portra     "Kodak Portra 400 -> Sharpen (0.3, sigma 1)"
+//   Portra     "Kodak Portra 400 -> Sharpen (0.4, sigma 1)"
 // All are ported from tools/preview_lab/app.html. Design: one decode, a single
 // fused colour pass, one neighbourhood pass, one encode. Every look stage is
 // elementwise, so running them as separate JPEG filters would only add
@@ -205,14 +205,15 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 //   -> monochrome -> vignette -> grain -> vibrance -> gaussian unsharp sharpen
 // Superia skips the matrix, saturation, vibrance and grain stages (its node
 // defaults make them identity/off); Kodachrome adds a matrix, saturation,
-// vibrance and grain; T-Max skips matrix, saturation, vibrance and tints, and
-// enables the monochrome mix; Portra adds WB, saturation, tone, tints,
-// vignette and grain, with no matrix, vibrance or monochrome stage. Values
+// vibrance and grain (off by default); T-Max skips matrix, saturation,
+// vibrance and tints, and enables the monochrome mix; Portra adds WB,
+// saturation, tone, tints, vignette and grain (off by default), with no
+// matrix, vibrance or monochrome stage. Values
 // differ from the lab by construction because the canvas is RGB565 (5/6/5
 // bits): expect mild extra banding on smooth gradients vs. the lab's 8-bit
-// model. Kodachrome's/T-Max's/Portra's grain size of 1.2 is below the lab's
-// blur threshold (sigma < 0.3), so only the amount is reproduced; the device
-// grain is the same per-pixel noise, monochrome.
+// model. When grain is enabled, Kodachrome's/T-Max's/Portra's grain size of
+// 1.2 is below the lab's blur threshold (sigma < 0.3), so only the amount is
+// reproduced; the device grain is the same per-pixel noise, monochrome.
 
 // Superia tunables, all -D overridable. Values = preview_lab node defaults.
 #ifndef SUPERIA_AUTO_BALANCE
@@ -279,9 +280,14 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 // ---- per-filter look parameters -------------------------------------------
 // The shared pipeline reads the active FilmLookParams. Kodachrome values are
 // the preview_lab node defaults for the chain
-// "Kodachrome 64 -> Vibrance (0.5) -> Sharpen (0.4, sigma 1)".
+// "Kodachrome 64 -> Vibrance (0.5) -> Sharpen (0.4, sigma 1)", with grain
+// off by default.
+// Auto balance is off: the camera AWB already leaves neutral scenes neutral,
+// while the grey-world mean of a foliage-heavy frame lifts R/B and the warm
+// matrix then turns the whites magenta. The other looks' WB/tints absorb that
+// correction; Kodachrome's identity WB and red matrix do not.
 #ifndef KODACHROME_AUTO_BALANCE
-#define KODACHROME_AUTO_BALANCE 0.62f
+#define KODACHROME_AUTO_BALANCE 0.0f
 #endif
 #ifndef KODACHROME_AUTO_CONTRAST
 #define KODACHROME_AUTO_CONTRAST 0.62f
@@ -344,7 +350,7 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 #define KODACHROME_VIGNETTE 0.10f
 #endif
 #ifndef KODACHROME_GRAIN
-#define KODACHROME_GRAIN 0.010f
+#define KODACHROME_GRAIN 0.00f
 #endif
 #ifndef KODACHROME_VIBRANCE
 #define KODACHROME_VIBRANCE 0.50f
@@ -446,7 +452,8 @@ static_assert(TMAX_HIGHLIGHT_ROLLOFF >= 0.0f && TMAX_HIGHLIGHT_ROLLOFF < 1.0f,
               "whole tonal range into the knee");
 
 // Portra 400 values are the preview_lab node defaults for
-// "Portra 400 -> Sharpen (0.3, sigma 1)". The grade is soft, slightly
+// "Portra 400 -> Sharpen (0.4, sigma 1)", with grain off by default. The
+// grade is soft, slightly
 // desaturated and golden-yellow; the 0.03 shoulder keeps the highlights creamy.
 #ifndef PORTRA_AUTO_BALANCE
 #define PORTRA_AUTO_BALANCE 0.60f
@@ -500,10 +507,10 @@ static_assert(TMAX_HIGHLIGHT_ROLLOFF >= 0.0f && TMAX_HIGHLIGHT_ROLLOFF < 1.0f,
 #define PORTRA_VIGNETTE 0.06f
 #endif
 #ifndef PORTRA_GRAIN
-#define PORTRA_GRAIN 0.010f
+#define PORTRA_GRAIN 0.00f
 #endif
 #ifndef PORTRA_USM_AMOUNT
-#define PORTRA_USM_AMOUNT 0.30f
+#define PORTRA_USM_AMOUNT 0.40f
 #endif
 #ifndef PORTRA_USM_SIGMA
 #define PORTRA_USM_SIGMA 1.00f
@@ -1502,16 +1509,14 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
   const uint16_t fh = (uint16_t)(h + 2 * border);
   const size_t canvasBytes = (size_t)fw * (size_t)fh * sizeof(uint16_t);
 
-#if CAPTURE_TIMING
+  // Always collect the stage timings: the EXIF header records them.
+  // CAPTURE_TIMING only controls the optional diagnostic log/selftest.
   uint32_t tStage = (uint32_t)micros();
   auto mark = [&](uint32_t& field) {
     const uint32_t now = (uint32_t)micros();
     field = (now - tStage) / 1000u;
     tStage = now;
   };
-#else
-  auto mark = [](uint32_t&) {};
-#endif
 
   uint8_t* canvas = (uint8_t*)ps_malloc(canvasBytes);
   if (!canvas) return false;

@@ -492,12 +492,14 @@ _PRESETS = [
         family="Kodak",
         description="Warm pastel skin tones, soft contrast, creamy highlights.",
         auto_balance=0.60, auto_contrast=0.45,
-        exposure=0.05, wb=(1.02, 1.00, 0.98),
-        saturation=0.92, midtone_gamma=0.98, contrast=0.14,
-        shadow_tint=(0.004, 0.002, 0.004),
-        highlight_tint=(0.035, 0.018, -0.012),
-        softness=0.10, vignette=0.06,
-        grain=0.010, grain_size=1.2,
+        wb=(1.04, 1.00, 0.96),
+        saturation=0.95, midtone_gamma=0.98, contrast=0.14,
+        highlight_rolloff=0.03,
+        shadow_tint=(0.005, 0.003, 0.001),
+        highlight_tint=(0.045, 0.020, -0.020),
+        sharpen=0.40, sharpen_radius=1.0,
+        vignette=0.06,
+        grain=0.00, grain_size=1.2,
     ),
     FilmPreset(
         name="kodak_portra_160",
@@ -580,7 +582,9 @@ _PRESETS = [
         label="Kodak Kodachrome 64",
         family="Kodak",
         description="Warm saturated reds, golden highlights and deep cool shadows - the classic travel-slide look.",
-        auto_balance=0.62, auto_contrast=0.62,
+        # Off: grey-world over foliage tints the whites magenta after this
+        # warm matrix; the camera AWB is already neutral.
+        auto_balance=0.0, auto_contrast=0.62,
         matrix=(
             (1.10, -0.04, -0.02),
             (-0.03, 1.00, 0.02),
@@ -591,7 +595,8 @@ _PRESETS = [
         shadow_tint=(-0.004, 0.002, 0.012),
         highlight_tint=(0.046, 0.004, -0.024),
         vignette=0.10,
-        grain=0.010, grain_size=1.2,
+        sharpen=0.40, sharpen_radius=1.0,
+        grain=0.00, grain_size=1.2,
     ),
 
     # ---------------- Fujifilm ----------------

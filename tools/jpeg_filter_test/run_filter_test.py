@@ -14,7 +14,9 @@ What this reproduces vs. hardware:
               RGB565 canvas, 5/6/5-bit truncation/replication, the native
               little-endian decoder canvas and the pre-encode swap that the
               encoder's big-endian read expects, tone chain order,
-              row-ring USM, JPEG_REENCODE_QUALITY handling)
+              row-ring USM, JPEG_REENCODE_QUALITY handling); src/exif.h's
+              APP1 layout/first-write/patch-offset contract, with the result
+              reopened by Pillow to confirm ImageDescription parses
   different   JPEG decoder/encoder codec: the device uses esp_new_jpeg +
               jpge; the host byte-exact stubs use stb. Expect comparable but
               not bit-identical JPEG compression behaviour around blocks.
@@ -87,6 +89,28 @@ def build(wsl_repo: str) -> None:
         print(f"built out/{exe} (kind {kind}, mode {mode})")
 
 
+def check_exif(wsl_repo: str, sample_in: Path, sample_out: Path) -> None:
+    """Compile/run the APP1 contract test plus a real-JPEG Pillow read."""
+    cmd = (f'cd {wsl_repo}/tools/jpeg_filter_test && '
+           f'g++ -O2 -Wall -I {wsl_repo}/src exif_test.cpp -o out/exif_test && '
+           f'./out/exif_test {as_wsl(sample_in)} {as_wsl(sample_out)}')
+    r = subprocess.run(["wsl", "-e", "bash", "-c", cmd], text=True,
+                       capture_output=True)
+    if r.returncode != 0:
+        print(f"exif check failed:\n{r.stdout}{r.stderr}", file=sys.stderr)
+        raise SystemExit(2)
+
+    with Image.open(sample_out) as im:
+        im.load()
+        desc = im.getexif().get(0x010E)
+    if isinstance(desc, bytes):
+        desc = desc.decode("ascii", "replace")
+    if not desc or "look=T-Max 400" not in desc:
+        print(f"exif check failed: ImageDescription={desc!r}", file=sys.stderr)
+        raise SystemExit(2)
+    print(r.stdout.strip())
+
+
 def write_gallery(out_dir: Path, groups) -> Path:
     rows = []
     for src, items in groups:
@@ -155,6 +179,7 @@ def main(argv=None) -> int:
         d.mkdir(parents=True, exist_ok=True)
 
     build(as_wsl(REPO_ROOT))
+    check_exif(as_wsl(REPO_ROOT), images[0], out_dir / "exif_sample.jpg")
 
     groups, sheet_links = [], {}
     for image_path in images:

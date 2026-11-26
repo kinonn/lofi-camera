@@ -5,3 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+// The filter records per-stage timings for the EXIF header even when the
+// CAPTURE_TIMING log is off; the host run has no clock, so zero is fine.
+static inline unsigned long millis() { return 0; }
+static inline unsigned long micros() { return 0; }

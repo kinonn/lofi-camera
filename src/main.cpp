@@ -10,6 +10,7 @@
 #include "FS.h"
 #include "preview.h"
 #include "jpeg_filter.h"
+#include "exif.h"
 #include "img_converters.h"
 #include "esp32-hal-psram.h"
 #include "esp_system.h"
@@ -650,6 +651,32 @@ static size_t fileSinkWrite(void* arg, const uint8_t* data, size_t len) {
   return n;
 }
 
+#if EXIF_ENABLED
+// Insert the APP1 segment after SOI on the first write. The description is
+// patched in place after the encode, when the encode and total timings exist;
+// the image data itself is never touched. The return value stays the number of
+// JPEG bytes consumed, so jpegFilterStream's pass-through length check and its
+// `written` counter keep their meaning (the file is EXIF_APP1_BYTES larger).
+struct ExifSink {
+  FileSink* file;
+  uint8_t app1[EXIF_APP1_BYTES];
+  char desc[EXIF_DESC_SIZE];
+  bool headerDone;
+};
+
+static ExifSink exifSink;
+
+static size_t exifSinkWrite(void* arg, const uint8_t* data, size_t len) {
+  ExifSink* s = (ExifSink*)arg;
+  if (!s->headerDone) {
+    s->headerDone = true;
+    return exifWriteFirst(fileSinkWrite, s->file, data, len, s->app1,
+                          &s->file->failed);
+  }
+  return fileSinkWrite(s->file, data, len);
+}
+#endif
+
 // Outcome of a still capture, so each failure gets an honest message.
 enum PhotoResult {
   PHOTO_OK,
@@ -730,10 +757,55 @@ PhotoResult captureStill(char* name, size_t nameLen) {
           result = PHOTO_WRITE_FAIL;
         } else {
           FileSink sink = { &f, false };
+          JpegWriteFn writeFn = fileSinkWrite;
+          void* writeArg = &sink;
+#if EXIF_ENABLED
+          exifSink.file = &sink;
+          exifSink.headerDone = false;
+          exifBuild(exifSink.app1);
+          writeFn = exifSinkWrite;
+          writeArg = &exifSink;
+#endif
           size_t written = 0;
           uint16_t ow = 0, oh = 0;
-          const bool okFilter = jpegFilterStream(fb, JPEG_REENCODE_QUALITY, fileSinkWrite,
-                                                 &sink, &written, &ow, &oh);
+          const bool okFilter = jpegFilterStream(fb, JPEG_REENCODE_QUALITY, writeFn,
+                                                 writeArg, &written, &ow, &oh);
+
+          // Patch the description after the encode, before close. A failed
+          // patch leaves a valid JPEG with zeroed timings; a failed first write
+          // has already set sink.failed and the file is removed below.
+#if EXIF_ENABLED
+          if (okFilter && !sink.failed) {
+            f.flush();
+            ExifInfo info = {};
+            info.look = jpegFilterLookName(jpegFilterGetLook());
+            info.border = jpegFilterGetBorder();
+            info.inset = info.border ? JPEG_FILTER_INSET_PX : 0;
+            info.srcW = (int)fb->width;
+            info.srcH = (int)fb->height;
+            info.outW = (int)ow;
+            info.outH = (int)oh;
+            info.quality = (jpegFilterGetLook() != FILTER_LOOK_NONE ||
+                            jpegFilterGetBorder())
+                               ? JPEG_REENCODE_QUALITY
+                               : 0;  // 0 = pass-through, no re-encode
+            info.srcBytes = fb->len;
+            info.fbMs = gJpegCaptureTiming.fbMs;
+            info.decodeMs = gJpegCaptureTiming.decodeMs;
+            info.statsMs = gJpegCaptureTiming.statsMs;
+            info.lookMs = gJpegCaptureTiming.lookMs;
+            info.sharpenMs = gJpegCaptureTiming.sharpenMs;
+            info.encodeMs = gJpegCaptureTiming.encodeMs;
+            info.totalMs = millis() - tCapture;
+            exifFormatDescription(exifSink.desc, sizeof(exifSink.desc), info);
+            if (!f.seek(EXIF_DESC_FILE_OFFSET) ||
+                f.write((const uint8_t*)exifSink.desc, sizeof(exifSink.desc)) !=
+                    sizeof(exifSink.desc) ||
+                !f.seek(0, SeekEnd)) {
+              DBG("EXIF patch failed on %s\n", path);
+            }
+          }
+#endif
           const uint32_t tClose = millis();
           f.close();
           gJpegCaptureTiming.closeMs = millis() - tClose;
@@ -752,8 +824,10 @@ PhotoResult captureStill(char* name, size_t nameLen) {
             DBG("Short write on %s (%u bytes) -- removed\n", path, (unsigned)written);
             result = PHOTO_WRITE_FAIL;
           } else {
+            const size_t fileBytes =
+                written + (EXIF_ENABLED ? EXIF_APP1_BYTES : 0);
             snprintf(name, nameLen, "%s", path);
-            DBG("Saved %s (%u bytes, %ux%u)\n", path, (unsigned)written,
+            DBG("Saved %s (%u bytes, %ux%u)\n", path, (unsigned)fileBytes,
                 (unsigned)ow, (unsigned)oh);
             result = PHOTO_OK;
           }

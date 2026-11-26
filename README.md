@@ -138,16 +138,17 @@ plus tjgd's work area.
 The capture pipeline in `src/jpeg_filter.h` post-processes the captured JPEG
 before it is written to the card. Look and border are selected at **runtime**
 with the GPIO14 button; the choice is stored in NVS and survives a reboot.
-`NONE` is a pure pass-through: the camera's JPEG is written verbatim, with no
-decode or re-encode, so it costs nothing.
+`NONE` writes the camera's JPEG image data verbatim, with no decode or
+re-encode, so the look costs nothing; the SD sink still inserts a small EXIF
+header.
 
 | Look | Effect | Output |
 |---|---|---|
 | `NONE` | Pass-through | SXGA 1280×1024 |
 | `SUPERIA` | Fuji Superia 400 film look + gaussian unsharp sharpen, ported from the `tools/preview_lab` chain with the lab's default parameters. One decode, one fused colour pass, sharpen as a second pass, one re-encode — no intermediate JPEG round trips. The lab's grain stage is not ported (its default is 0 = off). Measured on the S3 at 240 MHz with `-O3`: about 6.5 s per SXGA shot (decode 0.89, stats 0.62, look 2.04, sharpen 1.17, encode 1.36 s); it was ~14–15 s on the ESP32-CAM. | SXGA 1280×1024 |
-| `KODACHROME` | Kodak Kodachrome 64 film look + vibrance + gaussian unsharp, ported from the `tools/preview_lab` chain “Kodachrome 64 → Vibrance (0.5) → Sharpen (0.4, sigma 1)”. Same one-decode, one fused colour pass, one sharpen, one re-encode design. The lab's grain is reproduced as per-pixel monochrome noise (the default grain size 1.2 is below the lab's own blur threshold), and the look carries the same S-curve as T-Max (`KODACHROME_TONE_GAIN` 1.12 about mid-grey, then a `KODACHROME_HIGHLIGHT_ROLLOFF` 0.08 shoulder) folded into the tone LUT. Measured on the S3 at 240 MHz with `-O3`: about 7.25 s per SXGA shot (decode 0.92, stats 0.62, look 2.98, sharpen 1.17, encode 1.43 s). | SXGA 1280×1024 |
+| `KODACHROME` | Kodak Kodachrome 64 film look + vibrance + gaussian unsharp, ported from the `tools/preview_lab` chain “Kodachrome 64 → Vibrance (0.5) → Sharpen (0.4, sigma 1)”. Same one-decode, one fused colour pass, one sharpen, one re-encode design. Grain is off by default (`KODACHROME_GRAIN` 0.00); when enabled it is the lab's per-pixel monochrome noise (the lab's grain size 1.2 is below its own blur threshold). The look carries the same S-curve as T-Max (`KODACHROME_TONE_GAIN` 1.12 about mid-grey, then a `KODACHROME_HIGHLIGHT_ROLLOFF` 0.08 shoulder) folded into the tone LUT. Measured on the S3 at 240 MHz with `-O3`: about 7.25 s per SXGA shot (decode 0.92, stats 0.62, look 2.98, sharpen 1.17, encode 1.43 s). | SXGA 1280×1024 |
 | `TMAX` | Kodak T-Max 400 panchromatic B&W + gaussian unsharp, ported from the `tools/preview_lab` chain “T-Max 400 → Sharpen (0.4, sigma 1)”. Same fused design; the panchromatic mix is 0.30/0.59/0.11, with the node's contrast 0.80, vignette 0.30 and grain 0.030, plus an S-curve (`TMAX_TONE_GAIN` 1.12 about mid-grey, then a `TMAX_HIGHLIGHT_ROLLOFF` 0.08 shoulder) that lifts the highlights without clipping them while the shadows go down — see the T-Max macro list below. Measured on the S3 at 240 MHz with `-O3`: about 6.5 s per SXGA shot (decode 0.92, stats 0.65, look 1.71, sharpen 1.28, encode 1.54 s). | SXGA 1280×1024 |
-| `PORTRA` | Kodak Portra 400 warm golden-pastel film look + gaussian unsharp, ported from the `tools/preview_lab` chain “Portra 400 → Sharpen (0.3, sigma 1)”. Same fused design; auto balance 0.60, auto contrast 0.45, saturation 0.95, white balance 1.04/1.00/0.96, midtone gamma 0.98, smoothstep contrast 0.14, tone gain 1.00 with a 0.03 highlight shoulder, shadow/highlight tint, vignette 0.06, grain 0.010. Not measured unbordered; the bordered variant is 7.02 s single-core / 5.51 s dual-core (timing table below). | SXGA 1280×1024 |
+| `PORTRA` | Kodak Portra 400 warm golden-pastel film look + gaussian unsharp, ported from the `tools/preview_lab` chain “Portra 400 → Sharpen (0.4, sigma 1)”. Same fused design; auto balance 0.60, auto contrast 0.45, saturation 0.95, white balance 1.04/1.00/0.96, midtone gamma 0.98, smoothstep contrast 0.14, tone gain 1.00 with a 0.03 highlight shoulder, shadow/highlight tint, vignette 0.06, grain 0.00. Not measured unbordered; the bordered variant is 7.02 s single-core / 5.51 s dual-core (timing table below). | SXGA 1280×1024 |
 
 `SUPERIA` is retired from the button cycle. The implementation remains for the
 host test, and a saved `SUPERIA` selection falls back to the default on boot.
@@ -160,10 +161,19 @@ inset and the border is filled around it, with no crop or resampling.
 
 | State | Output |
 |---|---|
-| `NONE`, border off | 1280×1024, byte-identical pass-through |
+| `NONE`, border off | 1280×1024, image data pass-through + EXIF |
 | `WITH_BORDER` (`NONE` + border) | 1328×1072, re-encoded |
 | any look, border off | 1280×1024 |
 | any look, border on | 1328×1072 |
+
+Every saved JPEG carries an APP1 EXIF `ImageDescription` written by the SD
+sink: the active look, border/inset, source and output dimensions, re-encode
+quality (`q=0` on pass-through), and per-stage milliseconds (`fb_ms`,
+`dec_ms`, `stats_ms`, `look_ms`, `sharp_ms`, `enc_ms`, `total_ms`). The image
+data is unchanged; only the header differs, so `NONE` is no longer
+byte-identical at the file level. The segment is 292 bytes; `total_ms` runs
+through the encode, while the file-close time stays in the optional
+`/timing.txt` log.
 
 The T-Max border variant measures 5.88 s per SXGA shot with the 24 px frame on
 one core and 4.59 s on both (full breakdown in the dual-core table below). The
@@ -199,6 +209,7 @@ Tunables (all `-D` overridable):
 | `JPEG_QUALITY` | `6` | Camera JPEG quality (esp32-camera scale: lower = better). 10 left visible 8×8 tiles in smooth sky; 6 is the measured fix. |
 | `JPEG_REENCODE_QUALITY` | `80` | Re-encode quality after a filter runs (fmt2jpg scale: higher = better). The two scales are unrelated — encoder quality 10 means ~5.5× scaled tables plus 4:2:0 subsampling, which visibly solarizes smooth dusk gradients. 80's luma table (DC 6) matches the q6 sensor's, so the re-encode no longer re-flattens the finer input; 60 was matched to the old q10 sensor. |
 | `JPEG_FILTER_DUALCORE` | `1` | Split the two statistics passes, the look pass and the sharpen pass across both S3 cores by row. `0` forces the single-core path. Decode and encode stay single-core. |
+| `EXIF_ENABLED` | `1` | Insert the APP1 EXIF header before the JPEG data. `0` disables it and restores a byte-identical `NONE` pass-through. |
 
 On the S3 the statistics passes, the look pass and the sharpen pass are split by
 row across both LX7 cores (`JPEG_FILTER_DUALCORE`, default `1`). The worker is
@@ -250,13 +261,16 @@ at sigma 1.00). Each is overridable with
 scalar).
 
 The Kodachrome filter inlines its node defaults as `KODACHROME_*` macros
-(auto balance 0.62, auto contrast 0.62, saturation 1.24, midtone gamma 0.94,
+(auto balance 0.0, auto contrast 0.62, saturation 1.24, midtone gamma 0.94,
 smoothstep contrast 0.40, S-curve gain 1.12 with a 0.08 highlight shoulder,
-warm 3×3 matrix, shadow/highlight tint, vignette 0.10, grain 0.010, vibrance
+warm 3×3 matrix, shadow/highlight tint, vignette 0.10, grain 0.00, vibrance
 0.50, unsharp amount 0.40 at sigma 1.00),
 overridable with `-DKODACHROME_<NAME>=<value>`. The 3×3 matrix entries are
 `KODACHROME_MAT_RR` … `KODACHROME_MAT_BB`. The white balance is identity, so
-the linear-light LUT is skipped for this look.
+the linear-light LUT is skipped for this look. Auto balance is intentionally
+off: the camera AWB already leaves neutral scenes neutral, and the grey-world
+correction on a foliage-heavy frame lifts R/B and tints the whites magenta
+once the warm matrix is applied.
 
 The T-Max look inlines its node defaults as `TMAX_*` macros (auto balance
 0.70, auto contrast 0.55, midtone gamma 0.98, smoothstep contrast 0.80,
@@ -280,11 +294,11 @@ it, a steeper S eats highlight detail that the sharpen pass then cannot recover.
 The Portra filter inlines its node defaults as `PORTRA_*` macros (auto balance
 0.60, auto contrast 0.45, saturation 0.95, white balance 1.04/1.00/0.96,
 midtone gamma 0.98, smoothstep contrast 0.14, tone gain 1.00 with a 0.03
-highlight shoulder, shadow/highlight tint, vignette 0.06, grain 0.010, unsharp
-amount 0.30 at sigma 1.00), overridable with
+highlight shoulder, shadow/highlight tint, vignette 0.06, grain 0.00, unsharp
+amount 0.40 at sigma 1.00), overridable with
 `-DPORTRA_<NAME>=<value>`. It has no matrix, vibrance or monochrome stage;
-its grain size 1.2 is below the lab's blur threshold, so only the amount is
-reproduced.
+grain is off by default, and its size 1.2 is below the lab's blur threshold,
+so only the amount matters when it is enabled.
 
 **Memory.** `NONE` with border off does not allocate a canvas at all. Every
 re-encoded state decodes into one RGB565 canvas. Bordered states grow the
