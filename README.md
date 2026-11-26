@@ -74,9 +74,9 @@ core's S3 build (`CONFIG_SCCB_HARDWARE_I2C_PORT1`), so the buses don't collide.
   viewfinder settles at ~5 fps at SXGA; the sensor frame period, not the
   renderer, is the limit.
 - Button press (debounced 50 ms): captures **SXGA (1280×1024) JPEG at
-  `jpeg_quality = 10`**, saves as `/img_NNNN.jpg` (next free index, never
-  overwritten). Expect roughly 90–120 KB per photo — measured at 0.57 bpp on
-  the OV2640 module; an OV3660 has a different bitrate and colour response.
+  `jpeg_quality = 6`**, saves as `/img_NNNN.jpg` (next free index, never
+  overwritten). Expect roughly 100–140 KB per photo — measured at 0.6–0.8 bpp
+  on the OV2640 module; an OV3660 has a different bitrate and colour response.
   - Success → OLED shows `Saved` + filename for ~0.9 s.
   - Failure → `CAM FAILED` (no frame from the sensor) or
     `SD FAILED` (SD write error / filter error).
@@ -96,10 +96,12 @@ core's S3 build (`CONFIG_SCCB_HARDWARE_I2C_PORT1`), so the buses don't collide.
   (`DITHER_CONTRAST`, default `130`).
 - `AE_LEVEL` in `src/main.cpp` is the auto-exposure bias (-2..+2, 0 neutral);
   lower it if highlights blow out.
-- `CAM_VFLIP` / `CAM_HMIRROR` (both `1` by default) rotate the image 180° for
-  an upside-down module mount. The flip is applied at the sensor, so the OLED
-  preview and the saved JPEGs stay consistent. Set both to `0` for a normally
-  oriented module.
+- `CAM_VFLIP` (`1` by default) / `CAM_HMIRROR` (`0` by default) set the sensor
+  orientation. The default vertical flip matches the upside-down module mount;
+  the horizontal mirror stays off so the scene is not left-right reversed. Both
+  are applied at the sensor, so the OLED preview and the saved JPEGs stay
+  consistent. Set both to `0` for a normally oriented module; both `1` gives a
+  180° rotation.
 - Viewfinder self-heal is **time-based**: only after `CAM_STALL_MS` (1500 ms)
   without a good frame does the camera get restarted, so the brief frame
   drops that happen around mode switches and SD activity are ignored.
@@ -145,7 +147,7 @@ decode or re-encode, so it costs nothing.
 | `SUPERIA` | Fuji Superia 400 film look + gaussian unsharp sharpen, ported from the `tools/preview_lab` chain with the lab's default parameters. One decode, one fused colour pass, sharpen as a second pass, one re-encode — no intermediate JPEG round trips. The lab's grain stage is not ported (its default is 0 = off). Measured on the S3 at 240 MHz with `-O3`: about 6.5 s per SXGA shot (decode 0.89, stats 0.62, look 2.04, sharpen 1.17, encode 1.36 s); it was ~14–15 s on the ESP32-CAM. | SXGA 1280×1024 |
 | `KODACHROME` | Kodak Kodachrome 64 film look + vibrance + gaussian unsharp, ported from the `tools/preview_lab` chain “Kodachrome 64 → Vibrance (0.5) → Sharpen (0.4, sigma 1)”. Same one-decode, one fused colour pass, one sharpen, one re-encode design. The lab's grain is reproduced as per-pixel monochrome noise (the default grain size 1.2 is below the lab's own blur threshold), and the look carries the same S-curve as T-Max (`KODACHROME_TONE_GAIN` 1.12 about mid-grey, then a `KODACHROME_HIGHLIGHT_ROLLOFF` 0.08 shoulder) folded into the tone LUT. Measured on the S3 at 240 MHz with `-O3`: about 7.25 s per SXGA shot (decode 0.92, stats 0.62, look 2.98, sharpen 1.17, encode 1.43 s). | SXGA 1280×1024 |
 | `TMAX` | Kodak T-Max 400 panchromatic B&W + gaussian unsharp, ported from the `tools/preview_lab` chain “T-Max 400 → Sharpen (0.4, sigma 1)”. Same fused design; the panchromatic mix is 0.30/0.59/0.11, with the node's contrast 0.80, vignette 0.30 and grain 0.030, plus an S-curve (`TMAX_TONE_GAIN` 1.12 about mid-grey, then a `TMAX_HIGHLIGHT_ROLLOFF` 0.08 shoulder) that lifts the highlights without clipping them while the shadows go down — see the T-Max macro list below. Measured on the S3 at 240 MHz with `-O3`: about 6.5 s per SXGA shot (decode 0.92, stats 0.65, look 1.71, sharpen 1.28, encode 1.54 s). | SXGA 1280×1024 |
-| `PORTRA` | Kodak Portra 400 warm golden-pastel film look + gaussian unsharp, ported from the `tools/preview_lab` chain “Portra 400 → Sharpen (0.3, sigma 1)”. Same fused design; auto balance 0.60, auto contrast 0.45, saturation 0.95, white balance 1.04/1.00/0.96, midtone gamma 0.98, smoothstep contrast 0.14, tone gain 1.00 with a 0.03 highlight shoulder, shadow/highlight tint, vignette 0.06, grain 0.010. Not separately measured on hardware. | SXGA 1280×1024 |
+| `PORTRA` | Kodak Portra 400 warm golden-pastel film look + gaussian unsharp, ported from the `tools/preview_lab` chain “Portra 400 → Sharpen (0.3, sigma 1)”. Same fused design; auto balance 0.60, auto contrast 0.45, saturation 0.95, white balance 1.04/1.00/0.96, midtone gamma 0.98, smoothstep contrast 0.14, tone gain 1.00 with a 0.03 highlight shoulder, shadow/highlight tint, vignette 0.06, grain 0.010. Not measured unbordered; the bordered variant is 7.02 s single-core / 5.51 s dual-core (timing table below). | SXGA 1280×1024 |
 
 `SUPERIA` is retired from the button cycle. The implementation remains for the
 host test, and a saved `SUPERIA` selection falls back to the default on boot.
@@ -163,10 +165,10 @@ inset and the border is filled around it, with no crop or resampling.
 | any look, border off | 1280×1024 |
 | any look, border on | 1328×1072 |
 
-The T-Max border variant measured 6.34 s per SXGA shot with the 24 px frame
-(decode 0.88, stats 0.62, look 1.80, sharpen 0.80, encode 1.80 s). The first
-runtime-selectable build was about 0.9 s slower: every look parameter was read
-from flash once per pixel, the zero-valued tint block still ran, and the
+The T-Max border variant measures 5.88 s per SXGA shot with the 24 px frame on
+one core and 4.59 s on both (full breakdown in the dual-core table below). The
+first runtime-selectable build was about 0.9 s slower: every look parameter was
+read from flash once per pixel, the zero-valued tint block still ran, and the
 sharpen blurred all three planes of a monochrome image. The Superia,
 Kodachrome and Portra border variants add the same border/encode stage (not
 separately measured).
@@ -194,8 +196,49 @@ Tunables (all `-D` overridable):
 | `FILTER_DEFAULT_LOOK` | `FILTER_LOOK_TMAX` | Look used when NVS has no saved value. |
 | `FILTER_DEFAULT_BORDER` | `0` | Border state used when NVS has no saved value. |
 | `JPEG_FILTER_INSET_PX` | `24` | Border width in output pixels, each side. The canvas grows by `2 ×` this; the image is never cropped. Applies to every bordered state, including `WITH_BORDER`. |
-| `JPEG_QUALITY` | `10` | Camera JPEG quality (esp32-camera scale: lower = better) |
-| `JPEG_REENCODE_QUALITY` | `60` | Re-encode quality after a filter runs (fmt2jpg scale: higher = better). The two scales are unrelated — encoder quality 10 means ~5.5× scaled tables plus 4:2:0 subsampling, which visibly solarizes smooth dusk gradients. |
+| `JPEG_QUALITY` | `6` | Camera JPEG quality (esp32-camera scale: lower = better). 10 left visible 8×8 tiles in smooth sky; 6 is the measured fix. |
+| `JPEG_REENCODE_QUALITY` | `80` | Re-encode quality after a filter runs (fmt2jpg scale: higher = better). The two scales are unrelated — encoder quality 10 means ~5.5× scaled tables plus 4:2:0 subsampling, which visibly solarizes smooth dusk gradients. 80's luma table (DC 6) matches the q6 sensor's, so the re-encode no longer re-flattens the finer input; 60 was matched to the old q10 sensor. |
+| `JPEG_FILTER_DUALCORE` | `1` | Split the two statistics passes, the look pass and the sharpen pass across both S3 cores by row. `0` forces the single-core path. Decode and encode stay single-core. |
+
+On the S3 the statistics passes, the look pass and the sharpen pass are split by
+row across both LX7 cores (`JPEG_FILTER_DUALCORE`, default `1`). The worker is
+pinned to core 0, created on the first filtered capture, and the build falls
+back to the single-core path if it cannot be created; the arithmetic is
+unchanged, so the host test and existing outputs stay byte-identical. The
+canvas is sharpened in place, so the two sharpen bands copy the 2R boundary
+rows into a small halo before either starts writing. The per-look stage
+breakdowns in the table above are the original single-core runs; the current
+single-core and dual-core totals are below.
+
+Measured on the connected S3 at 240 MHz with the 24 px border, three shots per
+build:
+
+| Look + border | Stats | Look | Sharpen | Total |
+|---|---|---|---|---|
+| T-Max 400, single core | 0.57 s | 1.41 s | 0.80 s | 5.88 s |
+| T-Max 400, dual core | 0.35 s | 0.85 s | 0.42 s | 4.59 s |
+| Portra 400, single core | 0.57 s | 2.51 s | 1.17 s | 7.02 s |
+| Portra 400, dual core | 0.35 s | 1.62 s | 0.60 s | 5.51 s |
+
+The table is the q60 build. With the q80 default, a dual-core run measured
+T-Max 5.69 s and Portra 5.63 s; stats/look/sharpen were unchanged, and the
+difference is encode (T-Max 2.61 s, Portra 1.91 s). The per-look stage
+breakdowns above are also q60 runs; at q80 only the encode stage grows.
+
+Stats and look scale about 1.65x (the shared cache/PSRAM path is the likely
+ceiling); sharpen scales about 1.9x because it works from the internal-DRAM
+ring. Total capture drops ~22 %. The parallel sharpen path needs the static
+ring, so a wider `*_USM_SIGMA` (rad > 3) falls back to single-core sharpen; the
+default looks all use rad 3. `-DJPEG_FILTER_DUALCORE=0` reproduces the
+single-core rows.
+
+The split was checked three ways: the host matrix still compiles the same
+per-pixel math, a host harness compares the two-band sharpen with the
+single-band result byte-for-byte, and the phase-2 captures were compared with
+single-core shots of the same scene — the bright row at the split height is
+present in every build, so it is scene content, not a seam. No brownout reset
+occurred during the bench runs; the 18650 + 5 V boost supply is the intended
+field supply and still needs its own soak test.
 
 The Superia look inlines the preview lab's node defaults as `SUPERIA_*`
 macros (auto balance 0.55, auto contrast 0.56, white balance 0.98/1.01/1.00,
@@ -261,8 +304,8 @@ held in RAM either.
 
 The border canvas grows with `JPEG_FILTER_INSET_PX`, and
 `jpegFilterWorstCaseBytes()` includes the extra rows/columns. The free-space
-bound is 0.25 bytes/pixel at encoder quality 10; with the default
-`JPEG_REENCODE_QUALITY` of 60 the budget doubles to 0.5 bytes/pixel.
+bound is 0.25 bytes/pixel at encoder quality 10 or below; with the default
+`JPEG_REENCODE_QUALITY` of 80 the budget doubles to 0.5 bytes/pixel.
 
 All five looks share one runtime-parameterized pipeline, one LUT set and the
 same ring/LUT working set. The sharpen ring (one 16-byte group per
@@ -276,6 +319,12 @@ let the vertical pass use the S3's 8-lane 16-bit dot product
 (`ee.vmulas.s16.accx` in `src/usm_simd.S`); the scalar fallback runs on the
 host, on wider kernels, and when the ring comes from the PSRAM heap. Check the
 link size after any change to these buffers.
+
+The dual-core build adds, in internal DRAM, an 8 KB second histogram table, a
+second 61 KB sharpen ring, a second 3.8 KB 8-bit row buffer, a 15 KB sharpen
+halo, and a 4 KB worker stack plus two semaphores (allocated once on the first
+filtered capture). PSRAM peak is unchanged; the second core only splits
+existing rows.
 
 Adding a look: add a `FilterLook` value, a `FilmLookParams` entry in
 `FILM_LOOKS`, a name in `jpegFilterLookName()`, an entry in `LOOK_STAGES`, and
@@ -307,9 +356,10 @@ Known limitations (by design, not bugs):
 
 - The shutter is the onboard BOOT button (GPIO0), so holding it through a
   reset puts the ROM in download mode instead of booting the firmware.
-- Capture blocks the loop: about 0.2-0.4 s with `NONE`, the whole ~6.5 s
-  T-Max pass with the default build, and ~7.2 s with T-Max + border, so the
-  preview pauses while the file is written.
+- Capture blocks the loop: about 0.2-0.4 s with `NONE`; the filtered looks
+  block for the whole shot (measured with the 24 px border: ~4.6 s T-Max and
+  ~5.5 s Portra on the dual-core build, vs ~5.9 s and ~7.0 s single-core), so
+  the preview pauses while the file is written.
 - SXGA stills need PSRAM: the stream reserves two ~256 KB frame buffers. If
   that allocation fails, the boot ladder (`CAM_MODES` in `src/main.cpp`) steps
   down to XGA, SVGA and finally VGA on its own, and the OLED reports which
@@ -328,8 +378,9 @@ pio run --target upload --upload-port COM6   # upload to explicit port
 pio device monitor -b 115200 -p COM6     # USB CDC serial monitor
 ```
 
-Build output with the checked-in flags (runtime filters, USB CDC, `-O3`):
-RAM 45.1 % (147,644 / 327,680 B), Flash 15.5 % (516,845 / 3,342,336 B).
+Build output with the checked-in flags (runtime filters, USB CDC, `-O3`,
+dual-core stats/look/sharpen):
+RAM 72.1 % (236,236 / 327,680 B), Flash 15.7 % (523,597 / 3,342,336 B).
 
 ### Upload checklist
 

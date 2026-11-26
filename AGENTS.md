@@ -7,16 +7,18 @@ changing firmware.
 
 ## Commands
 
-- Build: `pio run` — expect ~44 % RAM, ~14 % flash; a large jump means
+- Build: `pio run` — expect ~72 % RAM, ~16 % flash. The dual-core second ring
+  and sharpen halo account for most of the RAM; a further large jump means
   something got linked that should not have been.
 - Upload: `pio run --target upload --upload-port COM<n>` — native USB-C
   (USB-Serial-JTAG); no peripherals need disconnecting.
 - Serial monitor works over USB CDC; `DBG()` is always compiled in.
 - Film lab: `.venv\Scripts\python.exe tools\film_lab\run_film_lab.py`, then open
   `tools/film_lab/out/index.html`.
-- There is no test suite. A clean `pio run` is the only automated check;
-  behaviour changes need an on-device sanity check, so say explicitly what was
-  not verified on hardware.
+- There is no firmware unit-test suite. The automated checks are `pio run` and
+  `tools/jpeg_filter_test/run_filter_test.py` (host compile + matrix); a
+  behaviour change still needs an on-device sanity check, so say explicitly
+  what was not verified on hardware.
 
 ## Hardware invariants (never break)
 
@@ -45,13 +47,19 @@ changing firmware.
 - SD writes stream through `JpegWriteFn`; keep the encoded JPEG out of RAM
   (peak PSRAM is ~3.2 MB of 8 MB and depends on it).
 - No per-frame or per-shot heap allocation. Use `static`/file-scope buffers
-  (`PreviewFrame`, the once-allocated `previewRgb`).
+  (`PreviewFrame`, the once-allocated `previewRgb`). The dual-core worker task
+  and its semaphores are allocated once, not per shot.
+- Dual-core split: stats, look and sharpen run on both cores when
+  `JPEG_FILTER_DUALCORE` is `1` (default). The worker is one persistent core-0
+  task, never one per shot. Sharpen rewrites the canvas in place, so its two
+  bands must read the 2R boundary rows from the halo copy; wider kernels
+  (rad > 3) keep the single-core sharpen. Decode and encode stay single-core.
 
 ## Conventions
 
 - Modules are header-only and pulled in by `preview.h` / `main.cpp`. Match that;
   only add a `.cpp` when unavoidable. The one exception is `src/usm_simd.S`, the
-  S3 PIE dot-product kernel behind the Superia sharpen.
+  S3 PIE dot-product kernel behind the shared sharpen.
 - Every tunable is an `#ifndef MACRO` / `#define MACRO default` pair so
   `build_flags` (`-D...`) can override it without editing code.
 - Invalid compile-time selections must fail the build (`#error`), never silently
@@ -77,9 +85,10 @@ backs the pre-write free-space check.
 
 ## Porting film looks
 
-`tools/film_lab/` is the design bench and nothing in it is on the device yet.
-When a look is ported to C++, implement the shared chain once, not one algorithm
-per preset. Keep the lab runnable and firmware-free — it must never edit `src/`.
+`tools/film_lab/` is the design bench for new looks; a grade is ported to
+firmware only after it is chosen there. When a look is ported to C++,
+implement the shared chain once, not one algorithm per preset. Keep the lab
+runnable and firmware-free — it must never edit `src/`.
 
 ## Do not
 
@@ -87,8 +96,8 @@ per preset. Keep the lab runnable and firmware-free — it must never edit `src/
 - Leave a truncated JPEG on the card or burn a filename slot on a failed write.
 - Replace "retry forever with backoff" with a halt: the unit has no console, so
   OLED messages plus self-healing **are** the recovery mechanism.
-- Commit `test-images/`, `.venv/`, `.pio/`, `tools/film_lab/out/`, or the
-  generated `.vscode` files.
+- Commit `test-images/`, `.venv/`, `.pio/`, `/out/`, `tools/film_lab/out/`,
+  `tools/jpeg_filter_test/out/`, or the generated `.vscode` files.
 
 ## Host tools
 

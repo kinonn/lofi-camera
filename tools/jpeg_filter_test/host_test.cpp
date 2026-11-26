@@ -27,10 +27,10 @@
 //                            -DKODACHROME_HIGHLIGHT_ROLLOFF=0, same A/B idea
 //
 // Usage: host_test <in.jpg> <out.jpg> [quality]
-// quality applies to the re-encode like on device -- default 10, the
-// firmware's JPEG_QUALITY. Output JPEG codec is stb, the device's is jpge;
-// see run_filter_test.py for the honest checklist of what this does and
-// does not reproduce.
+// quality applies to the re-encode like on device -- default 80, the
+// firmware's JPEG_REENCODE_QUALITY. Output JPEG codec is stb, the device's
+// is jpge; see run_filter_test.py for the honest checklist of what this does
+// and does not reproduce.
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -122,7 +122,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "usage: %s <in.jpg> <out.jpg> [quality]\n", argv[0]);
     return 2;
   }
-  const uint8_t quality = argc > 3 ? (uint8_t)atoi(argv[3]) : 10;
+  const uint8_t quality = argc > 3 ? (uint8_t)atoi(argv[3]) : 80;
   selfCheck();
   selectFilter(FILTER_KIND);
 

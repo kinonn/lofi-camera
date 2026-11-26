@@ -69,15 +69,24 @@
 #define AE_LEVEL 0
 
 // Still JPEG quality, esp32-camera scale 0-63 (lower = better and larger).
+// 6 keeps the sensor's 8x8 blocks out of smooth sky; 10 left visible tiles.
 // The re-encode quality is a separate macro, JPEG_REENCODE_QUALITY, living in
 // jpeg_filter.h -- the encoder (fmt2jpg/jpge) uses the opposite scale.
-#define JPEG_QUALITY 10
+#ifndef JPEG_QUALITY
+#define JPEG_QUALITY 6
+#endif
 
-// Camera orientation. 1 = flip. Setting both to 1 rotates the image 180
-// degrees (for a module mounted upside down in its housing); set both to 0
-// for a normally oriented module. Applies to the preview and the stills.
+// Camera orientation. The module is mounted upside down in its housing, so the
+// vertical flip corrects the sensor; CAM_HMIRROR must stay 0 or both the OLED
+// preview and the saved JPEGs come out left-right reversed. Set both to 0 for
+// a normally oriented module. Both are applied at the sensor, so preview and
+// stills stay consistent.
+#ifndef CAM_VFLIP
 #define CAM_VFLIP 1
-#define CAM_HMIRROR 1
+#endif
+#ifndef CAM_HMIRROR
+#define CAM_HMIRROR 0
+#endif
 
 // Viewfinder recovery. A few dropped frames are normal (mode switches, SD
 // activity, a slow AGC step), so a restart only happens once the camera has

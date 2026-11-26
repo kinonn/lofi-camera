@@ -14,7 +14,7 @@ What this reproduces vs. hardware:
               RGB565 canvas, 5/6/5-bit truncation/replication, the native
               little-endian decoder canvas and the pre-encode swap that the
               encoder's big-endian read expects, tone chain order,
-              row-ring USM, JPEG_QUALITY=10 handling)
+              row-ring USM, JPEG_REENCODE_QUALITY handling)
   different   JPEG decoder/encoder codec: the device uses esp_new_jpeg +
               jpge; the host byte-exact stubs use stb. Expect comparable but
               not bit-identical JPEG compression behaviour around blocks.
@@ -23,7 +23,7 @@ What this reproduces vs. hardware:
 
 Usage:
   .venv/Scripts/python.exe tools/jpeg_filter_test/run_filter_test.py
-  ...  --input test-images/img_0134.jpg  --quality 10
+  ...  --input test-images/img_0134.jpg  --quality 80
 Output: tools/jpeg_filter_test/out/gallery/index.html (git-ignored).
 """
 
@@ -137,8 +137,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--input", default=str(REPO_ROOT / "test-images"))
     parser.add_argument("--out", default=str(TOOL / "out"))
-    parser.add_argument("--quality", type=int, default=10,
-                        help="re-encode quality; 10 = firmware JPEG_QUALITY")
+    parser.add_argument("--quality", type=int, default=80,
+                        help="re-encode quality; default = firmware JPEG_REENCODE_QUALITY")
     parser.add_argument("--thumb-width", type=int, default=420)
     args = parser.parse_args(argv)
 
