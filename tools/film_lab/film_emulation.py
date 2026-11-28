@@ -96,6 +96,12 @@ def _gaussian(a: np.ndarray, sigma: float) -> np.ndarray:
 # pipeline stages
 # --------------------------------------------------------------------------
 
+# Auto contrast may not amplify local contrast beyond this slope (1 = the
+# source's own). Flat frames (small hi-lo histogram) otherwise push the slope
+# past 2 and turn the sensor JPEG's coarse chroma blocks into banding; the
+# firmware caps the same way (SUPERIA_CONTRAST_SLOPE_CAP in src/jpeg_filter.h).
+CONTRAST_SLOPE_CAP = 1.5
+
 
 def auto_balance(rgb: np.ndarray, strength: float) -> np.ndarray:
     """Gently neutralise a colour cast measured over mid-tones only.
@@ -127,6 +133,12 @@ def auto_contrast(rgb: np.ndarray, strength: float) -> np.ndarray:
     hi = float(np.percentile(flat, 99.0))
     if hi - lo < 0.02:
         return rgb
+    # Cap the stretch's local slope: on a flat frame it amplifies the sensor
+    # JPEG's coarse chroma blocks into banding (same cap as the firmware's
+    # SUPERIA_CONTRAST_SLOPE_CAP).
+    gain = (0.960 - 0.015) / (hi - lo)
+    if gain > 1.0:
+        strength = min(strength, (CONTRAST_SLOPE_CAP - 1.0) / (gain - 1.0))
     # Land the histogram on 0.015..0.96 instead of 0..1. Leaving a little
     # headroom stops the already near-clipped sky from going pure white, which
     # is what made every look read as the same blown-out highlight.

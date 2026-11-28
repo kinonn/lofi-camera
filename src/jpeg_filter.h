@@ -786,6 +786,14 @@ static float   usmLutGammaScale[SUPERIA_LUT_N];
 // percentiles, so it is rebuilt per shot -- 512 divisions instead of 1.31 M.
 // Bins cover L in [0, 2]: the balance gain can push luma past 1, and clamping
 // that back to 1 would visibly lift highlights.
+// The stretch's local slope is (1-ac) + ac*(0.945/(hi-lo)): on a flat frame
+// (small hi-lo) that exceeds 1 and amplifies the source JPEG's coarse chroma
+// blocks and the 5/6-bit canvas staircase into visible block-aligned banding.
+// The cap limits that slope; normal scenes (wide histogram) never reach it.
+// Mirrored in tools/film_lab and tools/preview_lab.
+#ifndef SUPERIA_CONTRAST_SLOPE_CAP
+#define SUPERIA_CONTRAST_SLOPE_CAP 1.5f
+#endif
 #define SUPERIA_CSCALE_N 512
 static float   usmLutContrast[SUPERIA_CSCALE_N];
 // Vibrance needs 1/max(r,g,b); 256 divisions once instead of one per pixel.
@@ -1596,12 +1604,18 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
     // from the same table); only the content-gated stages stay runtime flags.
     const bool doBalance  = (FILM_AUTO_BALANCE > 0) && (maskedN >= 200);
     const bool doContrast = (FILM_AUTO_CONTRAST > 0) && ((hi - lo) >= 0.02f);
-    const float ac = FILM_AUTO_CONTRAST;
     const float cx = (float)(w - 1) * 0.5f, cy = (float)(h - 1) * 0.5f;
     const float cxn = cx > 1.0f ? cx : 1.0f, cyn = cy > 1.0f ? cy : 1.0f;
     const float invCxn = 1.0f / cxn, invCyn = 1.0f / cyn;
 
     if (doContrast) {
+      float ac = FILM_AUTO_CONTRAST;
+      const float gain = (0.960f - 0.015f) / (hi - lo);
+      if (gain > 1.0f) {
+        const float acCap =
+            (SUPERIA_CONTRAST_SLOPE_CAP - 1.0f) / (gain - 1.0f);
+        if (ac > acCap) ac = acCap;
+      }
       for (int i = 0; i < SUPERIA_CSCALE_N; i++) {
         const float L = (float)i * USM_INV255;
         const float t = usmClampF((L - lo) / (hi - lo), 0.0f, 1.0f);

@@ -281,6 +281,11 @@ function stdDev(a){
   let s=0; for(const v of a) s+=(v-m)*(v-m);
   return Math.sqrt(s/a.length);
 }
+// Auto contrast may not amplify local contrast beyond this slope (1 = the
+// source's own). Flat frames (small hi-lo histogram) otherwise push the slope
+// past 2 and turn the sensor JPEG's coarse chroma blocks into banding; the
+// firmware caps the same way (SUPERIA_CONTRAST_SLOPE_CAP in src/jpeg_filter.h).
+const CONTRAST_SLOPE_CAP = 1.5;
 function filmLook(rgb,W,H,p,opts={}){
   const n=W*H, f=new Float32Array(n*3);
   for(let i=0;i<n*3;i++) f[i]=rgb[i]/255;
@@ -306,10 +311,19 @@ function filmLook(rgb,W,H,p,opts={}){
     const sorted=L.slice().sort();
     const lo=percentileSorted(sorted,1), hi=percentileSorted(sorted,99);
     if(hi-lo>=0.02){
+      // Cap the stretch's local slope: flat frames otherwise amplify the
+      // sensor JPEG's coarse chroma blocks into banding (same cap as
+      // SUPERIA_CONTRAST_SLOPE_CAP in src/jpeg_filter.h and the film_lab).
+      let ac=p.autoContrast;
+      const gain=(0.960-0.015)/(hi-lo);
+      if(gain>1){
+        const cap=(CONTRAST_SLOPE_CAP-1)/(gain-1);
+        if(ac>cap) ac=cap;
+      }
       for(let i=0;i<n;i++){
         const t=Math.min(1,Math.max(0,(L[i]-lo)/(hi-lo)));
         const s=0.015+t*(0.960-0.015);
-        scale(i,(L[i]+(s-L[i])*p.autoContrast)/Math.max(L[i],1e-4));
+        scale(i,(L[i]+(s-L[i])*ac)/Math.max(L[i],1e-4));
       }
     }
   }

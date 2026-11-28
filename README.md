@@ -334,6 +334,11 @@ let the vertical pass use the S3's 8-lane 16-bit dot product
 host, on wider kernels, and when the ring comes from the PSRAM heap. Check the
 link size after any change to these buffers.
 
+The shared auto contrast never amplifies local contrast past
+`SUPERIA_CONTRAST_SLOPE_CAP` (default 1.5, all looks): on a flat frame the
+1–99 percentile stretch would otherwise multiply the source JPEG's 4:2:0
+chroma blocks and the RGB565 canvas staircase into visible banding.
+
 The dual-core build adds, in internal DRAM, an 8 KB second histogram table, a
 second 61 KB sharpen ring, a second 3.8 KB 8-bit row buffer, a 15 KB sharpen
 halo, and a 4 KB worker stack plus two semaphores (allocated once on the first
