@@ -146,10 +146,12 @@ static inline size_t jpegFilterWorstCaseBytes(const camera_fb_t* fb) {
 
 // The pass-through and unbordered paths keep the capture's dimensions. Every
 // bordered variant needs the larger canvas: at SXGA with a 24 px frame that is
-// 1328x1072 (2,847,232 bytes). The decoder writes the image into the leading
-// 1280x1024 pixels, the look/sharpen passes run there, and only at the end are
-// the rows shifted into the inset and the border filled. Peak PSRAM stays
-// about 3.4 MB including two camera buffers.
+// 1328x1072 (4,270,848 bytes at 3 bytes/pixel). The decoder writes the image
+// into the leading 1280x1024 pixels, the look/sharpen passes run there, and
+// only at the end are the rows shifted into the inset and the border filled.
+// Peak PSRAM stays about 4.8 MB including two camera buffers, of the 8 MB
+// module. The canvas is RGB888: the RGB565 canvas' 5-bit chroma was the
+// banding floor on flat surfaces once the look's local gain amplified it.
 
 // ESP32-S3 PIE 8-lane 16-bit dot product (ee.vmulas.s16.accx). The .S file is
 // assembled only in the S3 build; the host test and other targets use the
@@ -209,9 +211,9 @@ extern "C" void usmVblurS3(const int16_t* ring, uint8_t* out,
 // vibrance and tints, and enables the monochrome mix; Portra adds WB,
 // saturation, tone, tints, vignette and grain (off by default), with no
 // matrix, vibrance or monochrome stage. Values
-// differ from the lab by construction because the canvas is RGB565 (5/6/5
-// bits): expect mild extra banding on smooth gradients vs. the lab's 8-bit
-// model. When grain is enabled, Kodachrome's/T-Max's/Portra's grain size of
+// match the lab's 8-bit model: the canvas is RGB888, so there is no 5/6/5
+// quantisation difference to account for. When grain is enabled,
+// Kodachrome's/T-Max's/Portra's grain size of
 // 1.2 is below the lab's blur threshold (sigma < 0.3), so only the amount is
 // reproduced; the device grain is the same per-pixel noise, monochrome.
 
@@ -741,37 +743,17 @@ static USM_ALWAYS_INLINE uint8_t usmToU8(float v) {
 }
 
 // 1/255 as a literal multiply. Written as a division anywhere in a hot loop it
-// becomes __divsf3; the two differ by at most 1 ulp, far below the 5-bit canvas.
+// becomes __divsf3; the two differ by at most 1 ulp.
 #define USM_INV255 (1.0f / 255.0f)
-
-// RGB565 <-> 8-bit channels (bit replication). The linked esp32-camera JPEG
-// decoder stores the canvas as native little-endian standard R5G6B5 (verified
-// in the linked lib: its RGB565 writer stores out[0] = v & 0xFF, out[1] =
-// v >> 8), so a plain u16 read already holds the true channels. The byte swap
-// the canvas needs lives at the encode boundary (see jpegFilterStream).
-static USM_ALWAYS_INLINE uint16_t usmPack565(uint8_t r, uint8_t g, uint8_t b) {
-  return (uint16_t)(((uint16_t)(r >> 3) << 11)
-                  | ((uint16_t)(g >> 2) << 5)
-                  | (uint16_t)(b >> 3));
-}
-
-static USM_ALWAYS_INLINE void usmUnpack565(uint16_t v, uint8_t rgb[3]) {
-  const uint8_t r5 = (uint8_t)((v >> 11) & 0x1F);
-  const uint8_t g6 = (uint8_t)((v >> 5) & 0x3F);
-  const uint8_t b5 = (uint8_t)(v & 0x1F);
-  rgb[0] = (uint8_t)((r5 << 3) | (r5 >> 2));  // 5 -> 8 bit replication
-  rgb[1] = (uint8_t)((g6 << 2) | (g6 >> 4));  // 6 -> 8 bit replication
-  rgb[2] = (uint8_t)((b5 << 3) | (b5 >> 2));
-}
 
 // The lab evaluates powf() per pixel (midtone gamma, vignette) and a full
 // sRGB<->linear round trip per channel for the white balance. Per-pixel
 // transcendentals are the slowest op on this MCU, so every curve becomes a
 // table. The first version used 4096-entry float tables in PSRAM (64 KB
 // total): every lookup was a random access that missed the 32 KB data cache,
-// and pass 3 alone accounted for most of the shot. The canvas is 5/6/5, so
-// 8-bit inputs are enough; the tables now live in internal DRAM and fit the
-// cache. All lookups are one indexed load, no interpolation.
+// and pass 3 alone accounted for most of the shot. 8-bit inputs are enough;
+// the tables now live in internal DRAM and fit the cache. All lookups are one
+// indexed load, no interpolation.
 #define SUPERIA_LUT_N 256
 static float   usmLutToLin[SUPERIA_LUT_N];  // sRGB -> linear, built once
 static uint8_t usmLutWb[3][SUPERIA_LUT_N];  // sRGB -> gain -> sRGB, once
@@ -904,7 +886,7 @@ static uint8_t usmRow8[3u * SUPERIA_USM_RING_W];
 static int16_t usmRing2[3u * SUPERIA_USM_RING_W * USM_SLOTS_PER_GROUP]
     __attribute__((aligned(16)));
 static uint8_t usmRow8b[3u * SUPERIA_USM_RING_W];
-static uint16_t usmHalo[2u * USM_PARALLEL_MAX_RAD * SUPERIA_USM_RING_W];
+static uint8_t usmHalo[2u * USM_PARALLEL_MAX_RAD * SUPERIA_USM_RING_W * 3];
 #endif
 
 // Slots per 16-byte group for a given radius: 8 for rad <= 3, 16/24 above.
@@ -988,7 +970,7 @@ static inline void parallelRun(ParallelBandFn fn, int h) {
 // The content-dependent stages (auto balance needs this frame's masked means,
 // auto contrast its percentiles) stay runtime flags.
 struct UsmLook {
-  uint16_t* px;
+  uint8_t* px;
   int w, h;
   float gainR, gainG, gainB;
   bool doBalance, doContrast;
@@ -997,8 +979,8 @@ struct UsmLook {
 
 // Cheap deterministic per-pixel noise in [-1, 1]. One integer hash, no state.
 // The lab's grain size 1.2 is below its own blur threshold (sigma < 0.3), so
-// it is unblurred noise; at a 1% amount the distribution shape is invisible on
-// a 5/6/5 canvas, so a uniform hash replaces the lab's Gaussian.
+// it is unblurred noise; a uniform hash replaces the lab's Gaussian, which is
+// invisible at the 1% default amount.
 static USM_ALWAYS_INLINE float usmNoise(int x, int y) {
   uint32_t h = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u + 0x9E3779B9u;
   h = (h ^ (h >> 13)) * 1274126177u;
@@ -1008,7 +990,6 @@ static USM_ALWAYS_INLINE float usmNoise(int x, int y) {
 
 template <int STAGES>
 static void usmLookRows(const UsmLook& c, int y0, int y1) {
-  uint16_t* px = c.px;
   const int w = c.w;
   // The look table is const, so it lives in flash: reading FILM_* inside the
   // pixel loop became one pointer load per parameter per pixel when looks
@@ -1025,10 +1006,10 @@ static void usmLookRows(const UsmLook& c, int y0, int y1) {
   const float vign = FILM_VIGNETTE, grain = FILM_GRAIN, vib = FILM_VIBRANCE;
   for (int y = y0; y < y1; y++) {
     const float yy = ((float)y - c.cy) * c.invCyn;
+    uint8_t* row = c.px + (size_t)y * w * 3;
     for (int x = 0; x < w; x++) {
-      uint8_t rgb[3];
-      usmUnpack565(px[(size_t)y * w + x], rgb);
-      float f[3] = { rgb[0] * USM_INV255, rgb[1] * USM_INV255, rgb[2] * USM_INV255 };
+      uint8_t* p = row + x * 3;
+      float f[3] = { p[0] * USM_INV255, p[1] * USM_INV255, p[2] * USM_INV255 };
 
       if (c.doBalance) {
         f[0] *= c.gainR; f[1] *= c.gainG; f[2] *= c.gainB;
@@ -1100,7 +1081,9 @@ static void usmLookRows(const UsmLook& c, int y0, int y1) {
           g += usmNoise(x, y) * (1.514f * grain * wgt);
         }
         const uint8_t v = usmToU8(g * 255.0f);
-        px[(size_t)y * w + x] = usmPack565(v, v, v);
+        row[x * 3] = v;
+        row[x * 3 + 1] = v;
+        row[x * 3 + 2] = v;
         continue;
       }
       if (STAGES & LOOK_VIGN) {
@@ -1127,9 +1110,9 @@ static void usmLookRows(const UsmLook& c, int y0, int y1) {
         const float avg = (f[0] + f[1] + f[2]) * (1.0f / 3.0f);
         for (int ch = 0; ch < 3; ch++) f[ch] = avg + (f[ch] - avg) * gain;
       }
-      px[(size_t)y * w + x] = usmPack565(usmToU8(f[0] * 255.0f),
-                                        usmToU8(f[1] * 255.0f),
-                                        usmToU8(f[2] * 255.0f));
+      row[x * 3] = usmToU8(f[0] * 255.0f);
+      row[x * 3 + 1] = usmToU8(f[1] * 255.0f);
+      row[x * 3 + 2] = usmToU8(f[2] * 255.0f);
     }
   }
 }
@@ -1242,30 +1225,28 @@ static bool usmSimdSelfTest() {
 // band's working set, and `halo` (parallel only) holds the 2R source rows
 // around the split so neither band reads canvas rows the other is rewriting.
 template <int R>
-static void usmSharpenBandT(uint16_t* px, int w, int h, int16_t* ring,
-                            uint8_t* row8, const uint16_t* halo, int haloY0,
+static void usmSharpenBandT(uint8_t* px, int w, int h, int16_t* ring,
+                            uint8_t* row8, const uint8_t* halo, int haloY0,
                             int haloY1, const int* k, int amountQ8, int stride,
                             bool allowSimd, bool mono, int y0, int y1) {
   const int ringRows = 2 * R + 1;
-  // A mono look packs one value into all three channels, and R and B share the
-  // same 5-bit grid, so their planes -- and therefore their unsharp results --
-  // are identical: two blurs cover the frame instead of three.
+  // A mono look packs one value into all three channels, so the R and B planes
+  // -- and therefore their unsharp results -- are identical: two blurs cover
+  // the frame instead of three.
   const int chans = mono ? 2 : 3;
 
   // Horizontal blur of canvas row ysrc into its ring slot (ysrc outside the
   // frame replicates row 0/h-1). `ring + slot` is the group's slot 0.
   auto hblurSlot = [&](int ysrc) {
     const int yc = ysrc < 0 ? 0 : (ysrc > h - 1 ? h - 1 : ysrc);
-    const uint16_t* src =
+    const uint8_t* src =
         (halo && yc >= haloY0 && yc < haloY1)
-            ? halo + (size_t)(yc - haloY0) * w
-            : px + (size_t)yc * w;
+            ? halo + (size_t)(yc - haloY0) * w * 3
+            : px + (size_t)yc * w * 3;
     for (int x = 0; x < w; x++) {
-      uint8_t rgb[3];
-      usmUnpack565(src[x], rgb);
-      row8[x] = rgb[0];
-      row8[w + x] = rgb[1];
-      if (!mono) row8[2 * w + x] = rgb[2];
+      row8[x] = src[x * 3];
+      row8[w + x] = src[x * 3 + 1];
+      if (!mono) row8[2 * w + x] = src[x * 3 + 2];
     }
     const int slot = (ysrc % ringRows + ringRows) % ringRows;
     usmHblurRowT<R>(row8, ring + slot, k, w, stride, chans);
@@ -1276,7 +1257,7 @@ static void usmSharpenBandT(uint16_t* px, int w, int h, int16_t* ring,
   int16_t coeff[24] __attribute__((aligned(16)));
 
   for (int y = y0; y < y1; y++) {
-    uint16_t* prow = px + (size_t)y * w;
+    uint8_t* prow = px + (size_t)y * w * 3;
 
     // Rotate the kernel into ring-slot order for this output row: slot s
     // holds the row whose ring slot is s, so tap y+d lands in (y+d)%ringRows.
@@ -1301,26 +1282,26 @@ static void usmSharpenBandT(uint16_t* px, int w, int h, int16_t* ring,
         usmVblurRowT<R>(grp, row8 + c * w, coeff, w, stride);
     }
 
-    // Unsharp mask against the blurred planes, then pack back to RGB565.
+    // Unsharp mask against the blurred planes, then write back to RGB888.
     for (int x = 0; x < w; x++) {
-      uint8_t rgb[3];
-      usmUnpack565(prow[x], rgb);
       if (mono) {
         const int b0 = row8[x], b1 = row8[w + x];
-        int v0 = (int)rgb[0] + ((((int)rgb[0] - b0) * amountQ8 + 128) >> 8);
-        int v1 = (int)rgb[1] + ((((int)rgb[1] - b1) * amountQ8 + 128) >> 8);
+        int v0 = (int)prow[x * 3] + ((((int)prow[x * 3] - b0) * amountQ8 + 128) >> 8);
+        int v1 = (int)prow[x * 3 + 1] +
+                 ((((int)prow[x * 3 + 1] - b1) * amountQ8 + 128) >> 8);
         const uint8_t o0 = (uint8_t)(v0 < 0 ? 0 : (v0 > 255 ? 255 : v0));
         const uint8_t o1 = (uint8_t)(v1 < 0 ? 0 : (v1 > 255 ? 255 : v1));
-        prow[x] = usmPack565(o0, o1, o0);
+        prow[x * 3] = o0;
+        prow[x * 3 + 1] = o1;
+        prow[x * 3 + 2] = o0;
         continue;
       }
-      uint8_t out[3];
       for (int c = 0; c < 3; c++) {
         const int blurred = row8[c * w + x];
-        int v = (int)rgb[c] + ((((int)rgb[c] - blurred) * amountQ8 + 128) >> 8);
-        out[c] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        const int v = (int)prow[x * 3 + c] +
+                      ((((int)prow[x * 3 + c] - blurred) * amountQ8 + 128) >> 8);
+        prow[x * 3 + c] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
       }
-      prow[x] = usmPack565(out[0], out[1], out[2]);
     }
     // Slide the window for the next output row. Skipping the last row avoids
     // reading a source row outside this band's halo after the other band may
@@ -1334,11 +1315,11 @@ static void usmSharpenBandT(uint16_t* px, int w, int h, int16_t* ring,
 // path; the band split and the halo layout follow the same h/2 split as
 // parallelRun(). Slot 0 is the worker (the existing ring), slot 1 the loop
 // task (the second static ring).
-static uint16_t* gSharpPx = nullptr;
+static uint8_t* gSharpPx = nullptr;
 static int gSharpW = 0, gSharpH = 0;
 static int16_t* gSharpRing[2] = {nullptr, nullptr};
 static uint8_t* gSharpRow8[2] = {nullptr, nullptr};
-static const uint16_t* gSharpHalo = nullptr;
+static const uint8_t* gSharpHalo = nullptr;
 static int gSharpHaloY0 = 0, gSharpHaloY1 = 0;
 static const int* gSharpK = nullptr;
 static int gSharpAmountQ8 = 0, gSharpStride = 0;
@@ -1359,7 +1340,7 @@ static void usmSharpenThunkT(int slot, int y0, int y1) {
 #endif
 
 template <int R>
-static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
+static void usmSharpenT(uint8_t* px, int w, int h, int16_t* ring,
                         uint8_t* row8, const int* k, int amountQ8,
                         int stride, bool allowSimd, bool mono) {
 #if JPEG_FILTER_PARALLEL
@@ -1368,8 +1349,8 @@ static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
   if (allowSimd && R <= USM_PARALLEL_MAX_RAD && h >= 2 * R) {
     const int haloY0 = h / 2 - R;
     const int haloRows = 2 * R;
-    memcpy(usmHalo, px + (size_t)haloY0 * w,
-           (size_t)haloRows * w * sizeof(uint16_t));
+    memcpy(usmHalo, px + (size_t)haloY0 * w * 3,
+           (size_t)haloRows * w * 3u);
 
     gSharpPx = px;
     gSharpW = w;
@@ -1398,7 +1379,7 @@ static void usmSharpenT(uint16_t* px, int w, int h, int16_t* ring,
 // ---- statistics bands ------------------------------------------------------
 // Canvas and per-shot constants are set by the loop task before parallelRun()
 // and read-only while the worker runs; the semaphore hand-off orders them.
-static const uint16_t* gBandPx = nullptr;
+static const uint8_t* gBandPx = nullptr;
 static int gBandW = 0;
 static float gBandGainR = 1.0f, gBandGainG = 1.0f, gBandGainB = 1.0f;
 static float gBandHistPerL = 0.0f;
@@ -1412,21 +1393,19 @@ static UsmStatsSums usmSums[2];
 // to midtone pixels (0.10 < L < 0.90) so shadows/highlights do not skew the
 // channel gains. Integer sums merge exactly in either order.
 static void usmBalanceBand(int y0, int y1, int slot) {
-  const uint16_t* px = gBandPx;
+  const uint8_t* px = gBandPx;
   const int w = gBandW;
   UsmStatsSums s = {0, 0, 0, 0};
   for (int y = y0; y < y1; y++) {
-    const uint16_t* row = px + (size_t)y * w;
+    const uint8_t* row = px + (size_t)y * w * 3;
     for (int x = 0; x < w; x++) {
-      uint8_t rgb[3];
-      usmUnpack565(row[x], rgb);
+      const uint8_t r = row[x * 3], g = row[x * 3 + 1], b = row[x * 3 + 2];
       const float L =
-          ((0.2126f * rgb[0]) + (0.7152f * rgb[1]) + (0.0722f * rgb[2])) *
-          USM_INV255;
+          ((0.2126f * r) + (0.7152f * g) + (0.0722f * b)) * USM_INV255;
       if (L > 0.10f && L < 0.90f) {
-        s.sumR += rgb[0];
-        s.sumG += rgb[1];
-        s.sumB += rgb[2];
+        s.sumR += r;
+        s.sumG += g;
+        s.sumB += b;
         s.maskedN++;
       }
     }
@@ -1445,18 +1424,16 @@ static void usmHistBand(int y0, int y1, int slot) {
   (void)slot;
   uint32_t* hist = usmHist;
 #endif
-  const uint16_t* px = gBandPx;
+  const uint8_t* px = gBandPx;
   const int w = gBandW;
   const float histPerL = gBandHistPerL;
   const float gainR = gBandGainR, gainG = gBandGainG, gainB = gBandGainB;
   for (int y = y0; y < y1; y++) {
-    const uint16_t* row = px + (size_t)y * w;
+    const uint8_t* row = px + (size_t)y * w * 3;
     for (int x = 0; x < w; x++) {
-      uint8_t rgb[3];
-      usmUnpack565(row[x], rgb);
-      const float L = ((0.2126f * rgb[0] * gainR) +
-                       (0.7152f * rgb[1] * gainG) +
-                       (0.0722f * rgb[2] * gainB)) *
+      const float L = ((0.2126f * row[x * 3] * gainR) +
+                       (0.7152f * row[x * 3 + 1] * gainG) +
+                       (0.0722f * row[x * 3 + 2] * gainB)) *
                       USM_INV255;
       int bin = (int)(L * histPerL);
       if (bin < 0) bin = 0;
@@ -1515,7 +1492,7 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
   const int border = gFilterBorder ? JPEG_FILTER_INSET_PX : 0;
   const uint16_t fw = (uint16_t)(w + 2 * border);
   const uint16_t fh = (uint16_t)(h + 2 * border);
-  const size_t canvasBytes = (size_t)fw * (size_t)fh * sizeof(uint16_t);
+  const size_t canvasBytes = (size_t)fw * (size_t)fh * 3u;
 
   // Always collect the stage timings: the EXIF header records them.
   // CAPTURE_TIMING only controls the optional diagnostic log/selftest.
@@ -1529,9 +1506,9 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
   uint8_t* canvas = (uint8_t*)ps_malloc(canvasBytes);
   if (!canvas) return false;
 
-  // Decoding goes through jpg2rgb565(): the callback form of esp_jpg_decode()
+  // Decoding goes through fmt2rgb888(): the callback form of esp_jpg_decode()
   // proved unstable on this target (see the border filter) and panicked.
-  if (!jpg2rgb565(fb->buf, fb->len, canvas, JPG_SCALE_NONE)) {
+  if (!fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, canvas)) {
     free(canvas);
     return false;
   }
@@ -1540,7 +1517,7 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
   if (doLook) usmInitLuts();
   mark(gJpegCaptureTiming.decodeMs);
 
-  uint16_t* px = (uint16_t*)canvas;
+  uint8_t* px = canvas;
   if (doLook) {
     const float histPerL = (float)SUPERIA_HIST_N / SUPERIA_HIST_LMAX;
 
@@ -1728,40 +1705,38 @@ static inline bool jpegFilterStream(camera_fb_t* fb, uint8_t quality,
 
   // ---- encode ----------------------------------------------------------------
 
-  // Byte-order boundary. fmt2jpg_cb() reads RGB565 input unconditionally
-  // big-endian (its convert_line_format takes R from the first byte), while
-  // the canvas is little-endian standard R5G6B5. One swap pass brings the
-  // processed canvas to the encoder's byte order -- the same swap the white
-  // border filter does before its encode.
-  for (size_t i = 0; i < n; i++) {
-    px[i] = (uint16_t)((px[i] >> 8) | (px[i] << 8));
-  }
+  // The canvas is RGB888 in the encoder's own byte order, so no swap pass is
+  // needed (the RGB565 path needed one: fmt2jpg_cb() read it big-endian).
 
   // Final node: preserve the image and add the white frame around it. Rows
   // move bottom-up (destination is always below the source) so no unread image
-  // row is overwritten. 0xFFFF is white in either byte order.
+  // row is overwritten. White is FF,FF,FF.
   if (border > 0) {
     for (int y = (int)h - 1; y >= 0; y--) {
-      memmove(px + (size_t)(y + border) * fw + border,
-              px + (size_t)y * w,
-              (size_t)w * sizeof(uint16_t));
+      memmove(px + ((size_t)(y + border) * fw + border) * 3,
+              px + (size_t)y * w * 3,
+              (size_t)w * 3u);
     }
-    const size_t rowBytes = (size_t)fw * sizeof(uint16_t);
+    const size_t rowBytes = (size_t)fw * 3u;
     for (int y = 0; y < border; y++) {
-      memset(px + (size_t)y * fw, 0xFF, rowBytes);
-      memset(px + (size_t)(fh - 1 - y) * fw, 0xFF, rowBytes);
+      memset(px + (size_t)y * fw * 3u, 0xFF, rowBytes);
+      memset(px + (size_t)(fh - 1 - y) * fw * 3u, 0xFF, rowBytes);
     }
     for (int y = border; y < (int)fh - border; y++) {
-      uint16_t* row = px + (size_t)y * fw;
+      uint8_t* row = px + (size_t)y * fw * 3u;
       for (int x = 0; x < border; x++) {
-        row[x] = 0xFFFF;
-        row[fw - 1 - x] = 0xFFFF;
+        row[x * 3] = 0xFF;
+        row[x * 3 + 1] = 0xFF;
+        row[x * 3 + 2] = 0xFF;
+        row[(fw - 1 - x) * 3] = 0xFF;
+        row[(fw - 1 - x) * 3 + 1] = 0xFF;
+        row[(fw - 1 - x) * 3 + 2] = 0xFF;
       }
     }
   }
 
   FilmJpgOutCtx out = { write, arg, 0, false };
-  const bool encoded = fmt2jpg_cb(canvas, canvasBytes, fw, fh, PIXFORMAT_RGB565,
+  const bool encoded = fmt2jpg_cb(canvas, canvasBytes, fw, fh, PIXFORMAT_RGB888,
                                   quality, filmJpgOutCb, &out);
   free(canvas);
   mark(gJpegCaptureTiming.encodeMs);

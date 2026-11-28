@@ -301,20 +301,22 @@ grain is off by default, and its size 1.2 is below the lab's blur threshold,
 so only the amount matters when it is enabled.
 
 **Memory.** `NONE` with border off does not allocate a canvas at all. Every
-re-encoded state decodes into one RGB565 canvas. Bordered states grow the
+re-encoded state decodes into one RGB888 canvas. Bordered states grow the
 frame: the canvas is `(w+2b) × (h+2b)` (1328×1072 at 24 px), while the
-look/sharpen passes still run on the leading 1280×1024 image. `jpg2rgb565()`
+look/sharpen passes still run on the leading 1280×1024 image. `fmt2rgb888()`
 writes straight into that one canvas and `fmt2jpg_cb` streams the encoded JPEG
 to the SD file, so there is no second full-frame buffer and the JPEG is never
-held in RAM either.
+held in RAM either. The canvas is RGB888, not the camera's RGB565: at 5-bit
+chroma the look's local gain turned flat surfaces into visible colour
+banding (the RGB565 round trip alone was clean; the amplification was not).
 
 | Item | Bytes |
 |---|---|
-| RGB565 canvas, 1280×1024 (unbordered re-encode) | 2,621,440 |
-| RGB565 canvas, 1328×1072 (any bordered state) | 2,847,232 |
+| RGB888 canvas, 1280×1024 (unbordered re-encode) | 3,932,160 |
+| RGB888 canvas, 1328×1072 (any bordered state) | 4,270,848 |
 | Camera buffers (`fb_count = 2`, w×h/5 each) | 524,288 |
-| **Peak, unbordered looks** | **~3.2 MB** (of 8 MB PSRAM) |
-| **Peak, bordered looks / `WITH_BORDER`** | **~3.4 MB** (of 8 MB PSRAM) |
+| **Peak, unbordered looks** | **~4.5 MB** (of 8 MB PSRAM) |
+| **Peak, bordered looks / `WITH_BORDER`** | **~4.8 MB** (of 8 MB PSRAM) |
 
 The border canvas grows with `JPEG_FILTER_INSET_PX`, and
 `jpegFilterWorstCaseBytes()` includes the extra rows/columns. The free-space
@@ -324,8 +326,9 @@ bound is 0.25 bytes/pixel at encoder quality 10 or below; with the default
 All five looks share one runtime-parameterized pipeline, one LUT set and the
 same ring/LUT working set. The sharpen ring (one 16-byte group per
 channel/pixel, holding the 2·radius+1 blurred rows as int16 slots, ~61 KB at
-SXGA) and LUTs (~5 KB) live in internal DRAM, not PSRAM, so peak PSRAM stays
-at ~3.2 MB for unbordered looks and ~3.4 MB for bordered states. Keep it there:
+SXGA) and LUTs (~5 KB) live in internal DRAM, not PSRAM, so PSRAM peak is the
+canvas plus the camera buffers (~4.5 MB unbordered, ~4.8 MB bordered, of the
+8 MB module; the RGB565 canvas sat at ~3.2/~3.4 MB):
 an earlier version used a ~0.67 MB band buffer in PSRAM, pushed the peak to
 ~3.6 MB, and the old ESP32-CAM's PSRAM delivered block-garbage into the canvas
 at that pressure (psychedelic capture output). The 16-byte groups are also what
@@ -337,7 +340,7 @@ link size after any change to these buffers.
 The shared auto contrast never amplifies local contrast past
 `SUPERIA_CONTRAST_SLOPE_CAP` (default 1.5, all looks): on a flat frame the
 1–99 percentile stretch would otherwise multiply the source JPEG's 4:2:0
-chroma blocks and the RGB565 canvas staircase into visible banding.
+chroma blocks and the canvas staircase into visible banding.
 
 The dual-core build adds, in internal DRAM, an 8 KB second histogram table, a
 second 61 KB sharpen ring, a second 3.8 KB 8-bit row buffer, a 15 KB sharpen

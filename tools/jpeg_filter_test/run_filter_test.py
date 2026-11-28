@@ -11,9 +11,7 @@ for side-by-side inspection.
 
 What this reproduces vs. hardware:
   reproduced  all filter math from src/jpeg_filter.h as compiled (LUTs,
-              RGB565 canvas, 5/6/5-bit truncation/replication, the native
-              little-endian decoder canvas and the pre-encode swap that the
-              encoder's big-endian read expects, tone chain order,
+              RGB888 canvas, byte-order-free decode/encode, tone chain order,
               row-ring USM, JPEG_REENCODE_QUALITY handling); src/exif.h's
               APP1 layout/first-write/patch-offset contract, with the result
               reopened by Pillow to confirm ImageDescription parses

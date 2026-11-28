@@ -45,7 +45,7 @@ changing firmware.
   the runtime look/border selection only affects the SD file. Neither may
   change the other's output.
 - SD writes stream through `JpegWriteFn`; keep the encoded JPEG out of RAM
-  (peak PSRAM is ~3.2 MB of 8 MB and depends on it).
+  (peak PSRAM is ~4.8 MB of 8 MB with the RGB888 canvas and depends on it).
 - When `EXIF_ENABLED` is set (default `1`), saved JPEGs carry an APP1 EXIF
   `ImageDescription` inserted by the SD sink:
   look, border/inset, source/output dimensions, re-encode quality and
